@@ -40,39 +40,50 @@ The transcription engine ships a small helper that may need Python during instal
 
 ## Part 2 — Get the project files onto your computer
 
-The developer will send you a ZIP archive (a single file ending in `.zip`,
-likely named something like `Eric-yt-channel-ai.zip`). That's all you need
-— no GitHub account, no installing extra tools.
+The project lives on GitHub at:
 
-### 2.1 Extract the archive
+**https://github.com/Bander4ik/Eric-yt-channel-ai**
 
-1. Find the ZIP. It probably landed in your **Downloads** folder.
-2. Extract it:
-   - **Windows**: right-click the ZIP → **Extract All...** → **Extract**. A new folder appears next to it.
-   - **macOS**: double-click the ZIP. A new folder appears next to it.
-3. The extracted folder contains files like `package.json`, `README.md`, `install.bat`, `start.bat`, `INSTALL.md` (this file), etc. That's your project folder.
+You have two ways to download it. Pick **one**. If you don't know which, pick Option A — it's the simplest and works exactly the same.
 
-### 2.2 Move the folder somewhere permanent
+### Option A — Download the ZIP from GitHub (simplest)
 
-**Important.** Don't leave the project in `Downloads` — most browsers and a few OS cleanup utilities auto-delete old Downloads, which would wipe your app and your local data along with it.
+No account, no extra tools. Best if you just want to run the app.
+
+1. Open **[https://github.com/Bander4ik/Eric-yt-channel-ai](https://github.com/Bander4ik/Eric-yt-channel-ai)** in your browser.
+2. Find the green **`<> Code`** button (near the top, above the file list) → click it.
+3. In the dropdown, click **Download ZIP** (at the bottom).
+4. The ZIP downloads to your **Downloads** folder. It will be named `Eric-yt-channel-ai-main.zip`.
+5. Extract it:
+   - **Windows**: right-click the ZIP → **Extract All...** → **Extract**.
+   - **macOS**: double-click the ZIP.
+6. You now have a folder called `Eric-yt-channel-ai-main` containing `package.json`, `README.md`, `install.bat`, `start.bat`, etc.
+
+### Option B — Clone via GitHub Desktop (recommended if you'll get updates)
+
+If the developer is going to push fixes and you want one-click updates without re-downloading the ZIP each time, use GitHub Desktop.
+
+1. Download GitHub Desktop from **[https://desktop.github.com/](https://desktop.github.com/)** → install (defaults are fine).
+2. Open GitHub Desktop. You can sign in with a GitHub account or skip — both work since the repo is public.
+3. **File → Clone repository...** → tab **URL** at the top → paste:
+   ```
+   https://github.com/Bander4ik/Eric-yt-channel-ai
+   ```
+4. **Local path** → pick a folder (default `Documents/GitHub/Eric-yt-channel-ai` is fine) → **Clone**.
+5. Done. To update later: open GitHub Desktop → click **Fetch origin** → if there are new changes, click **Pull origin**.
+
+### 2.x — Move the folder somewhere safe
+
+This applies to **both options**.
+
+**Don't leave the project in `Downloads`** — browsers and OS cleanup utilities auto-delete old Downloads, which would wipe the app *and your local data* (API keys, transcripts, chat history) along with it. If you used Option B, the GitHub Desktop default location (`Documents/GitHub/...`) is already fine — skip this step.
 
 Move (drag-and-drop is fine) the folder to:
 
 - **Windows**: `C:\Users\<your name>\Documents\Eric-yt-channel-ai`
-- **macOS**: `~/Documents/Eric-yt-channel-ai` (i.e. `Macintosh HD/Users/<your name>/Documents/`)
+- **macOS**: `~/Documents/Eric-yt-channel-ai` (under `Macintosh HD/Users/<your name>/Documents/`)
 
 > ⚠️ **Don't put the project inside a cloud-sync folder.** OneDrive, iCloud Drive, Dropbox, and Google Drive all silently sync changes to the cloud as you work. The app's SQLite database is touched constantly while the app runs, and these sync services can corrupt the database's WAL files. Keep the project under plain `Documents` (outside any synced subfolder), on your **Desktop**, or in a folder like `C:\dev\` (Windows) / `~/code/` (macOS). Anywhere NOT inside iCloud / OneDrive / Dropbox.
-
-### 2.3 (Later) Getting updates
-
-When the developer ships fixes, they'll send you a new ZIP archive. To update:
-
-1. **Stop the app** if it's running (close the terminal window).
-2. **Rename your current project folder** by adding `-old` to the end (e.g. `Eric-yt-channel-ai-old`). Don't delete it yet — we need one file from it.
-3. Extract the new ZIP somewhere convenient.
-4. Open the **OLD** folder, find the `data` subfolder (lowercase `data`), and **copy it** into the **NEW** folder. This carries over your API keys, channels, transcripts, chat history — everything you've set up.
-5. Inside the new folder, double-click `install.bat` / `install.command` once (dependencies may have changed), then `start.bat` / `start.command` to launch.
-6. Once you've confirmed the new version works and your data is there, you can delete the `-old` folder.
 
 ---
 
@@ -223,18 +234,28 @@ Same pattern. Self-explanatory help text is on each card in the Integrations pag
 
 ## Part 7 — Updating the app
 
-When the developer sends you a new ZIP archive (after fixes or new features),
-follow the procedure from Part 2.3:
+How you update depends on which option you used in Part 2.
+
+### If you used Option B (GitHub Desktop) — the easy way
+
+1. **Stop the app** (close the terminal window the server is running in).
+2. Open **GitHub Desktop** → click **Fetch origin**.
+3. If GitHub Desktop shows "X commits behind" + a **Pull origin** button → click it. The new code is downloaded into your existing project folder; your `data/` folder is left untouched (it's gitignored).
+4. Back in the project folder, double-click `install.bat` / `install.command` once (in case any dependencies changed — takes 30 seconds to a couple of minutes).
+5. Launch the app again with `start.bat` / `start.command`.
+
+**Your data survives automatically** because GitHub Desktop never touches the `data/` folder.
+
+### If you used Option A (ZIP download)
 
 1. **Stop the app** (close the terminal window).
-2. **Rename your current project folder** to `Eric-yt-channel-ai-old`.
-3. Extract the new ZIP.
-4. **Copy the `data/` folder** from the OLD project into the NEW one. This preserves your API keys, channels, transcripts, chat history — everything.
-5. Run `install.bat` / `install.command` inside the new folder (dependencies may have changed).
-6. Launch with `start.bat` / `start.command`.
-7. Once you've verified the new version works and your data is intact, delete `Eric-yt-channel-ai-old`.
+2. **Rename your current project folder** to `Eric-yt-channel-ai-old`. Don't delete it yet — we need one folder from it.
+3. Re-download the ZIP from **[github.com/Bander4ik/Eric-yt-channel-ai](https://github.com/Bander4ik/Eric-yt-channel-ai)** → green **Code** button → **Download ZIP**. Extract it.
+4. Open the **OLD** folder, find the `data` subfolder, and **copy it into the NEW folder**. This preserves your API keys, OAuth tokens, channels, transcripts, chat history — everything you've set up.
+5. Inside the new folder, run `install.bat` / `install.command` once (dependencies may have changed), then `start.bat` / `start.command`.
+6. Once you've verified the new version works and your data is intact, delete the `-old` folder.
 
-**Your data is preserved across updates** as long as you copy the `data/` folder.
+> Tip: if you find yourself updating more than once or twice, switching to Option B (GitHub Desktop, Part 2) is worth the 5 minutes it takes to set up.
 
 ---
 

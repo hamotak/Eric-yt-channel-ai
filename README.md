@@ -9,9 +9,10 @@ A local AI-powered YouTube channel analytics platform: YouTube Studio-style dash
 Full step-by-step setup for someone who has never worked with code is in **[INSTALL.md](./INSTALL.md)**. Short version:
 
 1. Install Node.js 20+ from [nodejs.org](https://nodejs.org/)
-2. Run `install.bat` (Windows) or `install.command` (macOS) — installs dependencies
-3. Run `start.bat` (Windows) or `start.command` (macOS) — opens the app in your browser at `http://localhost:3000`
-4. Open **Integrations** and add your keys (minimum: Claude + Deepgram)
+2. Download this repo — either as a ZIP from the green **Code** button above, or `git clone https://github.com/Bander4ik/Eric-yt-channel-ai.git`
+3. Run `install.bat` (Windows) or `install.command` (macOS) — installs dependencies
+4. Run `start.bat` (Windows) or `start.command` (macOS) — opens the app in your browser at `http://localhost:3000`
+5. Open **Integrations** and add your keys (minimum: Claude + Deepgram)
 
 ## What it does
 
