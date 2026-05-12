@@ -729,23 +729,26 @@ async function getAudioUrlViaCobalt(
 /**
  * End-to-end: given a videoId and a Deepgram key, produce a transcript.
  *
- * Three tiers, picked at runtime by which can resolve audio:
+ * Tier order tuned for **local installs** (this project is local-only).
+ * On a residential IP yt-dlp Just Works — it's the fastest, most reliable
+ * path. The Innertube and cobalt paths exist as fallbacks for unusual
+ * networks (corporate proxy that strips video traffic, ISP-level YouTube
+ * blocks, etc.).
  *
- *   Tier 1 — Innertube audio URL → Deepgram URL ingestion. Lightest
- *     touch; nothing transits Railway. Currently blocked on cloud IPs
- *     because YouTube strips streaming_data from player responses.
+ *   Tier 1 — yt-dlp into RAM → Deepgram bytes POST. Residential-IP first
+ *     choice. Reliable, fast, single-process.
  *
- *   Tier 2 — yt-dlp into RAM → Deepgram bytes POST. Works locally
- *     (residential IP), blocked on Railway by YouTube's bot defense.
+ *   Tier 2 — Innertube audio URL → Deepgram URL ingestion. Lightweight
+ *     fallback if yt-dlp itself is missing or fails (e.g. binary not
+ *     installed by the postinstall script). Lets Deepgram fetch directly
+ *     from Google CDN.
  *
- *   Tier 3 — cobalt.tools proxy → Deepgram URL ingestion. cobalt's
- *     residential-friendly server fetches from YouTube on its end,
- *     hands us a stream URL Deepgram can pull from. This is the
- *     auto-magic path that survives the datacenter wall WITHOUT the
- *     user uploading anything by hand.
+ *   Tier 3 — cobalt.tools proxy → Deepgram URL ingestion. Last resort —
+ *     cobalt fetches YouTube on its end and hands us a stream URL.
+ *     Useful when both yt-dlp and Innertube get blocked locally.
  *
- * On total failure the thrown AudioUrlError lists every tier's
- * specific error so /logs shows the full diagnostic chain.
+ * On total failure the thrown AudioUrlError lists every tier's specific
+ * error so /logs shows the full diagnostic chain.
  */
 export async function transcribeYouTubeVideo(
   videoId: string,
@@ -758,8 +761,23 @@ export async function transcribeYouTubeVideo(
   costCents: number;
   model: string;
 }> {
-  // ----- Tier 1: Innertube → Deepgram URL ingestion -----
+  // ----- Tier 1: yt-dlp + bytes (residential-IP, the local path) -----
   let tier1Error: string | null = null;
+  try {
+    const r = await transcribeVideoAudio(videoId, apiKey, opts);
+    return {
+      text: r.text,
+      language: r.language,
+      durationSeconds: r.durationSeconds,
+      costCents: estimateCostCents(r.durationSeconds),
+      model: opts.model ?? DEEPGRAM_MODEL,
+    };
+  } catch (e) {
+    tier1Error = e instanceof Error ? e.message : String(e);
+  }
+
+  // ----- Tier 2: Innertube → Deepgram URL ingestion -----
+  let tier2Error: string | null = null;
   try {
     const audio = await getAudioUrlViaInnertube(videoId);
     if (audio?.url) {
@@ -773,17 +791,12 @@ export async function transcribeYouTubeVideo(
         model: opts.model ?? DEEPGRAM_MODEL,
       };
     }
-    tier1Error = "Innertube returned no audio URL across all player clients";
+    tier2Error = "Innertube returned no audio URL across all player clients";
   } catch (e) {
-    tier1Error = e instanceof Error ? e.message : String(e);
+    tier2Error = e instanceof Error ? e.message : String(e);
   }
 
   // ----- Tier 3: cobalt.tools → Deepgram URL ingestion -----
-  // Promoted ahead of yt-dlp on the cloud path because yt-dlp is
-  // guaranteed to fail on Railway IPs, while cobalt usually works.
-  // On local dev cobalt is also fine, so trying it first costs us
-  // nothing in either environment.
-  let tier3Error: string | null = null;
   try {
     const cobalt = await getAudioUrlViaCobalt(videoId);
     if (cobalt?.url) {
@@ -796,31 +809,26 @@ export async function transcribeYouTubeVideo(
         model: opts.model ?? DEEPGRAM_MODEL,
       };
     }
-    tier3Error = "cobalt.tools returned no stream URL from any mirror";
-  } catch (e) {
-    tier3Error = e instanceof Error ? e.message : String(e);
-  }
-
-  // ----- Tier 2: yt-dlp + bytes (residential-IP path) -----
-  try {
-    const r = await transcribeVideoAudio(videoId, apiKey, opts);
-    const costCents = estimateCostCents(r.durationSeconds);
-    return {
-      text: r.text,
-      language: r.language,
-      durationSeconds: r.durationSeconds,
-      costCents,
-      model: opts.model ?? DEEPGRAM_MODEL,
-    };
-  } catch (e) {
-    const tier2Msg = e instanceof Error ? e.message : String(e);
     throw new AudioUrlError(
       `All transcription tiers failed for ${videoId}.\n` +
-        `  Tier 1 (Innertube → Deepgram URL): ${tier1Error}\n` +
-        `  Tier 3 (cobalt.tools → Deepgram URL): ${tier3Error}\n` +
-        `  Tier 2 (yt-dlp + bytes): ${tier2Msg}\n\n` +
-        `Use the file-upload or URL-input options on the Transcript tab to ` +
-        `bypass YouTube entirely.`
+        `  Tier 1 (yt-dlp + bytes): ${tier1Error}\n` +
+        `  Tier 2 (Innertube → Deepgram URL): ${tier2Error}\n` +
+        `  Tier 3 (cobalt.tools): no stream URL from any mirror\n\n` +
+        `If yt-dlp keeps failing, the most reliable fix is to paste a YouTube ` +
+        `cookies.txt under Integrations → YouTube cookies. Or use the ` +
+        `file-upload / URL-input options on the video Transcript tab.`
+    );
+  } catch (e) {
+    if (e instanceof AudioUrlError) throw e;
+    const tier3Msg = e instanceof Error ? e.message : String(e);
+    throw new AudioUrlError(
+      `All transcription tiers failed for ${videoId}.\n` +
+        `  Tier 1 (yt-dlp + bytes): ${tier1Error}\n` +
+        `  Tier 2 (Innertube → Deepgram URL): ${tier2Error}\n` +
+        `  Tier 3 (cobalt.tools): ${tier3Msg}\n\n` +
+        `If yt-dlp keeps failing, the most reliable fix is to paste a YouTube ` +
+        `cookies.txt under Integrations → YouTube cookies. Or use the ` +
+        `file-upload / URL-input options on the video Transcript tab.`
     );
   }
 }
