@@ -29,7 +29,9 @@ echo ====================================
 echo.
 
 REM Open the browser a few seconds after `npm run dev` boots, not before.
-REM Otherwise the user sees a blank "site can't be reached" page during
-REM the cold-start window.
-start "" /b cmd /c "timeout /t 5 /nobreak >nul && start \"\" \"http://localhost:3000\""
+REM PowerShell handles the delay + browser launch in one detached process.
+REM (Earlier attempts using nested `cmd /c "... start \"\" \"...\""` blew up
+REM with `\\` being interpreted as a UNC root — "Windows cannot find '\\'"
+REM plus an "Access is denied." message in the terminal.)
+start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 5; Start-Process 'http://localhost:3000'"
 call npm run dev
