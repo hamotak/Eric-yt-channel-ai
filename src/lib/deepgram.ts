@@ -350,37 +350,61 @@ async function downloadAudioToBuffer(
   // (muxed) format when audio-only isn't offered. Deepgram auto-detects
   // codec from body bytes, so feeding it muxed mp4 is fine — the inner
   // audio track gets transcribed and the video stream is ignored.
-  const baseOptions: Record<string, unknown> = {
+  //
+  // Two-attempt strategy:
+  //   1. With the standard bot-defense flags (alternate player clients,
+  //      Chrome UA).
+  //   2. On a "Requested format is not available" error, retry WITHOUT
+  //      the `player_client` override — some videos only expose the
+  //      muxed/audio-only formats to the default `web` client, not to
+  //      tv_embedded/ios/android.
+  const commonFlags = ytDlpCommonFlags(cookies?.path ?? null);
+  const optionsWithClients: Record<string, unknown> = {
+    ...commonFlags,
     format: "bestaudio/best",
     output: "-",
     quiet: true,
-    ...ytDlpCommonFlags(cookies?.path ?? null),
+  };
+  // Build the fallback options by spreading commonFlags WITHOUT the
+  // extractorArgs key. Destructuring is the cleanest way to drop one
+  // field in TS strict mode — `delete` on an object literal can trip
+  // strict-mode + some bundlers.
+  const { extractorArgs: _omit, ...flagsNoClients } = commonFlags as {
+    extractorArgs?: unknown;
+    [k: string]: unknown;
+  };
+  void _omit;
+  const optionsDefaultClient: Record<string, unknown> = {
+    ...flagsNoClients,
+    format: "bestaudio/best",
+    output: "-",
+    quiet: true,
   };
 
   let result: { buffer: Buffer; totalBytes: number } | null = null;
-  let firstAttemptError: AudioUrlError | null = null;
 
   try {
-    // Attempt 1: with all the bot-defense flags
+    // ---- Attempt 1 ----
     try {
-      result = await runYtDlpToBuffer(ytUrl, baseOptions, opts.signal, videoId);
-    } catch (err) {
-      firstAttemptError = err as AudioUrlError;
-      const msg = firstAttemptError.message ?? "";
-      // Only retry on the specific "Requested format is not available"
-      // failure — other errors (private, age-restricted, network) won't
-      // be fixed by changing the player client.
-      const isFormatError = /requested format is not available/i.test(msg);
-      if (!isFormatError) throw firstAttemptError;
-
-      // Attempt 2: drop the player_client override. The default `web`
-      // client exposes the full set of formats; some videos only signal
-      // muxed/segmented streams to tv_embedded/ios.
-      const fallbackOptions = { ...baseOptions };
-      delete (fallbackOptions as Record<string, unknown>).extractorArgs;
       result = await runYtDlpToBuffer(
         ytUrl,
-        fallbackOptions,
+        optionsWithClients,
+        opts.signal,
+        videoId
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isFormatError = /requested format is not available/i.test(msg);
+      if (!isFormatError) {
+        // Re-throw the original AudioUrlError so the chained error
+        // message keeps its diagnostic detail.
+        throw err;
+      }
+
+      // ---- Attempt 2 (default web client) ----
+      result = await runYtDlpToBuffer(
+        ytUrl,
+        optionsDefaultClient,
         opts.signal,
         videoId
       );
