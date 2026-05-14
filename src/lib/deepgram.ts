@@ -270,34 +270,28 @@ type DeepgramListenResponse = {
  * its stdout into memory. Peak RAM ≈ one audio track (typically 20-80MB
  * for a 30-60min video, since YouTube's bestaudio is opus/webm @ 128 kbps).
  */
-async function downloadAudioToBuffer(
-  videoId: string,
-  opts: { signal?: AbortSignal } = {}
-): Promise<{ buffer: Buffer; contentType: string }> {
-  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const cookies = maybeWriteCookiesTempFile();
-
-  // youtube-dl-exec's .exec() returns an execa subprocess — stdout is a
-  // Readable stream, stderr is another, and the promise resolves/rejects
-  // on process exit. We read stdout into a chunk array and error on non-
-  // zero exit.
+/**
+ * One attempt at running yt-dlp with the given options into a RAM
+ * buffer. Returns the bytes or throws AudioUrlError. Split out from the
+ * caller below so we can retry with different flags on a known-bad
+ * exit (e.g. "Requested format is not available").
+ */
+async function runYtDlpToBuffer(
+  ytUrl: string,
+  ytdlpOptions: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+  videoId: string
+): Promise<{ buffer: Buffer; totalBytes: number }> {
   const subprocess = youtubeDl.exec(
     ytUrl,
-    {
-      format: "bestaudio",
-      output: "-",
-      quiet: true,
-      ...ytDlpCommonFlags(cookies?.path ?? null),
-    },
+    ytdlpOptions,
     // Force binary-safe pipes; on Windows the default can sometimes corrupt
     // non-text stdout. Also explicitly ignore stdin so yt-dlp doesn't wait.
     { stdio: ["ignore", "pipe", "pipe"] }
   );
 
-  // If the caller aborts (timeout, user cancelled), kill the subprocess so
-  // we don't leak a process and a dangling stream.
   const onAbort = () => subprocess.kill("SIGTERM");
-  opts.signal?.addEventListener("abort", onAbort);
+  signal?.addEventListener("abort", onAbort);
 
   const chunks: Buffer[] = [];
   let totalBytes = 0;
@@ -313,7 +307,6 @@ async function downloadAudioToBuffer(
   try {
     await subprocess;
   } catch (err) {
-    // Non-zero exit — include stderr so the /logs page is actually useful.
     const e = err as { exitCode?: number; message?: string };
     throw new AudioUrlError(
       `yt-dlp audio download failed for ${videoId} (exit ${e.exitCode ?? "?"}): ${
@@ -321,20 +314,91 @@ async function downloadAudioToBuffer(
       }`
     );
   } finally {
-    opts.signal?.removeEventListener("abort", onAbort);
+    signal?.removeEventListener("abort", onAbort);
+  }
+
+  return { buffer: Buffer.concat(chunks, totalBytes), totalBytes };
+}
+
+/**
+ * Download the full audio track for a YouTube video into RAM via yt-dlp.
+ *
+ * Two attempts:
+ *   1. With the standard bot-defense flags (alternate player clients,
+ *      Chrome UA) and `bestaudio/best` selector. The `/best` fallback is
+ *      crucial — some restricted/newer videos only offer muxed formats,
+ *      and the bare `bestaudio` selector explodes with "Requested format
+ *      is not available" on those.
+ *   2. If attempt 1 fails with a format error, retry without the
+ *      `player_client` extractor args. The alternate clients (tv_embedded
+ *      / ios / android) sometimes only expose a subset of formats; the
+ *      default `web` client has the full list. Costs us nothing if attempt
+ *      1 already failed.
+ *
+ * No disk I/O: yt-dlp writes its audio output to stdout (`-o -`), we read
+ * its stdout into memory. Peak RAM ≈ one audio track (typically 20-80MB
+ * for a 30-60min video).
+ */
+async function downloadAudioToBuffer(
+  videoId: string,
+  opts: { signal?: AbortSignal } = {}
+): Promise<{ buffer: Buffer; contentType: string }> {
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const cookies = maybeWriteCookiesTempFile();
+
+  // `bestaudio/best`: prefer audio-only; fall back to the best combined
+  // (muxed) format when audio-only isn't offered. Deepgram auto-detects
+  // codec from body bytes, so feeding it muxed mp4 is fine — the inner
+  // audio track gets transcribed and the video stream is ignored.
+  const baseOptions: Record<string, unknown> = {
+    format: "bestaudio/best",
+    output: "-",
+    quiet: true,
+    ...ytDlpCommonFlags(cookies?.path ?? null),
+  };
+
+  let result: { buffer: Buffer; totalBytes: number } | null = null;
+  let firstAttemptError: AudioUrlError | null = null;
+
+  try {
+    // Attempt 1: with all the bot-defense flags
+    try {
+      result = await runYtDlpToBuffer(ytUrl, baseOptions, opts.signal, videoId);
+    } catch (err) {
+      firstAttemptError = err as AudioUrlError;
+      const msg = firstAttemptError.message ?? "";
+      // Only retry on the specific "Requested format is not available"
+      // failure — other errors (private, age-restricted, network) won't
+      // be fixed by changing the player client.
+      const isFormatError = /requested format is not available/i.test(msg);
+      if (!isFormatError) throw firstAttemptError;
+
+      // Attempt 2: drop the player_client override. The default `web`
+      // client exposes the full set of formats; some videos only signal
+      // muxed/segmented streams to tv_embedded/ios.
+      const fallbackOptions = { ...baseOptions };
+      delete (fallbackOptions as Record<string, unknown>).extractorArgs;
+      result = await runYtDlpToBuffer(
+        ytUrl,
+        fallbackOptions,
+        opts.signal,
+        videoId
+      );
+    }
+  } finally {
     cookies?.cleanup();
   }
 
-  if (totalBytes === 0) {
+  if (!result || result.totalBytes === 0) {
     throw new AudioUrlError(
       `yt-dlp produced no audio bytes for ${videoId}. Video may be private, region-locked, or age-restricted.`
     );
   }
 
-  // YouTube's bestaudio is typically webm/opus. Deepgram auto-detects from
-  // body content, so the declared Content-Type is a hint more than a hard
-  // requirement — we default to webm and let Deepgram sniff if it's wrong.
-  return { buffer: Buffer.concat(chunks, totalBytes), contentType: "audio/webm" };
+  // YouTube's bestaudio is typically webm/opus; bestaudio/best fallback
+  // can return mp4/m4a or muxed mp4. Deepgram auto-detects from body
+  // bytes, so the declared Content-Type is a hint at best.
+  return { buffer: result.buffer, contentType: "audio/webm" };
 }
 
 /**
