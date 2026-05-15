@@ -8,6 +8,7 @@ import {
   ChevronUp,
   Loader2,
   Pencil,
+  RefreshCw,
   X,
 } from "lucide-react";
 // Pencil + X used by the new card-level Edit button; Loader2 used by
@@ -80,6 +81,16 @@ export function EditorBillingCard() {
   const [saving, setSaving] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [showByEditor, setShowByEditor] = useState(true);
+  // "Refresh from YouTube" state — runs a lightweight sync across every
+  // connected channel so this-month video counts catch up with reality.
+  // Without this, the count column only reflects videos that happened
+  // to be in the local DB at last sync, which is days/weeks stale by
+  // the time editor payday rolls around.
+  const [syncing, setSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<{
+    totalAdded: number;
+    failed: number;
+  } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -126,6 +137,35 @@ export function EditorBillingCard() {
     }
   };
 
+  /**
+   * Refresh the local video DB with whatever the editors have uploaded
+   * since last sync. Hits /api/youtube/sync-recent which pulls the
+   * last 50 ids per channel, fetches details only for the new ones,
+   * upserts. ~90 YouTube Data API units for 30 channels. After it
+   * finishes we re-fetch the billing payload so the count column
+   * reflects reality.
+   */
+  const syncFromYouTube = async () => {
+    setSyncing(true);
+    setSyncResult(null);
+    try {
+      const res = await fetch("/api/youtube/sync-recent", { method: "POST" });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => ({}))) as { error?: string };
+        alert(j.error ?? `Sync failed (HTTP ${res.status})`);
+        return;
+      }
+      const data = (await res.json()) as {
+        totalAdded: number;
+        failed: number;
+      };
+      setSyncResult(data);
+      await load();
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   if (!data) return null;
 
   const current = data.months.find((m) => m.month === data.currentMonth) ?? {
@@ -165,15 +205,40 @@ export function EditorBillingCard() {
             Cleaner than two separate pencils per the user's feedback
             "блять, воно якось трохи складно працює". */}
         {!editing ? (
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            onClick={() => setEditing(true)}
-            className="gap-1.5"
-          >
-            <Pencil className="h-3 w-3" /> Edit
-          </Button>
+          <div className="flex items-center gap-2">
+            {/* Refresh button pulls the latest 50 uploads per channel
+                from YouTube so video counts here reflect reality —
+                without it the counts only show videos that happened to
+                be in the local DB at the last manual /integrations
+                sync, which is days/weeks stale by the time editor
+                payday rolls around. Hits a lightweight endpoint that
+                only fetches details for IDs we don't already have. */}
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={syncFromYouTube}
+              disabled={syncing}
+              className="gap-1.5"
+              title="Pull the latest uploads from every connected channel so this-month video counts catch up with reality"
+            >
+              {syncing ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <RefreshCw className="h-3 w-3" />
+              )}
+              {syncing ? "Syncing…" : "Sync uploads"}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setEditing(true)}
+              className="gap-1.5"
+            >
+              <Pencil className="h-3 w-3" /> Edit
+            </Button>
+          </div>
         ) : (
           <div className="flex items-center gap-1">
             <Button
@@ -211,6 +276,41 @@ export function EditorBillingCard() {
       </CardHeader>
 
       <CardContent className="space-y-4">
+        {/* Sync result toast — shows after Sync uploads finishes, until
+            the user clicks the X. Carries the "added 8 new videos" /
+            "all channels up to date" / "3 channels failed" payload so
+            the user knows whether the counts below are now fresh. */}
+        {syncResult && (
+          <div
+            className={cn(
+              "flex items-start gap-2 rounded-md border p-2 text-xs",
+              syncResult.failed > 0
+                ? "border-amber-500/40 bg-amber-500/10"
+                : "border-green-500/40 bg-green-500/10"
+            )}
+          >
+            <RefreshCw className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <div className="flex-1">
+              {syncResult.totalAdded > 0
+                ? `Synced ${syncResult.totalAdded} new video${syncResult.totalAdded === 1 ? "" : "s"} across all connected channels. Counts below should now be up to date.`
+                : "All channels are already up to date — no new videos since last sync."}
+              {syncResult.failed > 0 && (
+                <span className="ml-1 text-amber-700 dark:text-amber-400">
+                  ({syncResult.failed} channel{syncResult.failed === 1 ? "" : "s"} failed — check /logs)
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => setSyncResult(null)}
+              className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+              aria-label="Dismiss"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </div>
+        )}
+
         {/* Headline: this month */}
         <div className="rounded-lg border bg-card p-4">
           <div className="text-[11px] text-muted-foreground uppercase">
