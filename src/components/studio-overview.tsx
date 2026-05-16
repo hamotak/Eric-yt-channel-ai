@@ -93,13 +93,18 @@ function fmt(n: number): string {
 }
 
 function fmtMinutes(min: number): string {
-  if (min >= 60_000) return `${(min / 60).toFixed(0)} hrs`;
-  if (min >= 60) {
-    const h = Math.floor(min / 60);
-    const m = min % 60;
-    return `${h}h ${m}m`;
+  // Under an hour: stay in minutes so small values still read naturally.
+  if (min < 60) return `${Math.round(min)} min`;
+  // 1+ hour: convert to hours, then K/M-scale so we never show a raw
+  // "30412 hrs" — the dashboard wants "30K hrs" / "1.2M hrs" / "850 hrs".
+  const hrs = min / 60;
+  if (hrs >= 1_000_000) {
+    return `${(hrs / 1_000_000).toFixed(1).replace(/\.0$/, "")}M hrs`;
   }
-  return `${min} min`;
+  if (hrs >= 1_000) {
+    return `${(hrs / 1_000).toFixed(1).replace(/\.0$/, "")}K hrs`;
+  }
+  return `${Math.round(hrs)} hrs`;
 }
 
 function fmtSec(sec: number): string {

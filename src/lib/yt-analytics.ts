@@ -1049,6 +1049,7 @@ export async function fetchChannelAudience(period: PeriodSpec): Promise<ChannelA
 export type RevenueBundle = {
   period: { startDate: string; endDate: string; days: number };
   totals: {
+    views: number;            // Total views in the period — RPM denominator.
     estimatedRevenue: number; // USD
     estimatedAdRevenue: number;
     estimatedRedPartnerRevenue: number;
@@ -1076,7 +1077,11 @@ export type RevenueBundle = {
   }[];
 };
 
+// `views` is the divisor for RPM = (estimatedRevenue / views) × 1000. It's
+// a non-monetary metric but YT Analytics will return it in the same
+// monetary report request — no extra API call.
 const REVENUE_METRICS = [
+  "views",
   "estimatedRevenue",
   "estimatedAdRevenue",
   "estimatedRedPartnerRevenue",
@@ -1124,6 +1129,7 @@ export async function fetchChannelRevenue(
   return {
     period: { startDate, endDate, days: actualDays },
     totals: {
+      views: Math.round(totals.views ?? 0),
       estimatedRevenue: Number((totals.estimatedRevenue ?? 0).toFixed(2)),
       estimatedAdRevenue: Number((totals.estimatedAdRevenue ?? 0).toFixed(2)),
       estimatedRedPartnerRevenue: Number((totals.estimatedRedPartnerRevenue ?? 0).toFixed(2)),

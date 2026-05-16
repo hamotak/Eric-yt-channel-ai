@@ -22,7 +22,6 @@ import {
   Hash,
   Languages,
   Type,
-  Film,
   Minus,
   Rocket,
 } from "lucide-react";
@@ -355,11 +354,8 @@ export default function ChannelPage() {
         <>
           <GrowthCard analytics={analytics} />
           <PerformanceCard analytics={analytics} />
-          <ContentMixCard analytics={analytics} />
           <CadenceCard analytics={analytics} />
-          <DayOfWeekCard analytics={analytics} />
           <HourOfDayCard analytics={analytics} />
-          <MonthlyCard analytics={analytics} />
           <ThemesCard analytics={analytics} />
           <TranscriptsCoverageCard analytics={analytics} />
         </>
@@ -491,94 +487,6 @@ function DistributionBar({ performance }: { performance: Analytics["performance"
   );
 }
 
-function ContentMixCard({ analytics }: { analytics: Analytics }) {
-  const { t } = useI18n();
-  const m = analytics.contentMix;
-  const maxBucket = Math.max(1, ...m.durationBuckets.map((b) => b.count));
-
-  return (
-    <Card className="mb-4">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Film className="h-4 w-4 text-primary" />
-          {t.channel.contentMixTitle}
-        </CardTitle>
-        <CardDescription>{t.channel.contentMixDesc}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        {/* Shorts vs long-form */}
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <MixSplitCard
-            label={t.channel.shortsLabel}
-            count={m.shorts.count}
-            avgViews={m.shorts.avgViews}
-            totalViews={m.shorts.totalViews}
-          />
-          <MixSplitCard
-            label={t.channel.longFormLabel}
-            count={m.longForm.count}
-            avgViews={m.longForm.avgViews}
-            totalViews={m.longForm.totalViews}
-          />
-        </div>
-
-        {/* Duration buckets bars */}
-        <div>
-          <div className="mb-2 text-xs font-medium text-muted-foreground">
-            {t.channel.durationDist}
-          </div>
-          <div className="space-y-1">
-            {m.durationBuckets.map((b) => (
-              <div key={b.label} className="flex items-center gap-2 text-xs">
-                <span className="w-16 shrink-0 font-mono text-muted-foreground">{b.label}</span>
-                <div className="flex-1">
-                  <div className="relative h-4 rounded bg-muted">
-                    <div
-                      className="absolute inset-y-0 left-0 rounded bg-primary/50"
-                      style={{ width: `${(b.count / maxBucket) * 100}%` }}
-                    />
-                  </div>
-                </div>
-                <span className="w-12 shrink-0 text-right tabular-nums">{b.count}</span>
-                <span className="w-16 shrink-0 text-right text-muted-foreground tabular-nums">
-                  {fmt(b.totalViews)}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function MixSplitCard({
-  label,
-  count,
-  avgViews,
-  totalViews,
-}: {
-  label: string;
-  count: number;
-  avgViews: number;
-  totalViews: number;
-}) {
-  const { t } = useI18n();
-  return (
-    <div className="rounded-md border bg-card p-3">
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="mt-1 text-2xl font-semibold tabular-nums">{count}</div>
-      <div className="text-[11px] text-muted-foreground">{t.channel.videosCountLabel}</div>
-      <div className="mt-2 flex items-center gap-3 text-xs">
-        <span className="text-muted-foreground">avg</span>
-        <span className="tabular-nums">{fmt(avgViews)}</span>
-        <span className="ml-auto text-muted-foreground">total</span>
-        <span className="tabular-nums">{fmt(totalViews)}</span>
-      </div>
-    </div>
-  );
-}
-
 function CadenceCard({ analytics }: { analytics: Analytics }) {
   const { t } = useI18n();
   const c = analytics.cadence;
@@ -629,45 +537,6 @@ function CadenceCard({ analytics }: { analytics: Analytics }) {
   );
 }
 
-function DayOfWeekCard({ analytics }: { analytics: Analytics }) {
-  const { t } = useI18n();
-  const days = analytics.patterns.byDayOfWeek;
-  const maxCount = Math.max(1, ...days.map((d) => d.count));
-  return (
-    <Card className="mb-4">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Calendar className="h-4 w-4 text-primary" />
-          {t.channel.dayOfWeekTitle}
-        </CardTitle>
-        <CardDescription>{t.channel.dayOfWeekDesc}</CardDescription>
-      </CardHeader>
-      <CardContent>
-        <div className="grid grid-cols-7 gap-2">
-          {days.map((d) => {
-            const height = (d.count / maxCount) * 100;
-            return (
-              <div key={d.day} className="flex flex-col items-center gap-1">
-                <div className="relative flex h-24 w-full items-end rounded bg-muted">
-                  <div
-                    className="w-full rounded bg-primary/60"
-                    style={{ height: `${height}%` }}
-                  />
-                </div>
-                <div className="text-[10px] font-mono text-muted-foreground">{d.label}</div>
-                <div className="text-[11px] font-semibold tabular-nums">{d.count}</div>
-                <div className="text-[9px] text-muted-foreground tabular-nums">
-                  {d.avgViews > 0 ? fmt(d.avgViews) : "—"}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 function HourOfDayCard({ analytics }: { analytics: Analytics }) {
   const { t } = useI18n();
   const hours = analytics.patterns.byHour;
@@ -705,47 +574,6 @@ function HourOfDayCard({ analytics }: { analytics: Analytics }) {
               </div>
             );
           })}
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function MonthlyCard({ analytics }: { analytics: Analytics }) {
-  const { t } = useI18n();
-  const months = analytics.patterns.byMonth;
-  if (months.length === 0) return null;
-  const maxViews = Math.max(1, ...months.map((m) => m.views));
-  return (
-    <Card className="mb-4">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Calendar className="h-4 w-4 text-primary" />
-          {t.channel.monthlyTitle}
-        </CardTitle>
-        <CardDescription>{t.channel.monthlyDesc}</CardDescription>
-      </CardHeader>
-      <CardContent>
-        <div className="space-y-1">
-          {months.map((m) => (
-            <div key={m.month} className="flex items-center gap-2 text-xs">
-              <span className="w-16 shrink-0 font-mono text-muted-foreground">{m.month}</span>
-              <div className="flex-1">
-                <div className="relative h-4 rounded bg-muted">
-                  <div
-                    className="absolute inset-y-0 left-0 rounded bg-primary/60"
-                    style={{ width: `${(m.views / maxViews) * 100}%` }}
-                  />
-                </div>
-              </div>
-              <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
-                {fmt(m.views)}
-              </span>
-              <span className="w-12 shrink-0 text-right tabular-nums">
-                {m.count} {t.channel.videosCountLabel}
-              </span>
-            </div>
-          ))}
         </div>
       </CardContent>
     </Card>

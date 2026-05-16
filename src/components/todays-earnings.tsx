@@ -260,16 +260,20 @@ function EarningsBody({ bundle }: { bundle: Bundle }) {
         </div>
       </div>
 
-      {/* RPM context */}
+      {/* RPM — what the channel earns per 1,000 views, after YouTube's cut.
+          Computed client-side from the same monetary bundle we already fetch
+          (no new endpoint). Falls back to $0 when views == 0 to avoid NaN. */}
       <div className="rounded-lg border bg-card p-3">
-        <div className="text-[10px] uppercase text-muted-foreground">
-          Avg CPM (28d)
-        </div>
+        <div className="text-[10px] uppercase text-muted-foreground">RPM</div>
         <div className="mt-1 text-2xl font-bold tabular-nums">
-          {fmtUsd(bundle.totals.cpm)}
+          {fmtUsd(
+            bundle.totals.views > 0
+              ? (bundle.totals.estimatedRevenue / bundle.totals.views) * 1000
+              : 0
+          )}
         </div>
         <div className="mt-1 text-[11px] text-muted-foreground">
-          {bundle.totals.monetizedPlaybacks.toLocaleString("en-US")} monetized playbacks
+          Revenue per 1,000 views
         </div>
       </div>
     </div>
