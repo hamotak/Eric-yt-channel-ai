@@ -3,10 +3,13 @@ import {
   addCompetitor,
   COMPETITOR_TIERS,
   Competitor,
+  CompetitorListKpis,
+  CompetitorMetrics,
+  competitorListKpis,
+  competitorMetricsByCompetitor,
   CompetitorTier,
   countUnassignedCompetitors,
   getActiveChannelId,
-  getChannel,
   getCompetitorByUserChannelAndHandle,
   getCompetitorByUserChannelAndYouTubeId,
   isCompetitorTier,
@@ -16,6 +19,7 @@ import {
 } from "@/lib/db";
 import {
   CompetitorSyncError,
+  enrichCompetitorMetadataFromYouTube,
   normaliseChannelUrl,
   syncCompetitor,
 } from "@/lib/competitor-sync";
@@ -51,10 +55,22 @@ export async function GET(req: Request) {
   // belong to whichever channel is currently focused).
   const activeId = getActiveChannelId();
 
+  // Per-row metrics + top-strip aggregates. Both helpers run a single SQL
+  // query each — no N+1. Metrics are scoped to whichever user channel
+  // we're rendering for (or "all" when no scope param was passed, used
+  // by the migration view to render every row).
+  const metricsScope =
+    scope === "unassigned" ? null : (scope ?? activeId ?? null);
+  const metricsMap = competitorMetricsByCompetitor(metricsScope);
+  const kpis = competitorListKpis(activeId);
+
   return NextResponse.json({
-    competitors: competitors.map(toWire),
+    competitors: competitors.map((c) =>
+      toWire(c, metricsMap.get(c.id))
+    ),
     unreadAlerts: unreadCompetitorAlertCount(activeId),
     unassignedCount: countUnassignedCompetitors(),
+    kpis,
   });
 }
 
@@ -152,23 +168,31 @@ export async function POST(req: Request) {
     tier: tier as CompetitorTier,
   });
 
+  let syncResult: { videosInserted?: number; newAlerts?: number } | null = null;
+  let syncError: string | undefined;
   try {
-    const result = await syncCompetitor(id);
-    return NextResponse.json({ ok: true, id, ...result });
+    syncResult = await syncCompetitor(id);
   } catch (err) {
-    const message =
+    syncError =
       err instanceof CompetitorSyncError || err instanceof Error
         ? err.message
         : "sync failed";
-    log.error("competitors", `Initial sync failed for ${id}: ${message}`, err);
-    return NextResponse.json(
-      { ok: true, id, syncError: message },
-      { status: 201 }
-    );
+    log.error("competitors", `Initial sync failed for ${id}: ${syncError}`, err);
   }
+
+  // YT Data API enrichment (canonical title / subs / videoCount / avatar).
+  // Runs whether Apify succeeded or failed — when Apify failed and the row
+  // is still channel_id=null (handle entered without UC resolution), the
+  // helper short-circuits gracefully and we just keep the syncError state.
+  await enrichCompetitorMetadataFromYouTube(id);
+
+  if (syncError) {
+    return NextResponse.json({ ok: true, id, syncError }, { status: 201 });
+  }
+  return NextResponse.json({ ok: true, id, ...(syncResult ?? {}) });
 }
 
-function toWire(c: Competitor) {
+function toWire(c: Competitor, metrics?: CompetitorMetrics) {
   return {
     id: c.id,
     channelId: c.channel_id,
@@ -182,5 +206,12 @@ function toWire(c: Competitor) {
     userChannelId: c.user_channel_id,
     tier: c.tier,
     tierSetAt: c.tier_set_at,
+    // New Phase B fields. Default to sane zero/null/empty when the metrics
+    // map has no row for this competitor (shouldn't normally happen — the
+    // SQL LEFT JOINs every competitor in scope — but defensive).
+    outliers30d: metrics?.outliers30d ?? 0,
+    medianViews30d: metrics?.medianViews30d ?? null,
+    lastUploadAt: metrics?.lastUploadAt ?? null,
+    recentVideoViews: metrics?.recentVideoViews ?? [],
   };
 }

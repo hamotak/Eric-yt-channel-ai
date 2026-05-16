@@ -3064,6 +3064,251 @@ export function listCompetitorVideos(
 }
 
 /**
+ * Per-competitor metrics computed for the card UI:
+ *  - `outliers30d`     count of videos where views > 3 × the channel's own
+ *                      30-day median (per MENTOR_METHOD §2). 0 when the 30d
+ *                      window has fewer than 5 videos (sample too small).
+ *  - `medianViews30d`  the 30-day median itself (null when <5 videos).
+ *  - `lastUploadAt`    MAX(published_at) across all videos for this
+ *                      competitor (null when no videos).
+ *  - `recentVideoViews` last 10 videos' views, most-recent first.
+ *
+ * All values come from ONE SQL round trip — no N+1. The query joins five
+ * CTEs and returns one row per competitor in the scope.
+ */
+export type CompetitorMetrics = {
+  outliers30d: number;
+  medianViews30d: number | null;
+  lastUploadAt: number | null;
+  recentVideoViews: number[];
+};
+
+export function competitorMetricsByCompetitor(
+  userChannelId?: string | null
+): Map<number, CompetitorMetrics> {
+  const scope = userChannelId ?? null;
+  const rows = db
+    .prepare(
+      `WITH videos_30d AS (
+         SELECT v.competitor_id, v.views,
+                ROW_NUMBER() OVER (PARTITION BY v.competitor_id ORDER BY v.views) AS rn,
+                COUNT(*)     OVER (PARTITION BY v.competitor_id)                  AS n_30d
+         FROM competitor_videos v
+         JOIN competitors c ON c.id = v.competitor_id
+         WHERE v.published_at > strftime('%s','now') - 30 * 86400
+           AND (? IS NULL OR c.user_channel_id = ?)
+       ),
+       qualified_medians AS (
+         SELECT competitor_id, AVG(views) AS median_views
+         FROM videos_30d
+         WHERE n_30d >= 5 AND rn IN ((n_30d + 1) / 2, (n_30d + 2) / 2)
+         GROUP BY competitor_id
+       ),
+       outlier_30d_count AS (
+         SELECT v.competitor_id, COUNT(*) AS n_outliers
+         FROM competitor_videos v
+         JOIN qualified_medians m ON m.competitor_id = v.competitor_id
+         WHERE v.published_at > strftime('%s','now') - 30 * 86400
+           AND v.views > 3 * m.median_views
+         GROUP BY v.competitor_id
+       ),
+       last_upload_by_competitor AS (
+         SELECT competitor_id, MAX(published_at) AS last_upload_at
+         FROM competitor_videos
+         GROUP BY competitor_id
+       ),
+       recent_videos AS (
+         SELECT competitor_id, views,
+                ROW_NUMBER() OVER (PARTITION BY competitor_id ORDER BY published_at DESC) AS rn
+         FROM competitor_videos
+       ),
+       recent_views_by_competitor AS (
+         SELECT competitor_id, JSON_GROUP_ARRAY(views) AS recent_views_json
+         FROM recent_videos WHERE rn <= 10
+         GROUP BY competitor_id
+       )
+       SELECT
+         c.id                                  AS competitor_id,
+         COALESCE(o.n_outliers, 0)             AS outliers30d,
+         CAST(m.median_views AS INTEGER)       AS medianViews30d,
+         l.last_upload_at                      AS lastUploadAt,
+         COALESCE(r.recent_views_json, '[]')   AS recentVideoViewsJson
+       FROM competitors c
+       LEFT JOIN qualified_medians         m ON m.competitor_id = c.id
+       LEFT JOIN outlier_30d_count         o ON o.competitor_id = c.id
+       LEFT JOIN last_upload_by_competitor l ON l.competitor_id = c.id
+       LEFT JOIN recent_views_by_competitor r ON r.competitor_id = c.id
+       WHERE (? IS NULL OR c.user_channel_id = ?)`
+    )
+    .all(scope, scope, scope, scope) as {
+    competitor_id: number;
+    outliers30d: number;
+    medianViews30d: number | null;
+    lastUploadAt: number | null;
+    recentVideoViewsJson: string;
+  }[];
+
+  const map = new Map<number, CompetitorMetrics>();
+  for (const row of rows) {
+    let recent: number[] = [];
+    try {
+      const parsed = JSON.parse(row.recentVideoViewsJson);
+      if (Array.isArray(parsed)) recent = parsed.filter((n) => typeof n === "number");
+    } catch {
+      /* keep [] */
+    }
+    map.set(row.competitor_id, {
+      outliers30d: row.outliers30d,
+      medianViews30d: row.medianViews30d,
+      lastUploadAt: row.lastUploadAt,
+      recentVideoViews: recent,
+    });
+  }
+  return map;
+}
+
+/** Same shape as competitorMetricsByCompetitor but scoped to one competitor. */
+export function competitorMetricsForOne(
+  competitorId: number
+): CompetitorMetrics {
+  const row = db
+    .prepare(
+      `WITH videos_30d AS (
+         SELECT v.views,
+                ROW_NUMBER() OVER (ORDER BY v.views) AS rn,
+                COUNT(*)     OVER ()                 AS n_30d
+         FROM competitor_videos v
+         WHERE v.competitor_id = ?
+           AND v.published_at > strftime('%s','now') - 30 * 86400
+       ),
+       qualified_median AS (
+         SELECT AVG(views) AS median_views
+         FROM videos_30d
+         WHERE n_30d >= 5 AND rn IN ((n_30d + 1) / 2, (n_30d + 2) / 2)
+       ),
+       outliers_count AS (
+         SELECT COUNT(*) AS n_outliers
+         FROM competitor_videos v
+         CROSS JOIN qualified_median m
+         WHERE v.competitor_id = ?
+           AND v.published_at > strftime('%s','now') - 30 * 86400
+           AND v.views > 3 * m.median_views
+       ),
+       recent_views AS (
+         SELECT JSON_GROUP_ARRAY(views) AS recent_views_json
+         FROM (
+           SELECT views FROM competitor_videos
+           WHERE competitor_id = ?
+           ORDER BY published_at DESC
+           LIMIT 10
+         )
+       ),
+       last_upload AS (
+         SELECT MAX(published_at) AS last_upload_at
+         FROM competitor_videos WHERE competitor_id = ?
+       )
+       SELECT
+         COALESCE((SELECT n_outliers FROM outliers_count), 0)                AS outliers30d,
+         (SELECT CAST(median_views AS INTEGER) FROM qualified_median)        AS medianViews30d,
+         (SELECT last_upload_at FROM last_upload)                            AS lastUploadAt,
+         COALESCE((SELECT recent_views_json FROM recent_views), '[]')        AS recentVideoViewsJson`
+    )
+    .get(competitorId, competitorId, competitorId, competitorId) as
+    | {
+        outliers30d: number;
+        medianViews30d: number | null;
+        lastUploadAt: number | null;
+        recentVideoViewsJson: string;
+      }
+    | undefined;
+  if (!row) {
+    return {
+      outliers30d: 0,
+      medianViews30d: null,
+      lastUploadAt: null,
+      recentVideoViews: [],
+    };
+  }
+  let recent: number[] = [];
+  try {
+    const parsed = JSON.parse(row.recentVideoViewsJson);
+    if (Array.isArray(parsed)) recent = parsed.filter((n) => typeof n === "number");
+  } catch {
+    /* keep [] */
+  }
+  return {
+    outliers30d: row.outliers30d,
+    medianViews30d: row.medianViews30d,
+    lastUploadAt: row.lastUploadAt,
+    recentVideoViews: recent,
+  };
+}
+
+/**
+ * Aggregate KPI strip values for /competitors. competitors = count of rows
+ * in scope; combinedSubs = SUM of subscriber_count; outliersThisWeek = count
+ * of competitor_videos rows in scope where views > 3× the channel's 30-day
+ * median AND published in the last 7 days; lastSync = MAX(last_sync_at).
+ */
+export type CompetitorListKpis = {
+  competitors: number;
+  combinedSubs: number;
+  outliersThisWeek: number;
+  lastSync: number | null;
+};
+
+export function competitorListKpis(
+  userChannelId?: string | null
+): CompetitorListKpis {
+  const scope = userChannelId ?? null;
+  const basics = db
+    .prepare(
+      `SELECT COUNT(*)                            AS competitors,
+              COALESCE(SUM(subscriber_count), 0)  AS combinedSubs,
+              MAX(last_sync_at)                   AS lastSync
+       FROM competitors
+       WHERE (? IS NULL OR user_channel_id = ?)`
+    )
+    .get(scope, scope) as {
+    competitors: number;
+    combinedSubs: number;
+    lastSync: number | null;
+  };
+  const otw = db
+    .prepare(
+      `WITH videos_30d AS (
+         SELECT v.competitor_id, v.views,
+                ROW_NUMBER() OVER (PARTITION BY v.competitor_id ORDER BY v.views) AS rn,
+                COUNT(*)     OVER (PARTITION BY v.competitor_id)                  AS n_30d
+         FROM competitor_videos v
+         JOIN competitors c ON c.id = v.competitor_id
+         WHERE v.published_at > strftime('%s','now') - 30 * 86400
+           AND (? IS NULL OR c.user_channel_id = ?)
+       ),
+       qualified_medians AS (
+         SELECT competitor_id, AVG(views) AS median_views
+         FROM videos_30d
+         WHERE n_30d >= 5 AND rn IN ((n_30d + 1) / 2, (n_30d + 2) / 2)
+         GROUP BY competitor_id
+       )
+       SELECT COUNT(*) AS outliersThisWeek
+       FROM competitor_videos v
+       JOIN qualified_medians m ON m.competitor_id = v.competitor_id
+       JOIN competitors c       ON c.id            = v.competitor_id
+       WHERE v.published_at > strftime('%s','now') - 7 * 86400
+         AND v.views > 3 * m.median_views
+         AND (? IS NULL OR c.user_channel_id = ?)`
+    )
+    .get(scope, scope, scope, scope) as { outliersThisWeek: number };
+  return {
+    competitors: basics.competitors,
+    combinedSubs: basics.combinedSubs,
+    outliersThisWeek: otw.outliersThisWeek,
+    lastSync: basics.lastSync,
+  };
+}
+
+/**
  * Median views across this competitor's catalogue. Used as the
  * baseline for outlier detection — anything ≥2× median flips into
  * an alert. Median chosen over mean because a single huge hit

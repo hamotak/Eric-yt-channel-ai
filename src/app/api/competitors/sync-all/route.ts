@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { getActiveChannelId, listCompetitors } from "@/lib/db";
-import { syncCompetitor } from "@/lib/competitor-sync";
+import {
+  enrichCompetitorMetadataFromYouTube,
+  syncCompetitor,
+} from "@/lib/competitor-sync";
 import { log } from "@/lib/logger";
 
 export const runtime = "nodejs";
@@ -45,6 +48,9 @@ export async function POST(req: Request) {
   }> = [];
 
   for (const c of competitors) {
+    // YT enrichment first (1 quota unit), serial across competitors so we
+    // don't burst the YT API. Non-fatal — the helper handles its own errors.
+    await enrichCompetitorMetadataFromYouTube(c.id);
     try {
       const r = await syncCompetitor(c.id);
       results.push({

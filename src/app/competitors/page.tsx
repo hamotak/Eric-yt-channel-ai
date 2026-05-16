@@ -59,6 +59,17 @@ type Competitor = {
   userChannelId: string | null;
   tier: Tier;
   tierSetAt: number | null;
+  outliers30d: number;
+  medianViews30d: number | null;
+  lastUploadAt: number | null;
+  recentVideoViews: number[];
+};
+
+type Kpis = {
+  competitors: number;
+  combinedSubs: number;
+  outliersThisWeek: number;
+  lastSync: number | null;
 };
 
 type UserChannel = {
@@ -113,6 +124,12 @@ export default function CompetitorsPage() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [channels, setChannels] = useState<UserChannel[]>([]);
   const [competitors, setCompetitors] = useState<Competitor[]>([]);
+  const [kpis, setKpis] = useState<Kpis>({
+    competitors: 0,
+    combinedSubs: 0,
+    outliersThisWeek: 0,
+    lastSync: null,
+  });
   const [unassignedCount, setUnassignedCount] = useState(0);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [gaps, setGaps] = useState<Gap[]>([]);
@@ -162,10 +179,12 @@ export default function CompetitorsPage() {
         competitors: Competitor[];
         unreadAlerts: number;
         unassignedCount: number;
+        kpis: Kpis;
       };
       setCompetitors(d.competitors);
       setUnread(d.unreadAlerts);
       setUnassignedCount(d.unassignedCount);
+      if (d.kpis) setKpis(d.kpis);
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load");
     } finally {
@@ -365,22 +384,6 @@ export default function CompetitorsPage() {
     });
   };
 
-  const totalSubs = useMemo(
-    () => competitors.reduce((acc, c) => acc + (c.subscriberCount ?? 0), 0),
-    [competitors]
-  );
-  const totalVideos = useMemo(
-    () => competitors.reduce((acc, c) => acc + (c.videoCount ?? 0), 0),
-    [competitors]
-  );
-  const lastSync = useMemo(() => {
-    const max = competitors.reduce(
-      (acc, c) => (c.lastSyncAt && c.lastSyncAt > acc ? c.lastSyncAt : acc),
-      0
-    );
-    return max || null;
-  }, [competitors]);
-
   if (loading) {
     return (
       <div className="mx-auto max-w-6xl">
@@ -506,23 +509,29 @@ export default function CompetitorsPage() {
       {/* ===== OVERVIEW ===== */}
       {!migrationView && tab === "overview" && (
         <div className="space-y-4">
-          {/* KPI strip */}
+          {/* KPI strip — server-computed scoped to the active user channel.
+              "Outliers this week" replaces the old "Videos tracked", which
+              didn't surface anything actionable. */}
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Kpi
               icon={Users}
               label="Competitors"
-              value={String(competitors.length)}
+              value={String(kpis.competitors)}
             />
-            <Kpi icon={Eye} label="Combined subs" value={fmtCount(totalSubs)} />
+            <Kpi
+              icon={Eye}
+              label="Combined subs"
+              value={fmtCount(kpis.combinedSubs)}
+            />
             <Kpi
               icon={TrendingUp}
-              label="Videos tracked"
-              value={fmtCount(totalVideos)}
+              label="Outliers this week"
+              value={String(kpis.outliersThisWeek)}
             />
             <Kpi
               icon={RefreshCw}
               label="Last sync"
-              value={fmtRelative(lastSync)}
+              value={fmtRelative(kpis.lastSync)}
             />
           </div>
 
@@ -599,7 +608,7 @@ export default function CompetitorsPage() {
               </CardContent>
             </Card>
           ) : (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
               {visibleCompetitors.map((c) => (
                 <CompetitorCard
                   key={c.id}
@@ -837,141 +846,224 @@ function CompetitorCard({
   const initial = (competitor.title ?? competitor.handle ?? "?")
     .slice(0, 1)
     .toUpperCase();
+
+  // The whole card is a click target → competitor detail page. Every
+  // interactive control inside MUST stopPropagation, otherwise clicking
+  // a dropdown / icon also triggers the navigation. Each control wraps
+  // its own handler so we don't accidentally call the parent <Link>.
+  const stop = (e: React.MouseEvent | React.PointerEvent) => {
+    e.stopPropagation();
+  };
+
   return (
-    <Card>
-      <CardContent className="p-4">
-        <div className="flex items-start gap-3">
-          {competitor.avatarUrl ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={competitor.avatarUrl}
-              alt=""
-              className="h-10 w-10 shrink-0 rounded-full object-cover"
-              referrerPolicy="no-referrer"
-            />
-          ) : (
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-semibold text-muted-foreground">
-              {initial}
-            </div>
-          )}
-          <div className="min-w-0 flex-1">
-            <div className="flex items-start justify-between gap-2">
-              <div className="min-w-0">
-                <div className="truncate font-medium">
-                  {competitor.title ?? "(syncing…)"}
-                </div>
-                <div className="truncate text-xs text-muted-foreground">
-                  {competitor.handle ?? competitor.channelId ?? "—"}
-                </div>
+    <Link
+      href={`/competitors/${competitor.id}`}
+      className="block rounded-xl outline-none transition-colors hover:bg-accent/30 focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <Card>
+        <CardContent className="p-4">
+          {/* Top row: avatar + title + tier badge top-right */}
+          <div className="flex items-start gap-3">
+            {competitor.avatarUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={competitor.avatarUrl}
+                alt=""
+                className="h-8 w-8 shrink-0 rounded-full object-cover"
+                referrerPolicy="no-referrer"
+              />
+            ) : (
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-semibold text-muted-foreground">
+                {initial}
               </div>
+            )}
+            <div className="min-w-0 flex-1">
+              <div className="break-words text-sm font-semibold leading-snug">
+                {competitor.title ?? "(syncing…)"}
+              </div>
+              <div className="mt-0.5 break-all text-xs text-muted-foreground">
+                {competitor.handle ?? competitor.channelId ?? "—"}
+              </div>
+            </div>
+            <div className="flex shrink-0 flex-col items-end gap-1">
               <span
                 className={cn(
-                  "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium",
+                  "rounded-full px-2 py-0.5 text-[10px] font-medium",
                   TIER_PILL[competitor.tier]
                 )}
               >
                 {TIER_LABEL[competitor.tier]}
               </span>
+              <div className="flex items-center gap-0.5">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    stop(e);
+                    onSync();
+                  }}
+                  disabled={syncing}
+                  className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
+                  title="Sync now"
+                  aria-label="Sync"
+                >
+                  {syncing ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-3 w-3" />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    stop(e);
+                    onRemove();
+                  }}
+                  className="rounded-md p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                  title="Remove"
+                  aria-label="Remove"
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
+              </div>
             </div>
           </div>
-          <div className="flex shrink-0 items-center gap-1">
-            <button
-              type="button"
-              onClick={onSync}
-              disabled={syncing}
-              className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
-              title="Sync now"
-              aria-label="Sync"
-            >
-              {syncing ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="h-3.5 w-3.5" />
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={onRemove}
-              className="rounded-md p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-              title="Remove"
-              aria-label="Remove"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-            </button>
+
+          {/* 4-cell metric strip */}
+          <div className="mt-3 grid grid-cols-4 gap-2 text-center text-xs">
+            <CardMetric label="Subs" value={fmtCount(competitor.subscriberCount)} />
+            <CardMetric
+              label="Outliers 30d"
+              value={String(competitor.outliers30d)}
+              highlight={competitor.outliers30d > 0}
+            />
+            <CardMetric
+              label="Median views"
+              value={fmtCount(competitor.medianViews30d)}
+            />
+            <CardMetric
+              label="Last upload"
+              value={fmtRelative(competitor.lastUploadAt)}
+            />
           </div>
-        </div>
-        <div className="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-              Subs
-            </div>
-            <div className="font-semibold">
-              {fmtCount(competitor.subscriberCount)}
-            </div>
-          </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-              Videos
-            </div>
-            <div className="font-semibold">
-              {fmtCount(competitor.videoCount)}
-            </div>
-          </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-              Synced
-            </div>
-            <div className="font-semibold">
-              {fmtRelative(competitor.lastSyncAt)}
-            </div>
-          </div>
-        </div>
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3 text-[11px]">
-          <label className="inline-flex items-center gap-1.5 text-muted-foreground">
-            <span>Tier:</span>
-            <select
-              value={competitor.tier}
-              onChange={(e) => onTierChange(e.target.value as Tier)}
-              className="rounded-md border border-input bg-background px-1.5 py-0.5 text-[11px]"
-            >
-              {TIERS.map((t) => (
-                <option key={t} value={t}>
-                  {TIER_LABEL[t]}
-                </option>
-              ))}
-            </select>
-          </label>
-          {otherChannels.length > 0 && (
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setMoveOpen((v) => !v)}
-                className="text-muted-foreground hover:text-foreground"
-              >
-                Move to another channel ↗
-              </button>
-              {moveOpen && (
-                <div className="absolute right-0 z-10 mt-1 min-w-[200px] rounded-md border border-border bg-popover p-1 shadow-md">
-                  {otherChannels.map((ch) => (
-                    <button
-                      key={ch.id}
-                      type="button"
-                      onClick={() => {
-                        setMoveOpen(false);
-                        onMove(ch.id);
-                      }}
-                      className="block w-full truncate rounded px-2 py-1 text-left text-xs hover:bg-accent"
-                    >
-                      {ch.title ?? ch.handle ?? ch.id}
-                    </button>
-                  ))}
-                </div>
-              )}
+
+          {/* Sparkline — last 10 videos' views. Skipped when there's nothing
+              to plot (need at least 2 points to draw a line). */}
+          {competitor.recentVideoViews.length > 1 && (
+            <div className="mt-3 text-primary/70">
+              <CardSparkline values={competitor.recentVideoViews} />
             </div>
           )}
-        </div>
-      </CardContent>
-    </Card>
+
+          {/* Bottom row: tier dropdown + move-to-another-channel link. Both
+              call stop() so clicking them doesn't trigger the card link. */}
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3 text-[11px]">
+            <label
+              className="inline-flex items-center gap-1.5 text-muted-foreground"
+              onClick={stop}
+            >
+              <span>Tier:</span>
+              <select
+                value={competitor.tier}
+                onChange={(e) => onTierChange(e.target.value as Tier)}
+                onClick={stop}
+                className="rounded-md border border-input bg-background px-1.5 py-0.5 text-[11px]"
+              >
+                {TIERS.map((t) => (
+                  <option key={t} value={t}>
+                    {TIER_LABEL[t]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {otherChannels.length > 0 && (
+              <div className="relative" onClick={stop}>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    stop(e);
+                    setMoveOpen((v) => !v);
+                  }}
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  Move to another channel ↗
+                </button>
+                {moveOpen && (
+                  <div className="absolute right-0 z-10 mt-1 min-w-[200px] rounded-md border border-border bg-popover p-1 shadow-md">
+                    {otherChannels.map((ch) => (
+                      <button
+                        key={ch.id}
+                        type="button"
+                        onClick={(e) => {
+                          stop(e);
+                          setMoveOpen(false);
+                          onMove(ch.id);
+                        }}
+                        className="block w-full truncate rounded px-2 py-1 text-left text-xs hover:bg-accent"
+                      >
+                        {ch.title ?? ch.handle ?? ch.id}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    </Link>
+  );
+}
+
+function CardMetric({
+  label,
+  value,
+  highlight,
+}: {
+  label: string;
+  value: string;
+  highlight?: boolean;
+}) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+        {label}
+      </div>
+      <div
+        className={cn(
+          "mt-0.5 font-semibold",
+          highlight && "text-emerald-600 dark:text-emerald-400"
+        )}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function CardSparkline({ values }: { values: number[] }) {
+  // Server returns most-recent first. Visually: left=oldest → right=newest.
+  const ordered = [...values].reverse();
+  if (ordered.length < 2) return null;
+  const max = Math.max(...ordered, 1);
+  const w = 100;
+  const h = 24;
+  const dx = w / (ordered.length - 1);
+  const points = ordered
+    .map((v, i) => `${(i * dx).toFixed(1)},${(h - (v / max) * h).toFixed(1)}`)
+    .join(" L");
+  return (
+    <svg
+      viewBox={`0 0 ${w} ${h}`}
+      preserveAspectRatio="none"
+      className="h-6 w-full"
+    >
+      <path
+        d={`M${points}`}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+      />
+    </svg>
   );
 }
 

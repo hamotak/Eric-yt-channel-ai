@@ -1,6 +1,7 @@
 import "server-only";
 import { apifyYouTubeScrape, type ApifyYouTubeVideo } from "./apify";
 import {
+  Competitor,
   competitorMedianViews,
   getCompetitor,
   getIntegration,
@@ -9,6 +10,7 @@ import {
   upsertCompetitorVideo,
 } from "./db";
 import { log } from "./logger";
+import { resolveChannel, YouTubeApiError } from "./youtube";
 
 // Outlier threshold — when a video's views exceed median × this we flag it.
 // 2× is a reasonable starting point: it catches genuine breakout content
@@ -195,4 +197,82 @@ export async function syncCompetitor(competitorId: number): Promise<{
     channelTitle,
     medianViews: median,
   };
+}
+
+/**
+ * Always-on YouTube Data API metadata enrichment. Layered on top of the
+ * Apify sync (Apify still owns video lists + view counts; YT API owns
+ * canonical channel metadata: title, subscriber count, video count, avatar).
+ *
+ * Safe to call repeatedly — overwrites the same DB columns each time.
+ * Returns ok:false rather than throwing on any of:
+ *   - competitor row missing
+ *   - channel_id not yet resolved (Apify hasn't run / errored on add)
+ *   - no YouTube Data API key configured
+ *   - YouTube API error (4xx/5xx, network, channel not found)
+ *
+ * Quota cost: 1 unit per call (channels.list with a single UC-id).
+ */
+export type EnrichResult = {
+  ok: boolean;
+  fields: Partial<{
+    subscriber_count: number | null;
+    video_count: number | null;
+    title: string | null;
+    avatar_url: string | null;
+    handle: string | null;
+  }>;
+  error?: string;
+};
+
+export async function enrichCompetitorMetadataFromYouTube(
+  competitorId: number
+): Promise<EnrichResult> {
+  const comp = getCompetitor(competitorId);
+  if (!comp) {
+    return { ok: false, fields: {}, error: "competitor not found" };
+  }
+  if (!comp.channel_id) {
+    // Handle-only entries until first Apify sync resolves the UC-id.
+    return { ok: false, fields: {}, error: "no channel_id resolved yet" };
+  }
+  const apiKey = getIntegration("youtube")?.api_key;
+  if (!apiKey) {
+    return { ok: false, fields: {}, error: "no YouTube Data API key configured" };
+  }
+
+  try {
+    // resolveChannel called with a UC-id skips the search/handle lookup
+    // and goes straight to channels.list — exactly 1 quota unit.
+    const resolved = await resolveChannel(comp.channel_id, apiKey);
+
+    const fields: EnrichResult["fields"] = {
+      title: resolved.title,
+      subscriber_count: resolved.subscribers,
+      video_count: resolved.videoCount,
+      avatar_url: resolved.thumbnail,
+    };
+    // Handle protection: only overwrite a null local handle. Never clobber
+    // a value the user typed in (custom URLs returned by YouTube can lag
+    // by months when a creator updates their @handle).
+    if (!comp.handle && resolved.handle) {
+      fields.handle = resolved.handle.startsWith("@")
+        ? resolved.handle
+        : `@${resolved.handle}`;
+    }
+
+    updateCompetitorAfterSync(competitorId, fields as Partial<Competitor>);
+    log.info("competitors", `YT enrich ${comp.channel_id}: 1 unit quota burned`);
+    return { ok: true, fields };
+  } catch (err) {
+    const message =
+      err instanceof YouTubeApiError || err instanceof Error
+        ? err.message
+        : "unknown error";
+    log.warn(
+      "competitors",
+      `YT enrich ${comp.channel_id} failed (non-fatal): ${message}`
+    );
+    return { ok: false, fields: {}, error: message };
+  }
 }

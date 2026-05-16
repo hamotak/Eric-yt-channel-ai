@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import {
   COMPETITOR_TIERS,
+  competitorMetricsForOne,
   CompetitorTier,
   deleteCompetitor,
   getCompetitor,
@@ -13,6 +14,11 @@ import {
 
 export const runtime = "nodejs";
 
+/**
+ * Returns the single competitor row in the same wire shape the list endpoint
+ * uses (camelCase, metrics merged in) plus the 100 most-watched videos for
+ * the placeholder detail page.
+ */
 export async function GET(
   _req: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -26,8 +32,29 @@ export async function GET(
   if (!competitor) {
     return NextResponse.json({ error: "not found" }, { status: 404 });
   }
+  const metrics = competitorMetricsForOne(competitorId);
   const videos = listCompetitorVideos(competitorId, 100);
-  return NextResponse.json({ competitor, videos });
+  return NextResponse.json({
+    competitor: {
+      id: competitor.id,
+      channelId: competitor.channel_id,
+      handle: competitor.handle,
+      title: competitor.title,
+      avatarUrl: competitor.avatar_url,
+      subscriberCount: competitor.subscriber_count,
+      videoCount: competitor.video_count,
+      addedAt: competitor.added_at,
+      lastSyncAt: competitor.last_sync_at,
+      userChannelId: competitor.user_channel_id,
+      tier: competitor.tier,
+      tierSetAt: competitor.tier_set_at,
+      outliers30d: metrics.outliers30d,
+      medianViews30d: metrics.medianViews30d,
+      lastUploadAt: metrics.lastUploadAt,
+      recentVideoViews: metrics.recentVideoViews,
+    },
+    videos,
+  });
 }
 
 /**
