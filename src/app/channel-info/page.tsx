@@ -249,12 +249,14 @@ function SingleChannelCard({
   const [aiApplying, setAiApplying] = useState(false);
 
   // Load /api/channel to populate the detail widgets (themes, transcripts
-  // coverage, about, meta). The endpoint reads the active channel; we
-  // accept whatever it returns for now. In a follow-up the API could
-  // accept ?channelId= to scope explicitly.
+  // coverage, about, meta). Pass the focused channel id explicitly so the
+  // server scopes its queries to THIS channel even when the global active
+  // pointer points elsewhere (e.g. user clicked a row in the "All
+  // channels" summary table → ?focus=<id> overrides for one page load).
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/channel", { cache: "no-store" })
+    const qs = `?channelId=${encodeURIComponent(channel.channelId)}`;
+    fetch(`/api/channel${qs}`, { cache: "no-store" })
       .then((r) => r.json())
       .then((d) => {
         if (cancelled) return;

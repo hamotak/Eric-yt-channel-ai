@@ -6,7 +6,8 @@ import { ArrowLeft, Loader2 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
-type Tier = "authority" | "breakthrough" | "adjacent" | "far";
+const TIERS = ["authority", "breakthrough", "adjacent", "far"] as const;
+type Tier = (typeof TIERS)[number];
 
 const TIER_LABEL: Record<Tier, string> = {
   authority: "Authority",
@@ -34,10 +35,17 @@ type Competitor = {
   subscriberCount: number | null;
   videoCount: number | null;
   tier: Tier;
+  userChannelId: string | null;
   outliers30d: number;
   medianViews30d: number | null;
   lastUploadAt: number | null;
   recentVideoViews: number[];
+};
+
+type UserChannel = {
+  id: string;
+  title: string | null;
+  handle: string | null;
 };
 
 function fmtCount(n: number | null | undefined): string {
@@ -65,6 +73,9 @@ export default function CompetitorDetailPage({
 }) {
   const { id } = use(params);
   const [comp, setComp] = useState<Competitor | null>(null);
+  const [channels, setChannels] = useState<UserChannel[]>([]);
+  const [moveOpen, setMoveOpen] = useState(false);
+  const [patching, setPatching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -87,6 +98,56 @@ export default function CompetitorDetailPage({
       cancelled = true;
     };
   }, [id]);
+
+  // Channel list for the "Move to another channel" chooser. Same source
+  // as the list-page card so the dropdown shows every channel the user
+  // owns minus the one this competitor is already assigned to.
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/channels", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((d: { channels?: UserChannel[] }) => {
+        if (cancelled) return;
+        setChannels(d.channels ?? []);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Both controls hit the existing PATCH /api/competitors/[id]. On 200,
+  // update local state from the returned full record so the page
+  // reflects the change without a hard reload.
+  const patchCompetitor = async (patch: {
+    tier?: Tier;
+    userChannelId?: string | null;
+  }) => {
+    if (patching) return;
+    setPatching(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/competitors/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      const d = (await r.json().catch(() => ({}))) as {
+        ok?: boolean;
+        competitor?: Competitor;
+        error?: string;
+      };
+      if (!r.ok || !d.ok || !d.competitor) {
+        setError(d.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      setComp(d.competitor);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "update failed");
+    } finally {
+      setPatching(false);
+    }
+  };
 
   if (error) {
     return (
@@ -156,15 +217,74 @@ export default function CompetitorDetailPage({
                     {comp.handle ?? comp.channelId ?? "—"}
                   </div>
                 </div>
-                <span
-                  className={cn(
-                    "shrink-0 rounded-full px-2.5 py-0.5 text-xs font-medium",
-                    TIER_PILL[comp.tier]
+                <div className="flex shrink-0 flex-col items-end gap-1.5">
+                  <span
+                    className={cn(
+                      "rounded-full px-2.5 py-0.5 text-xs font-medium",
+                      TIER_PILL[comp.tier]
+                    )}
+                  >
+                    {TIER_LABEL[comp.tier]}
+                  </span>
+                  {/* Inline tier dropdown — mirrors the list-page card so
+                      the user can re-tag without going back. */}
+                  <label className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <span>Tier:</span>
+                    <select
+                      value={comp.tier}
+                      onChange={(e) =>
+                        patchCompetitor({ tier: e.target.value as Tier })
+                      }
+                      disabled={patching}
+                      className="rounded-md border border-input bg-background px-1.5 py-0.5 text-[11px]"
+                    >
+                      {TIERS.map((t) => (
+                        <option key={t} value={t}>
+                          {TIER_LABEL[t]}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {/* Move-to-another-channel chooser. Only show if the
+                      user owns more than just this competitor's current
+                      channel — otherwise the chooser would be empty. */}
+                  {channels.filter((c) => c.id !== comp.userChannelId).length >
+                    0 && (
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => setMoveOpen((v) => !v)}
+                        disabled={patching}
+                        className="text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-60"
+                      >
+                        Move to another channel ↗
+                      </button>
+                      {moveOpen && (
+                        <div className="absolute right-0 z-10 mt-1 min-w-[200px] rounded-md border border-border bg-popover p-1 shadow-md">
+                          {channels
+                            .filter((c) => c.id !== comp.userChannelId)
+                            .map((ch) => (
+                              <button
+                                key={ch.id}
+                                type="button"
+                                onClick={() => {
+                                  setMoveOpen(false);
+                                  patchCompetitor({ userChannelId: ch.id });
+                                }}
+                                className="block w-full truncate rounded px-2 py-1 text-left text-xs hover:bg-accent"
+                              >
+                                {ch.title ?? ch.handle ?? ch.id}
+                              </button>
+                            ))}
+                        </div>
+                      )}
+                    </div>
                   )}
-                >
-                  {TIER_LABEL[comp.tier]}
-                </span>
+                </div>
               </div>
+              {error && (
+                <div className="mt-2 text-[11px] text-destructive">{error}</div>
+              )}
             </div>
           </div>
 

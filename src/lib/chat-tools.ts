@@ -949,7 +949,7 @@ export function buildSystemPrompt(
         .join(", ");
       lines.push(
         `- The user has **${allChannels.length} channels connected** in this app. Other connected channels (NOT active right now): ${others}.`,
-        `- **CRITICAL multi-channel rule:** every local-DB tool (list_videos, search_transcripts, search_comments, video_stats, hooks_*, formula_*, raw_sql, etc.) returns data from the ACTIVE channel only. The other channels' videos/transcripts/comments are NOT visible to these tools until the user switches the active channel. If the user asks "ideas based on our channel" or "what's worked for us", that always means the ACTIVE channel — never an aggregate across all of them, and never a different one.`,
+        `- **CRITICAL multi-channel rule:** every local-DB tool (list_videos, search_transcripts, search_comments, video_stats, raw_sql, etc.) returns data from the ACTIVE channel only. The other channels' videos/transcripts/comments are NOT visible to these tools until the user switches the active channel. If the user asks "ideas based on our channel" or "what's worked for us", that always means the ACTIVE channel — never an aggregate across all of them, and never a different one.`,
         `- If the user names a specific channel by handle/title that matches one of their OTHER connected channels, tell them to switch to it in the sidebar first. Do not silently answer with the active channel's data and pretend it's the other one.`
       );
     }

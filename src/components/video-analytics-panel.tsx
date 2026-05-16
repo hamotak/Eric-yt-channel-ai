@@ -235,7 +235,7 @@ export function VideoAnalyticsPanel({ videoId }: { videoId: string }) {
                 Per-video analytics need a Google OAuth connection so we can pull
                 data from the YouTube Analytics API.
               </p>
-              <Link href="/integrations#youtube-analytics">
+              <Link href="/settings/integrations#youtube-analytics">
                 <Button size="sm" variant="outline" className="mt-2 gap-2">
                   Connect YouTube Analytics
                   <ArrowUpRight className="h-3.5 w-3.5" />

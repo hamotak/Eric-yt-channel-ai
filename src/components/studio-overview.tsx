@@ -180,7 +180,7 @@ export function StudioOverview() {
               Connect Google OAuth to see Studio-style channel analytics — views
               over time, watch time, subscriber dynamics, top videos by period.
             </p>
-            <Link href="/integrations#youtube-analytics">
+            <Link href="/settings/integrations#youtube-analytics">
               <Button size="sm" variant="outline" className="mt-2 gap-2">
                 Connect YouTube Analytics
                 <ArrowUpRight className="h-3.5 w-3.5" />
@@ -259,7 +259,7 @@ export function StudioOverview() {
                   Channel owner clicks <strong>Reconnect</strong> on this
                   machine themselves, with their own Google account. Their
                   refresh token gets saved locally —{" "}
-                  <Link href="/integrations#youtube-analytics" className="text-primary hover:underline">
+                  <Link href="/settings/integrations#youtube-analytics" className="text-primary hover:underline">
                     Integrations
                   </Link>
                   .

@@ -498,7 +498,7 @@ export type Channel = {
   monetization_status?: "monetized" | "pending" | "not_eligible" | null;
   notes?: string | null;
   expected_videos_per_month?: number | null;
-  // Per-channel context fields (set via /my-channels). DEFAULT '' in
+  // Per-channel context fields (set via /channel-info). DEFAULT '' in
   // the schema means existing rows already have an empty string after
   // the migration ran, so these are always strings, never null.
   niche?: string;
@@ -537,12 +537,12 @@ export function updateChannelMeta(channelId: string, patch: ChannelMeta): void {
 }
 
 /**
- * Channel context fields edited on /my-channels. Snake-case here is the
+ * Channel context fields edited on /channel-info. Snake-case here is the
  * column name; the API route maps the camelCase `externalSources` wire
  * shape to `external_sources` before calling this. Separate from
  * updateChannelMeta because the two pages have different concerns:
- * /integrations owns billing/monetization meta, /my-channels owns the
- * strategy/voice context that downstream AI features consume.
+ * /settings/integrations owns billing/monetization meta, /channel-info
+ * owns the strategy/voice context that downstream AI features consume.
  */
 export type ChannelContextField =
   | "niche"
@@ -799,10 +799,20 @@ export function upsertVideo(v: Partial<Video> & { id: string; title: string }): 
   );
 }
 
-export function getChannel(): Channel | undefined {
-  // Returns the *active* channel — the one most pages of the UI scope to.
-  // Falls back to "most recently imported" if no active pointer is set yet
-  // (covers fresh installs / pre-multi-channel data).
+export function getChannel(channelId?: string | null): Channel | undefined {
+  // Returns the *active* channel by default — the one most pages of the
+  // UI scope to. When `channelId` is supplied (e.g. /channel-info?focus=X
+  // wants a specific channel's data regardless of the active pointer),
+  // use that id instead. When `channelId` is supplied but unknown,
+  // return undefined rather than silently falling back to active — the
+  // caller asked for a specific channel and we shouldn't substitute.
+  if (channelId) {
+    return (
+      (db.prepare(`SELECT * FROM channels WHERE id = ?`).get(channelId) as
+        | Channel
+        | undefined) ?? undefined
+    );
+  }
   const activeId = getActiveChannelId();
   if (activeId) {
     const row = db
@@ -810,6 +820,8 @@ export function getChannel(): Channel | undefined {
       .get(activeId) as Channel | undefined;
     if (row) return row;
   }
+  // Final fallback (no id passed AND no active pointer): most recent
+  // import. Covers fresh installs / pre-multi-channel data.
   return db
     .prepare(`SELECT * FROM channels ORDER BY imported_at DESC LIMIT 1`)
     .get() as Channel | undefined;
@@ -1463,7 +1475,7 @@ db.exec(`
     // each = $160/month forecast"); the dashboard sums this across
     // every channel for total expected monthly editor cost.
     { name: "expected_videos_per_month", type: "INTEGER" },
-    // Per-channel context fields edited on /my-channels. Every AI
+    // Per-channel context fields edited on /channel-info. Every AI
     // feature downstream (outliers explainer, topic validator, ideation,
     // daily market watch, chat) reads these on every invocation, so they
     // must always be safe to concatenate into a prompt — DEFAULT '' means
@@ -1746,7 +1758,7 @@ export function getVideo(id: string): Video | undefined {
     .get(id) as Video | undefined;
 }
 
-export function videoStats(): {
+export function videoStats(channelId?: string | null): {
   total: number;
   totalViews: number;
   totalLikes: number;
@@ -1754,10 +1766,11 @@ export function videoStats(): {
   avgViews: number;
 } {
   // Headline KPI tiles must reflect the active channel only — otherwise
-  // switching channels wouldn't change the numbers.
-  const activeId = getActiveChannelId();
+  // switching channels wouldn't change the numbers. When `channelId` is
+  // passed explicitly (focus-mode in /channel-info), use that instead.
+  const id = channelId ?? getActiveChannelId();
   const row = (
-    activeId
+    id
       ? db
           .prepare(
             `SELECT COUNT(*) as total,
@@ -1766,7 +1779,7 @@ export function videoStats(): {
                     COALESCE(SUM(comments),0) as totalComments
              FROM videos WHERE channel_id = ?`
           )
-          .get(activeId)
+          .get(id)
       : db
           .prepare(
             `SELECT COUNT(*) as total,
@@ -1856,7 +1869,9 @@ export type ChannelAnalytics = {
  * calls. Meant for the Channel Details page where we want to surface
  * everything we can actually see, not just the 4 headline KPIs.
  */
-export function channelAnalytics(): ChannelAnalytics | null {
+export function channelAnalytics(
+  channelId?: string | null
+): ChannelAnalytics | null {
   type VideoRow = {
     id: string;
     title: string;
@@ -1868,16 +1883,18 @@ export function channelAnalytics(): ChannelAnalytics | null {
     tags: string | null;
   };
   // Scope every aggregate below to the active channel so the deep-analytics
-  // page reflects the channel currently selected in the switcher.
-  const activeId = getActiveChannelId();
+  // page reflects the channel currently selected in the switcher. When
+  // `channelId` is passed explicitly (focus-mode in /channel-info), use
+  // that instead so the detail widgets follow the URL, not the picker.
+  const id = channelId ?? getActiveChannelId();
   const videos = (
-    activeId
+    id
       ? db
           .prepare(
             `SELECT id, title, views, likes, comments, duration_seconds, published_at, tags
              FROM videos WHERE channel_id = ?`
           )
-          .all(activeId)
+          .all(id)
       : db
           .prepare(
             `SELECT id, title, views, likes, comments, duration_seconds, published_at, tags
@@ -1951,10 +1968,10 @@ export function channelAnalytics(): ChannelAnalytics | null {
     return { label: b.label, count: xs.length, totalViews: sumViews(xs) };
   });
 
-  // Transcripts coverage — scoped to the active channel via JOIN with videos
-  // so the % matches the videos count we computed above.
+  // Transcripts coverage — scoped to the same channel id we used for
+  // videos above (active channel by default, or the explicit focus id).
   const transcriptRows = (
-    activeId
+    id
       ? db
           .prepare(
             `SELECT t.language, t.text
@@ -1962,7 +1979,7 @@ export function channelAnalytics(): ChannelAnalytics | null {
              JOIN videos v ON v.id = t.video_id
              WHERE v.channel_id = ?`
           )
-          .all(activeId)
+          .all(id)
       : db.prepare(`SELECT language, text FROM transcripts`).all()
   ) as { language: string | null; text: string }[];
   const withTranscript = transcriptRows.length;

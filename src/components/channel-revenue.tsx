@@ -147,7 +147,7 @@ export function ChannelRevenue() {
               Reconnect Google with the <code className="rounded bg-muted px-1">yt-analytics-monetary.readonly</code>{" "}
               scope —{" "}
               <Link
-                href="/integrations#youtube-analytics"
+                href="/settings/integrations#youtube-analytics"
                 className="text-primary hover:underline"
               >
                 Integrations

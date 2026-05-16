@@ -38,7 +38,7 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const origin = resolveOrigin(req);
   const redirectBack = (params: Record<string, string>): NextResponse => {
-    const to = new URL("/integrations", origin);
+    const to = new URL("/settings/integrations", origin);
     for (const [k, v] of Object.entries(params)) {
       to.searchParams.set(k, v);
     }

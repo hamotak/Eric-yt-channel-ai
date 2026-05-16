@@ -12,6 +12,7 @@ export default function SettingsPage() {
   return (
     <div className="mx-auto max-w-3xl space-y-4">
       <header className="mb-6">
+        <h2 className="text-lg font-semibold tracking-tight">Preferences</h2>
         <p className="mt-1 text-sm text-muted-foreground">{t.settings.subtitle}</p>
       </header>
 
