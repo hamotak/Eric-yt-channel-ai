@@ -129,7 +129,7 @@ export default function TutorialPage() {
             (unrelated audience, best source for thumbnail formats).
           </PageDescription>
 
-          <PageDescription name="Alerts" href="/alerts" status="active">
+          <PageDescription name="Alerts" href="/settings/alerts" status="active">
             Rules that ping you when something happens — e.g. a competitor
             uploads, a video crosses a view threshold.
           </PageDescription>

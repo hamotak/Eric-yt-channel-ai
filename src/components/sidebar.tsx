@@ -10,7 +10,6 @@ import {
   MessageSquare,
   Settings,
   PlaySquare,
-  Bell,
   Search,
   Users,
   BookOpen,
@@ -57,7 +56,6 @@ export function Sidebar() {
       icon: Search,
       badge: unreadAlerts,
     },
-    { href: "/alerts", label: "Alerts", icon: Bell, badge: 0 },
     { href: "/settings", label: t.nav.settings, icon: Settings, badge: 0 },
     {
       href: "/tutorial",

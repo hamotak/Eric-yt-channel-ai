@@ -15,6 +15,7 @@ const TABS = [
   { href: "/settings/integrations", label: "Integrations" },
   { href: "/settings/import", label: "Import" },
   { href: "/settings/logs", label: "Logs" },
+  { href: "/settings/alerts", label: "Alerts" },
 ] as const;
 
 export default function SettingsLayout({

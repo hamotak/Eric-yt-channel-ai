@@ -18,6 +18,7 @@ const nextConfig: NextConfig = {
       { source: "/integrations", destination: "/settings/integrations", permanent: false },
       { source: "/import",       destination: "/settings/import",       permanent: false },
       { source: "/logs",         destination: "/settings/logs",         permanent: false },
+      { source: "/alerts",       destination: "/settings/alerts",       permanent: false },
     ];
   },
 };
