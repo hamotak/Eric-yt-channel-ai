@@ -26,7 +26,6 @@ import { TodaysEarnings } from "@/components/todays-earnings";
 import { MultiChannelEarnings } from "@/components/multi-channel-earnings";
 import { ViewsOverTime } from "@/components/views-over-time";
 import { TagsOverview } from "@/components/tags-overview";
-import { DashboardTabs } from "@/components/dashboard-tabs";
 import { AllChannelsOverview } from "@/components/all-channels-overview";
 import { cn } from "@/lib/utils";
 
@@ -57,11 +56,16 @@ export default function DashboardPage() {
   const { t } = useI18n();
   const [stats, setStats] = useState<Stats | null>(null);
   const [channel, setChannel] = useState<Channel | null>(null);
-  // "all" = cross-channel summary view (selected via DashboardTabs);
-  // "channel" = the existing single-channel dashboard. Defaults to
-  // "channel" until DashboardTabs reads its persisted preference and
-  // calls onModeChange.
+  // "all" = cross-channel summary view; "channel" = single-channel view.
+  // Source of truth is localStorage["dashboard.viewMode"], written by the
+  // top-bar ChannelSwitcher. The inline DashboardTabs toggle was removed
+  // in favour of the unified picker — same key, same vocabulary.
   const [viewMode, setViewMode] = useState<"all" | "channel">("channel");
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const saved = window.localStorage.getItem("dashboard.viewMode");
+    if (saved === "all" || saved === "channel") setViewMode(saved);
+  }, []);
   const [refreshing, setRefreshing] = useState(false);
   // Bumped each time the user hits Refresh — child components keyed off
   // this re-mount and re-fetch fresh data.
@@ -157,11 +161,6 @@ export default function DashboardPage() {
       </header>
 
       <ConnectBanner />
-
-      {/* Multi-channel tab bar — auto-hides when only 0/1 channels are
-          connected. Lets the user pick "All channels" (cross-channel
-          aggregate) or any specific channel. */}
-      <DashboardTabs onModeChange={setViewMode} />
 
       {/* Cross-channel summary view */}
       {viewMode === "all" && <AllChannelsOverview key={`all-${refreshKey}`} />}
