@@ -359,7 +359,7 @@ function EmptyState() {
         <p className="text-sm text-muted-foreground">
           No channels yet. Add your first YouTube channel on the{" "}
           <Link
-            href="/integrations"
+            href="/settings/integrations"
             className="font-medium text-foreground underline underline-offset-4"
           >
             Integrations page

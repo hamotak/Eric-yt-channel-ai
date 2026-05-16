@@ -146,7 +146,7 @@ export function TranscribeAllBanner() {
           <div className="font-medium">{t.deepgram.missingHint.replace("{n}", String(preview.missing))}</div>
           <div className="mt-0.5 text-xs text-muted-foreground">{t.deepgram.notConfiguredHint}</div>
         </div>
-        <a href="/integrations" className="shrink-0 text-xs font-medium text-primary hover:underline">
+        <a href="/settings/integrations" className="shrink-0 text-xs font-medium text-primary hover:underline">
           {t.deepgram.goToIntegrations} →
         </a>
       </div>

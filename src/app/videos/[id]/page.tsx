@@ -719,7 +719,7 @@ function TranscriptPanel({
             {deepgramReady === false && (
               <>
                 {" "}
-                <Link href="/integrations" className="text-primary hover:underline">
+                <Link href="/settings/integrations" className="text-primary hover:underline">
                   Add Deepgram key
                 </Link>{" "}
                 to enable transcription.

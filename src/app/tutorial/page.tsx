@@ -64,7 +64,7 @@ export default function TutorialPage() {
         <ol className="list-decimal space-y-2 pl-5">
           <li>
             Open{" "}
-            <Link href="/integrations" className="text-primary hover:underline">
+            <Link href="/settings/integrations" className="text-primary hover:underline">
               Integrations
             </Link>{" "}
             → paste your Claude and YouTube Data API keys.
@@ -136,18 +136,18 @@ export default function TutorialPage() {
 
           <PageDescription
             name="Integrations"
-            href="/integrations"
+            href="/settings/integrations"
             status="active"
           >
             Your API keys for Claude, YouTube Data, Deepgram, Apify, and
             others. One-time setup.
           </PageDescription>
 
-          <PageDescription name="Import" href="/import" status="active">
+          <PageDescription name="Import" href="/settings/import" status="active">
             Bulk-import data from CSV. Useful when migrating from another tool.
           </PageDescription>
 
-          <PageDescription name="Logs" href="/logs" status="active">
+          <PageDescription name="Logs" href="/settings/logs" status="active">
             Every API call, error, and event in chronological order. Look here
             if something feels broken.
           </PageDescription>

@@ -10,6 +10,16 @@ const nextConfig: NextConfig = {
   //     dynamic `await import()`. Leaving it external avoids any chance of
   //     Next inlining the wrong build and crashing at runtime.
   serverExternalPackages: ["better-sqlite3", "youtube-dl-exec", "youtubei.js"],
+  // /integrations, /import, /logs were folded into /settings as nested
+  // tabs. Soft (302) redirects so old bookmarks and any stale internal
+  // links still work after the move.
+  async redirects() {
+    return [
+      { source: "/integrations", destination: "/settings/integrations", permanent: false },
+      { source: "/import",       destination: "/settings/import",       permanent: false },
+      { source: "/logs",         destination: "/settings/logs",         permanent: false },
+    ];
+  },
 };
 
 export default nextConfig;

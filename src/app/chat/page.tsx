@@ -951,7 +951,7 @@ function ChatPageInner() {
             />
             {!hasKey && (
               <p className="mt-2 text-center text-xs text-muted-foreground">
-                <Link href="/integrations" className="underline hover:text-foreground">
+                <Link href="/settings/integrations" className="underline hover:text-foreground">
                   {t.banner.connectCta}
                 </Link>
               </p>
@@ -973,7 +973,7 @@ function EmptyState({ hasKey }: { hasKey: boolean | null }) {
       {hasKey === false ? (
         <>
           <div className="text-sm text-muted-foreground">{t.chat.missingKey}</div>
-          <Link href="/integrations">
+          <Link href="/settings/integrations">
             <Button size="sm">{t.banner.connectCta}</Button>
           </Link>
         </>

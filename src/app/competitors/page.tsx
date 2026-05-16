@@ -754,7 +754,7 @@ export default function CompetitorsPage() {
       {!migrationView && (
         <p className="mt-6 text-center text-[11px] text-muted-foreground">
           Competitor sync uses your{" "}
-          <Link href="/integrations" className="text-primary hover:underline">
+          <Link href="/settings/integrations" className="text-primary hover:underline">
             Apify integration
           </Link>
           . No Apify key → sync errors but everything else works (manual entry,

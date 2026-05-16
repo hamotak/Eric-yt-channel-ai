@@ -28,7 +28,7 @@ export function ConnectBanner() {
         <div className="font-medium">{t.banner.connectTitle}</div>
         <div className="mt-1 text-sm text-muted-foreground">{t.banner.connectDesc}</div>
       </div>
-      <Link href="/integrations">
+      <Link href="/settings/integrations">
         <Button size="sm">{t.banner.connectCta}</Button>
       </Link>
     </div>

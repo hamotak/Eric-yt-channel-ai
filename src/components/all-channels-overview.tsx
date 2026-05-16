@@ -143,7 +143,7 @@ export function AllChannelsOverview() {
           </ul>
           <div className="mt-3 text-[11px] text-muted-foreground">
             Add another channel from the{" "}
-            <Link href="/integrations" className="text-primary hover:underline">
+            <Link href="/settings/integrations" className="text-primary hover:underline">
               Integrations
             </Link>{" "}
             page.
