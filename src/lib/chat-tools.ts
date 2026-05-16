@@ -2,28 +2,21 @@ import "server-only";
 import type Anthropic from "@anthropic-ai/sdk";
 import {
   competitorGapAnalysis,
+  getActiveChannelId,
   getChannel,
   getComment,
   getCommentAnalysis,
   getIntegration,
   getSetting,
   getTranscript,
-  getVideoHook,
-  hookFormulaStats,
-  hookOverallStats,
   listAllChannels,
   listCompetitorAlerts,
   listCompetitors,
-  listHooksLibrary,
-  listHooksWithVideos,
   listReplies,
   listTopLevelComments,
   listVideos,
   searchComments,
   searchTranscripts,
-  titleLengthBuckets,
-  titleWordStats,
-  topVsBottomTitles,
   recordDeepgramUsage,
   upsertTranscript,
   videoStats,
@@ -440,58 +433,14 @@ const STRATEGY_TOOLS: Tool[] = [
     },
   },
   {
-    name: "get_hook_stats",
-    description:
-      "Channel-wide hook analysis stats: how many hooks analysed, average score, winning hook formula (direct question / statistic / story / mystery / etc.), per-formula avg views. Use to answer 'which kind of hook works best on my channel?'",
-    input_schema: { type: "object", properties: {}, required: [] },
-  },
-  {
-    name: "list_hook_breakdowns",
-    description:
-      "Hook-by-hook breakdown with per-video score, formula, strengths and weaknesses. Use after get_hook_stats when the user wants specific examples or wants to look at the lowest-scoring hooks to fix.",
-    input_schema: {
-      type: "object",
-      properties: {
-        orderBy: {
-          type: "string",
-          enum: ["score", "views", "recent"],
-          default: "score",
-        },
-        limit: { type: "number", default: 30 },
-      },
-    },
-  },
-  {
-    name: "get_video_hook",
-    description:
-      "Pull the full hook analysis for one specific video — formula type, 7 quality scores, strengths, suggested improvements, the literal hook text.",
-    input_schema: {
-      type: "object",
-      properties: { videoId: { type: "string" } },
-      required: ["videoId"],
-    },
-  },
-  {
-    name: "get_formula_breakdown",
-    description:
-      "Statistical breakdown of the user's title formulas: per-word avg views + success rate, title-length buckets, top 10 vs bottom 10 video titles. Use for 'what's working in my titles' questions.",
-    input_schema: { type: "object", properties: {}, required: [] },
-  },
-  {
     name: "get_comment_analysis",
     description:
-      "Return the cached AI audience analysis for one video — sentiment 1-10, top themes, credibility objections, future-video ideas with demand level, best hook candidates. Returns 'no analysis yet' if the user hasn't run it; tell them to open the Comments tab and click 'Analyse with AI'.",
+      "Return the cached AI audience analysis for one video — sentiment 1-10, top themes, credibility objections, future-video ideas, standout quote candidates. Returns 'no analysis yet' if the user hasn't run it; tell them to open the Comments tab and click 'Analyse with AI'.",
     input_schema: {
       type: "object",
       properties: { videoId: { type: "string" } },
       required: ["videoId"],
     },
-  },
-  {
-    name: "list_saved_hooks",
-    description:
-      "List the user's Hooks Library — comments / quotes they saved to reuse as opening lines in future videos. Includes status (available / used), source video, score. Use when planning a new video to remind the user of unused material they already curated.",
-    input_schema: { type: "object", properties: {}, required: [] },
   },
 ];
 
@@ -854,8 +803,13 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
       }
 
       // ===== Strategy tools (Phase D / E) =====
+      // All three competitor tools scope to the user's currently-active
+      // channel — competitors now belong to one of the user's channels,
+      // not the global app. Without active scoping, Claude would see
+      // every channel's competitors mixed together.
       case "list_competitors": {
-        const competitors = listCompetitors();
+        const activeId = getActiveChannelId() ?? undefined;
+        const competitors = listCompetitors(activeId);
         return {
           ok: true,
           data: competitors.map((c) => ({
@@ -865,6 +819,8 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
             channelId: c.channel_id,
             subscribers: c.subscriber_count,
             videoCount: c.video_count,
+            tier: c.tier,
+            userChannelId: c.user_channel_id,
             lastSyncAt: c.last_sync_at,
           })),
         };
@@ -875,7 +831,11 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
           200,
           Math.max(1, Number(input.limit) || 50)
         );
-        const alerts = listCompetitorAlerts({ unreadOnly, limit });
+        const alerts = listCompetitorAlerts({
+          unreadOnly,
+          limit,
+          userChannelId: getActiveChannelId(),
+        });
         return {
           ok: true,
           data: alerts.map((a) => ({
@@ -893,66 +853,14 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
       }
       case "competitor_gap_analysis": {
         const topN = Math.min(50, Math.max(5, Number(input.topN) || 25));
-        return { ok: true, data: competitorGapAnalysis({ topN }) };
-      }
-      case "get_hook_stats": {
-        const overall = hookOverallStats();
-        const formulas = hookFormulaStats();
-        return { ok: true, data: { overall, formulas } };
-      }
-      case "list_hook_breakdowns": {
-        const orderBy =
-          input.orderBy === "views" || input.orderBy === "recent"
-            ? (input.orderBy as "views" | "recent")
-            : ("score" as const);
-        const limit = Math.min(
-          100,
-          Math.max(1, Number(input.limit) || 30)
-        );
-        const hooks = listHooksWithVideos({ orderBy, limit });
+        // competitorGapAnalysis already falls back to getActiveChannelId
+        // internally; explicit pass-through keeps the call site grep-able.
         return {
           ok: true,
-          data: hooks.map((h) => ({
-            videoId: h.video_id,
-            title: h.title,
-            views: h.views,
-            formula: h.formula_type,
-            overallScore: h.overall_score,
-            scores: {
-              openLoop: h.score_open_loop,
-              valuePromise: h.score_value_promise,
-              conflict: h.score_conflict,
-              specificLanguage: h.score_specific_language,
-              identification: h.score_identification,
-              pacing: h.score_pacing,
-              benefit: h.score_benefit,
-            },
-            fortalezas: h.fortalezas,
-            mejoras: h.mejoras,
-          })),
-        };
-      }
-      case "get_video_hook": {
-        const videoId = String(input.videoId ?? "").trim();
-        if (!videoId) return { ok: false, error: "videoId required" };
-        const h = getVideoHook(videoId);
-        if (!h) {
-          return {
-            ok: false,
-            error:
-              "No hook analysis on file for this video. Open Hook Lab and click Analyse, or run the batch analyser.",
-          };
-        }
-        return { ok: true, data: h };
-      }
-      case "get_formula_breakdown": {
-        return {
-          ok: true,
-          data: {
-            wordStats: titleWordStats({ minUses: 2, topN: 30 }),
-            lengthBuckets: titleLengthBuckets(),
-            topBottom: topVsBottomTitles(),
-          },
+          data: competitorGapAnalysis({
+            topN,
+            userChannelId: getActiveChannelId(),
+          }),
         };
       }
       case "get_comment_analysis": {
@@ -988,24 +896,6 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
           },
         };
       }
-      case "list_saved_hooks": {
-        const hooks = listHooksLibrary();
-        return {
-          ok: true,
-          data: hooks.map((h) => ({
-            id: h.id,
-            quote: h.quote,
-            author: h.author,
-            status: h.status,
-            score: h.score,
-            sourceVideoId: h.source_video_id,
-            sourceVideoTitle: h.source_video_title,
-            note: h.note,
-            addedAt: h.added_at,
-          })),
-        };
-      }
-
       default:
         return { ok: false, error: `unknown tool: ${name}` };
     }
@@ -1100,7 +990,7 @@ export function buildSystemPrompt(
       );
     if (activeGroups.includes("strategy"))
       lines.push(
-        `- **Strategy** — read-only access to the platform's own analysis surfaces: tracked competitors + their outlier alerts + gap-analysis keywords, the channel's Hook Lab breakdowns (per-video formula + 7 quality scores + suggested improvements), the Formula Analyzer's title-word success rates and length buckets, AI Comment Analysis (sentiment / themes / objections / future-video ideas / best hook candidates), and the Hooks Library (saved comment quotes the creator plans to reuse). Use these when answering "what kind of hook works for me", "what should I make next", "what are competitors doing I'm not", "what does my audience actually want" — every dashboard the creator sees, you can read.`
+        `- **Strategy** — read-only access to the platform's own analysis surfaces: tracked competitors + their outlier alerts + gap-analysis keywords, and AI Comment Analysis on the user's own videos (sentiment / themes / objections / future-video ideas / standout quote candidates). Use these when answering "what should I make next", "what are competitors doing I'm not", "what does my audience actually want" — every dashboard the creator sees, you can read.`
       );
   }
 

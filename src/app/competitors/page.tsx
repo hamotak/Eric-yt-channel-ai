@@ -13,24 +13,58 @@ import {
   TrendingUp,
   Eye,
   ExternalLink,
-  X,
   Check,
+  ArrowLeft,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
+// Tier vocabulary mirrors MENTOR_METHOD.md §1 — UI labels are the exact
+// names from the methodology so the user maps them 1:1.
+const TIERS = ["authority", "breakthrough", "adjacent", "far"] as const;
+type Tier = (typeof TIERS)[number];
+
+const TIER_LABEL: Record<Tier, string> = {
+  authority: "Authority",
+  breakthrough: "Breakthrough",
+  adjacent: "Adjacent",
+  far: "Far",
+};
+
+// Pill colors. Authority = blue (established), Breakthrough = green
+// (currently winning), Adjacent = orange (related niche), Far = grey
+// (unrelated audience).
+const TIER_PILL: Record<Tier, string> = {
+  authority:
+    "bg-sky-500/15 text-sky-700 dark:text-sky-400 border border-sky-500/30",
+  breakthrough:
+    "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30",
+  adjacent:
+    "bg-orange-500/15 text-orange-700 dark:text-orange-400 border border-orange-500/30",
+  far: "bg-muted text-muted-foreground border border-border",
+};
+
 type Competitor = {
   id: number;
-  channel_id: string | null;
+  channelId: string | null;
   handle: string | null;
   title: string | null;
-  avatar_url: string | null;
-  subscriber_count: number | null;
-  video_count: number | null;
-  added_at: number;
-  last_sync_at: number | null;
+  avatarUrl: string | null;
+  subscriberCount: number | null;
+  videoCount: number | null;
+  addedAt: number;
+  lastSyncAt: number | null;
+  userChannelId: string | null;
+  tier: Tier;
+  tierSetAt: number | null;
+};
+
+type UserChannel = {
+  id: string;
+  title: string | null;
+  handle: string | null;
 };
 
 type Alert = {
@@ -76,52 +110,100 @@ function fmtRelative(ts: number | null): string {
 }
 
 export default function CompetitorsPage() {
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [channels, setChannels] = useState<UserChannel[]>([]);
   const [competitors, setCompetitors] = useState<Competitor[]>([]);
+  const [unassignedCount, setUnassignedCount] = useState(0);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [gaps, setGaps] = useState<Gap[]>([]);
   const [unread, setUnread] = useState(0);
   const [tab, setTab] = useState<Tab>("overview");
+  const [tierFilters, setTierFilters] = useState<Set<Tier>>(
+    new Set(TIERS as readonly Tier[])
+  );
+  const [migrationView, setMigrationView] = useState(false);
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState(false);
   const [identifier, setIdentifier] = useState("");
+  const [addTier, setAddTier] = useState<Tier>("authority");
   const [syncingAll, setSyncingAll] = useState(false);
   const [syncingIds, setSyncingIds] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
+  // One-shot fetch of /api/channels to populate the active channel +
+  // the chooser dropdowns used by the migration view + the per-card
+  // "Move to another channel" link.
+  const refreshChannels = useCallback(async () => {
     try {
-      const r = await fetch("/api/competitors", { cache: "no-store" });
-      const d = (await r.json()) as { competitors: Competitor[]; unreadAlerts: number };
+      const r = await fetch("/api/channels", { cache: "no-store" });
+      const d = (await r.json()) as {
+        channels: UserChannel[];
+        activeId: string | null;
+      };
+      setChannels(d.channels);
+      setActiveId(d.activeId ?? null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "failed to load channels");
+    }
+  }, []);
+
+  const refresh = useCallback(async () => {
+    // Migration view: ask for the unassigned slice. Default view: ask
+    // for the active channel's slice. Both responses carry the global
+    // unassignedCount so the banner stays accurate either way.
+    const qs = migrationView
+      ? "?userChannelId=unassigned"
+      : activeId
+        ? `?userChannelId=${encodeURIComponent(activeId)}`
+        : "";
+    try {
+      const r = await fetch(`/api/competitors${qs}`, { cache: "no-store" });
+      const d = (await r.json()) as {
+        competitors: Competitor[];
+        unreadAlerts: number;
+        unassignedCount: number;
+      };
       setCompetitors(d.competitors);
       setUnread(d.unreadAlerts);
+      setUnassignedCount(d.unassignedCount);
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [activeId, migrationView]);
 
   const refreshAlerts = useCallback(async () => {
+    if (!activeId) return setAlerts([]);
     try {
-      const r = await fetch("/api/competitors/alerts?limit=100", {
-        cache: "no-store",
-      });
+      const r = await fetch(
+        `/api/competitors/alerts?limit=100&userChannelId=${encodeURIComponent(activeId)}`,
+        { cache: "no-store" }
+      );
       const d = (await r.json()) as { alerts: Alert[] };
       setAlerts(d.alerts);
     } catch {
       /* keep current */
     }
-  }, []);
+  }, [activeId]);
 
   const refreshGaps = useCallback(async () => {
+    if (!activeId) return setGaps([]);
     try {
-      const r = await fetch("/api/competitors/gaps?topN=30", { cache: "no-store" });
+      const r = await fetch(
+        `/api/competitors/gaps?topN=30&userChannelId=${encodeURIComponent(activeId)}`,
+        { cache: "no-store" }
+      );
       const d = (await r.json()) as { gaps: Gap[] };
       setGaps(d.gaps);
     } catch {
       /* keep current */
     }
-  }, []);
+  }, [activeId]);
+
+  useEffect(() => {
+    refreshChannels();
+  }, [refreshChannels]);
 
   useEffect(() => {
     refresh();
@@ -129,15 +211,40 @@ export default function CompetitorsPage() {
     refreshGaps();
   }, [refresh, refreshAlerts, refreshGaps]);
 
+  const activeChannel = useMemo(
+    () => channels.find((c) => c.id === activeId) ?? null,
+    [channels, activeId]
+  );
+  const otherChannels = useMemo(
+    () => channels.filter((c) => c.id !== activeId),
+    [channels, activeId]
+  );
+
+  const visibleCompetitors = useMemo(() => {
+    // Tier filter only applies on the normal view — in migration view
+    // every unassigned row shows up regardless of tier so the user can
+    // bulk-assign without losing rows behind a filter chip.
+    if (migrationView) return competitors;
+    return competitors.filter((c) => tierFilters.has(c.tier));
+  }, [competitors, tierFilters, migrationView]);
+
   const addCompetitor = async () => {
     if (!identifier.trim()) return;
+    if (!activeId) {
+      setError("No active channel — set one from the top-right channel picker.");
+      return;
+    }
     setAdding(true);
     setError(null);
     try {
       const r = await fetch("/api/competitors", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ identifier }),
+        body: JSON.stringify({
+          identifier,
+          userChannelId: activeId,
+          tier: addTier,
+        }),
       });
       const d = (await r.json().catch(() => ({}))) as {
         ok?: boolean;
@@ -148,9 +255,6 @@ export default function CompetitorsPage() {
         throw new Error(d.error ?? `HTTP ${r.status}`);
       }
       setIdentifier("");
-      // Surface a soft warning when the row was created but the first
-      // sync failed (Apify down, bad handle, etc.) — user can hit
-      // "Sync" manually to retry without re-adding.
       if (d.syncError) {
         setError(`Added, but first sync failed: ${d.syncError}`);
       }
@@ -191,7 +295,11 @@ export default function CompetitorsPage() {
     setSyncingAll(true);
     setError(null);
     try {
-      const r = await fetch("/api/competitors/sync-all", { method: "POST" });
+      const r = await fetch("/api/competitors/sync-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userChannelId: activeId }),
+      });
       if (!r.ok) {
         const d = (await r.json().catch(() => ({}))) as { error?: string };
         throw new Error(d.error ?? `HTTP ${r.status}`);
@@ -224,17 +332,50 @@ export default function CompetitorsPage() {
     await refresh();
   };
 
+  const patchCompetitor = useCallback(
+    async (id: number, patch: { userChannelId?: string | null; tier?: Tier }) => {
+      setError(null);
+      try {
+        const r = await fetch(`/api/competitors/${id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        });
+        const d = (await r.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+        };
+        if (!r.ok || !d.ok) {
+          throw new Error(d.error ?? `HTTP ${r.status}`);
+        }
+        await refresh();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "update failed");
+      }
+    },
+    [refresh]
+  );
+
+  const toggleTierFilter = (t: Tier) => {
+    setTierFilters((prev) => {
+      const next = new Set(prev);
+      if (next.has(t)) next.delete(t);
+      else next.add(t);
+      return next;
+    });
+  };
+
   const totalSubs = useMemo(
-    () => competitors.reduce((acc, c) => acc + (c.subscriber_count ?? 0), 0),
+    () => competitors.reduce((acc, c) => acc + (c.subscriberCount ?? 0), 0),
     [competitors]
   );
   const totalVideos = useMemo(
-    () => competitors.reduce((acc, c) => acc + (c.video_count ?? 0), 0),
+    () => competitors.reduce((acc, c) => acc + (c.videoCount ?? 0), 0),
     [competitors]
   );
   const lastSync = useMemo(() => {
     const max = competitors.reduce(
-      (acc, c) => (c.last_sync_at && c.last_sync_at > acc ? c.last_sync_at : acc),
+      (acc, c) => (c.lastSyncAt && c.lastSyncAt > acc ? c.lastSyncAt : acc),
       0
     );
     return max || null;
@@ -253,76 +394,97 @@ export default function CompetitorsPage() {
 
   return (
     <div className="mx-auto max-w-6xl">
-      <header className="mb-6 flex items-center justify-between">
+      <header className="mb-4 flex items-center justify-between gap-3">
         <div>
           <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
             <Search className="h-6 w-6" />
             Competitor Tracking
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Add rival channels, watch for viral hits in your niche, and find
-            keywords you&apos;re missing.
+            Per-channel competitor lists. Tag each as Authority, Breakthrough,
+            Adjacent, or Far.
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={syncAll}
-            disabled={syncingAll || competitors.length === 0}
-            className="gap-1.5"
-          >
-            {syncingAll ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
-            )}
-            Sync All
-          </Button>
+          {!migrationView && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={syncAll}
+              disabled={syncingAll || competitors.length === 0}
+              className="gap-1.5"
+            >
+              {syncingAll ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="h-3.5 w-3.5" />
+              )}
+              Sync this channel
+            </Button>
+          )}
         </div>
       </header>
 
-      {/* Unread alert nudge */}
-      {unread > 0 && (
+      {/* Active-channel chip */}
+      {!migrationView && (
+        <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-border bg-background px-3 py-1 text-xs text-muted-foreground">
+          <span className="text-foreground/70">Active channel:</span>
+          <span className="font-medium text-foreground">
+            {activeChannel?.title ?? "(none)"}
+          </span>
+          {activeChannel?.handle && (
+            <span className="font-mono">{activeChannel.handle}</span>
+          )}
+        </div>
+      )}
+
+      {/* Migration banner */}
+      {!migrationView && unassignedCount > 0 && (
         <button
           type="button"
-          onClick={() => setTab("alerts")}
+          onClick={() => setMigrationView(true)}
           className="mb-4 flex w-full items-center justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-left text-sm hover:bg-amber-500/15"
         >
           <span className="inline-flex items-center gap-2 font-medium text-amber-700 dark:text-amber-400">
             <AlertCircle className="h-4 w-4" />
-            {unread} unread {unread === 1 ? "alert" : "alerts"} — competitors hit
-            viral views
+            You have {unassignedCount} unassigned{" "}
+            {unassignedCount === 1 ? "competitor" : "competitors"} from the
+            previous app version.
           </span>
           <span className="text-xs text-amber-700/80 dark:text-amber-400/80">
-            View →
+            Review and assign →
           </span>
         </button>
       )}
 
-      {/* Tabs */}
-      <div className="mb-4 flex gap-4 border-b border-border">
-        <TabButton active={tab === "overview"} onClick={() => setTab("overview")}>
-          Overview
-        </TabButton>
-        <TabButton active={tab === "gaps"} onClick={() => setTab("gaps")}>
-          <TrendingUp className="h-3.5 w-3.5" />
-          Gap Analysis
-          {gaps.length > 0 && (
-            <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px]">
-              {gaps.length}
-            </span>
-          )}
-        </TabButton>
-        <TabButton active={tab === "alerts"} onClick={() => setTab("alerts")}>
-          Alerts
-          {unread > 0 && (
-            <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
-              {unread}
-            </span>
-          )}
-        </TabButton>
-      </div>
+      {/* Tabs — hidden in migration view, which is a focused single-task screen */}
+      {!migrationView && (
+        <div className="mb-4 flex gap-4 border-b border-border">
+          <TabButton
+            active={tab === "overview"}
+            onClick={() => setTab("overview")}
+          >
+            Overview
+          </TabButton>
+          <TabButton active={tab === "gaps"} onClick={() => setTab("gaps")}>
+            <TrendingUp className="h-3.5 w-3.5" />
+            Gap Analysis
+            {gaps.length > 0 && (
+              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px]">
+                {gaps.length}
+              </span>
+            )}
+          </TabButton>
+          <TabButton active={tab === "alerts"} onClick={() => setTab("alerts")}>
+            Alerts
+            {unread > 0 && (
+              <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
+                {unread}
+              </span>
+            )}
+          </TabButton>
+        </div>
+      )}
 
       {error && (
         <div className="mb-4 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
@@ -331,8 +493,18 @@ export default function CompetitorsPage() {
         </div>
       )}
 
+      {/* ===== MIGRATION VIEW ===== */}
+      {migrationView && (
+        <MigrationView
+          competitors={competitors}
+          channels={channels}
+          onAssign={patchCompetitor}
+          onBack={() => setMigrationView(false)}
+        />
+      )}
+
       {/* ===== OVERVIEW ===== */}
-      {tab === "overview" && (
+      {!migrationView && tab === "overview" && (
         <div className="space-y-4">
           {/* KPI strip */}
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -341,11 +513,7 @@ export default function CompetitorsPage() {
               label="Competitors"
               value={String(competitors.length)}
             />
-            <Kpi
-              icon={Eye}
-              label="Combined subs"
-              value={fmtCount(totalSubs)}
-            />
+            <Kpi icon={Eye} label="Combined subs" value={fmtCount(totalSubs)} />
             <Kpi
               icon={TrendingUp}
               label="Videos tracked"
@@ -358,7 +526,28 @@ export default function CompetitorsPage() {
             />
           </div>
 
-          {/* Add competitor */}
+          {/* Tier filter pills */}
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="text-muted-foreground">Filter:</span>
+            {TIERS.map((t) => {
+              const on = tierFilters.has(t);
+              return (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => toggleTierFilter(t)}
+                  className={cn(
+                    "rounded-full px-2.5 py-0.5 font-medium transition-colors",
+                    on ? TIER_PILL[t] : "border border-border text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  {TIER_LABEL[t]}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Add competitor — requires a tier choice up front */}
           <Card>
             <CardContent className="flex flex-wrap items-center gap-2 p-3">
               <Plus className="h-4 w-4 text-muted-foreground" />
@@ -372,9 +561,21 @@ export default function CompetitorsPage() {
                 }}
                 className="min-w-[260px] flex-1 border-0 bg-transparent shadow-none focus-visible:ring-0"
               />
+              <select
+                value={addTier}
+                onChange={(e) => setAddTier(e.target.value as Tier)}
+                disabled={adding}
+                className="rounded-md border border-input bg-background px-2 py-1 text-xs"
+              >
+                {TIERS.map((t) => (
+                  <option key={t} value={t}>
+                    {TIER_LABEL[t]}
+                  </option>
+                ))}
+              </select>
               <Button
                 onClick={addCompetitor}
-                disabled={adding || !identifier.trim()}
+                disabled={adding || !identifier.trim() || !activeId}
                 size="sm"
                 className="gap-1.5"
               >
@@ -389,21 +590,28 @@ export default function CompetitorsPage() {
           </Card>
 
           {/* Competitor cards */}
-          {competitors.length === 0 ? (
+          {visibleCompetitors.length === 0 ? (
             <Card>
               <CardContent className="py-12 text-center text-sm text-muted-foreground">
-                No competitors yet. Add one above to start tracking.
+                {competitors.length === 0
+                  ? `No competitors tracked for ${activeChannel?.title ?? "this channel"} yet. Click 'Add Competitor' to start.`
+                  : "No competitors match the current tier filter."}
               </CardContent>
             </Card>
           ) : (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              {competitors.map((c) => (
+              {visibleCompetitors.map((c) => (
                 <CompetitorCard
                   key={c.id}
                   competitor={c}
+                  otherChannels={otherChannels}
                   syncing={syncingIds.has(c.id)}
                   onSync={() => syncOne(c.id)}
                   onRemove={() => removeOne(c.id)}
+                  onTierChange={(t) => patchCompetitor(c.id, { tier: t })}
+                  onMove={(targetUserChannelId) =>
+                    patchCompetitor(c.id, { userChannelId: targetUserChannelId })
+                  }
                 />
               ))}
             </div>
@@ -412,7 +620,7 @@ export default function CompetitorsPage() {
       )}
 
       {/* ===== GAP ANALYSIS ===== */}
-      {tab === "gaps" && (
+      {!migrationView && tab === "gaps" && (
         <Card>
           <CardContent className="p-4">
             {gaps.length === 0 ? (
@@ -425,8 +633,8 @@ export default function CompetitorsPage() {
                 <p className="mb-3 text-xs text-muted-foreground">
                   Words that appear in your competitors&apos; TOP videos but{" "}
                   <strong>not in any of yours</strong>. Sorted by aggregate
-                  views — the bigger the bar, the more proof the keyword
-                  pulls in your niche.
+                  views — the bigger the bar, the more proof the keyword pulls
+                  in your niche.
                 </p>
                 <ul className="space-y-1">
                   {gaps.map((g) => (
@@ -464,7 +672,7 @@ export default function CompetitorsPage() {
       )}
 
       {/* ===== ALERTS ===== */}
-      {tab === "alerts" && (
+      {!migrationView && tab === "alerts" && (
         <Card>
           <CardContent className="p-4">
             {alerts.length === 0 ? (
@@ -543,15 +751,16 @@ export default function CompetitorsPage() {
         </Card>
       )}
 
-      {/* Quick link to /integrations for users who don't have Apify set up */}
-      <p className="mt-6 text-center text-[11px] text-muted-foreground">
-        Competitor sync uses your{" "}
-        <Link href="/integrations" className="text-primary hover:underline">
-          Apify integration
-        </Link>
-        . No Apify key → sync errors but everything else works (manual entry,
-        gap analysis on existing data).
-      </p>
+      {!migrationView && (
+        <p className="mt-6 text-center text-[11px] text-muted-foreground">
+          Competitor sync uses your{" "}
+          <Link href="/integrations" className="text-primary hover:underline">
+            Apify integration
+          </Link>
+          . No Apify key → sync errors but everything else works (manual entry,
+          gap analysis on existing data).
+        </p>
+      )}
     </div>
   );
 }
@@ -609,24 +818,33 @@ function Kpi({
 
 function CompetitorCard({
   competitor,
+  otherChannels,
   syncing,
   onSync,
   onRemove,
+  onTierChange,
+  onMove,
 }: {
   competitor: Competitor;
+  otherChannels: UserChannel[];
   syncing: boolean;
   onSync: () => void;
   onRemove: () => void;
+  onTierChange: (t: Tier) => void;
+  onMove: (targetUserChannelId: string) => void;
 }) {
-  const initial = (competitor.title ?? competitor.handle ?? "?").slice(0, 1).toUpperCase();
+  const [moveOpen, setMoveOpen] = useState(false);
+  const initial = (competitor.title ?? competitor.handle ?? "?")
+    .slice(0, 1)
+    .toUpperCase();
   return (
     <Card>
       <CardContent className="p-4">
         <div className="flex items-start gap-3">
-          {competitor.avatar_url ? (
+          {competitor.avatarUrl ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img
-              src={competitor.avatar_url}
+              src={competitor.avatarUrl}
               alt=""
               className="h-10 w-10 shrink-0 rounded-full object-cover"
               referrerPolicy="no-referrer"
@@ -637,11 +855,23 @@ function CompetitorCard({
             </div>
           )}
           <div className="min-w-0 flex-1">
-            <div className="truncate font-medium">
-              {competitor.title ?? "(syncing…)"}
-            </div>
-            <div className="truncate text-xs text-muted-foreground">
-              {competitor.handle ?? competitor.channel_id ?? "—"}
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="truncate font-medium">
+                  {competitor.title ?? "(syncing…)"}
+                </div>
+                <div className="truncate text-xs text-muted-foreground">
+                  {competitor.handle ?? competitor.channelId ?? "—"}
+                </div>
+              </div>
+              <span
+                className={cn(
+                  "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium",
+                  TIER_PILL[competitor.tier]
+                )}
+              >
+                {TIER_LABEL[competitor.tier]}
+              </span>
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
@@ -676,7 +906,7 @@ function CompetitorCard({
               Subs
             </div>
             <div className="font-semibold">
-              {fmtCount(competitor.subscriber_count)}
+              {fmtCount(competitor.subscriberCount)}
             </div>
           </div>
           <div>
@@ -684,7 +914,7 @@ function CompetitorCard({
               Videos
             </div>
             <div className="font-semibold">
-              {fmtCount(competitor.video_count)}
+              {fmtCount(competitor.videoCount)}
             </div>
           </div>
           <div>
@@ -692,11 +922,276 @@ function CompetitorCard({
               Synced
             </div>
             <div className="font-semibold">
-              {fmtRelative(competitor.last_sync_at)}
+              {fmtRelative(competitor.lastSyncAt)}
             </div>
           </div>
         </div>
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3 text-[11px]">
+          <label className="inline-flex items-center gap-1.5 text-muted-foreground">
+            <span>Tier:</span>
+            <select
+              value={competitor.tier}
+              onChange={(e) => onTierChange(e.target.value as Tier)}
+              className="rounded-md border border-input bg-background px-1.5 py-0.5 text-[11px]"
+            >
+              {TIERS.map((t) => (
+                <option key={t} value={t}>
+                  {TIER_LABEL[t]}
+                </option>
+              ))}
+            </select>
+          </label>
+          {otherChannels.length > 0 && (
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setMoveOpen((v) => !v)}
+                className="text-muted-foreground hover:text-foreground"
+              >
+                Move to another channel ↗
+              </button>
+              {moveOpen && (
+                <div className="absolute right-0 z-10 mt-1 min-w-[200px] rounded-md border border-border bg-popover p-1 shadow-md">
+                  {otherChannels.map((ch) => (
+                    <button
+                      key={ch.id}
+                      type="button"
+                      onClick={() => {
+                        setMoveOpen(false);
+                        onMove(ch.id);
+                      }}
+                      className="block w-full truncate rounded px-2 py-1 text-left text-xs hover:bg-accent"
+                    >
+                      {ch.title ?? ch.handle ?? ch.id}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </CardContent>
     </Card>
+  );
+}
+
+function MigrationView({
+  competitors,
+  channels,
+  onAssign,
+  onBack,
+}: {
+  competitors: Competitor[];
+  channels: UserChannel[];
+  onAssign: (
+    id: number,
+    patch: { userChannelId?: string | null; tier?: Tier }
+  ) => Promise<void>;
+  onBack: () => void;
+}) {
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [bulkChannel, setBulkChannel] = useState<string>(channels[0]?.id ?? "");
+  const [bulkTier, setBulkTier] = useState<Tier>("authority");
+  const [busy, setBusy] = useState(false);
+
+  const toggleRow = (id: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const assignSelected = async () => {
+    if (!bulkChannel || selected.size === 0) return;
+    setBusy(true);
+    try {
+      for (const id of selected) {
+        await onAssign(id, { userChannelId: bulkChannel, tier: bulkTier });
+      }
+      setSelected(new Set());
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between gap-3">
+        <Button variant="ghost" size="sm" onClick={onBack} className="gap-1.5">
+          <ArrowLeft className="h-3.5 w-3.5" />
+          Back to active channel
+        </Button>
+        <span className="text-xs text-muted-foreground">
+          {competitors.length} unassigned
+        </span>
+      </div>
+      <Card>
+        <CardContent className="space-y-3 p-4">
+          <div className="text-xs text-muted-foreground">
+            Pre-rework competitors had no per-channel ownership. Pick a channel
+            and tier for each one, or use the bulk row below to assign several
+            at once.
+          </div>
+          <div className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-muted/30 p-2 text-xs">
+            <span className="font-medium">Bulk:</span>
+            <select
+              value={bulkChannel}
+              onChange={(e) => setBulkChannel(e.target.value)}
+              className="rounded-md border border-input bg-background px-2 py-1 text-xs"
+              disabled={busy}
+            >
+              {channels.length === 0 ? (
+                <option value="">(no channels)</option>
+              ) : (
+                channels.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.title ?? c.handle ?? c.id}
+                  </option>
+                ))
+              )}
+            </select>
+            <select
+              value={bulkTier}
+              onChange={(e) => setBulkTier(e.target.value as Tier)}
+              className="rounded-md border border-input bg-background px-2 py-1 text-xs"
+              disabled={busy}
+            >
+              {TIERS.map((t) => (
+                <option key={t} value={t}>
+                  {TIER_LABEL[t]}
+                </option>
+              ))}
+            </select>
+            <Button
+              size="sm"
+              onClick={assignSelected}
+              disabled={busy || !bulkChannel || selected.size === 0}
+              className="gap-1.5"
+            >
+              {busy ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Check className="h-3.5 w-3.5" />
+              )}
+              Assign {selected.size > 0 ? `(${selected.size})` : "selected"}
+            </Button>
+          </div>
+          {competitors.length === 0 ? (
+            <div className="py-10 text-center text-sm text-muted-foreground">
+              All competitors are assigned. Click &ldquo;Back to active
+              channel&rdquo; to return.
+            </div>
+          ) : (
+            <ul className="divide-y divide-border">
+              {competitors.map((c) => (
+                <MigrationRow
+                  key={c.id}
+                  competitor={c}
+                  channels={channels}
+                  checked={selected.has(c.id)}
+                  onToggle={() => toggleRow(c.id)}
+                  onAssign={(userChannelId, tier) =>
+                    onAssign(c.id, { userChannelId, tier })
+                  }
+                />
+              ))}
+            </ul>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function MigrationRow({
+  competitor,
+  channels,
+  checked,
+  onToggle,
+  onAssign,
+}: {
+  competitor: Competitor;
+  channels: UserChannel[];
+  checked: boolean;
+  onToggle: () => void;
+  onAssign: (userChannelId: string, tier: Tier) => Promise<void>;
+}) {
+  const [rowChannel, setRowChannel] = useState(channels[0]?.id ?? "");
+  const [rowTier, setRowTier] = useState<Tier>("authority");
+  const [busy, setBusy] = useState(false);
+
+  const assign = async () => {
+    if (!rowChannel) return;
+    setBusy(true);
+    try {
+      await onAssign(rowChannel, rowTier);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <li className="flex flex-wrap items-center gap-2 py-2 text-xs">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={onToggle}
+        className="h-4 w-4"
+        disabled={busy}
+        aria-label={`Select ${competitor.title ?? competitor.handle ?? competitor.id}`}
+      />
+      <span className="min-w-[180px] flex-1 truncate font-medium">
+        {competitor.title ?? "(no title yet)"}
+      </span>
+      <span className="min-w-[120px] truncate text-muted-foreground">
+        {competitor.handle ?? competitor.channelId ?? "—"}
+      </span>
+      <span className="min-w-[60px] text-muted-foreground">
+        {fmtCount(competitor.subscriberCount)} subs
+      </span>
+      <select
+        value={rowChannel}
+        onChange={(e) => setRowChannel(e.target.value)}
+        className="rounded-md border border-input bg-background px-2 py-1 text-xs"
+        disabled={busy || channels.length === 0}
+      >
+        {channels.length === 0 ? (
+          <option value="">(no channels)</option>
+        ) : (
+          channels.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.title ?? c.handle ?? c.id}
+            </option>
+          ))
+        )}
+      </select>
+      <select
+        value={rowTier}
+        onChange={(e) => setRowTier(e.target.value as Tier)}
+        className="rounded-md border border-input bg-background px-2 py-1 text-xs"
+        disabled={busy}
+      >
+        {TIERS.map((t) => (
+          <option key={t} value={t}>
+            {TIER_LABEL[t]}
+          </option>
+        ))}
+      </select>
+      <Button
+        size="sm"
+        onClick={assign}
+        disabled={busy || !rowChannel}
+        className="gap-1.5"
+      >
+        {busy ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <Check className="h-3.5 w-3.5" />
+        )}
+        Assign
+      </Button>
+    </li>
   );
 }

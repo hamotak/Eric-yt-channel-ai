@@ -217,8 +217,14 @@ db.exec(`
 // the cascade delete during channel switch). We don't actually use FTS on
 // transcripts — `searchTranscripts` does plain LIKE — so this table is
 // pure liability. Drop and let it stay gone.
+//
+// Also drop the retired Hook Lab + Hooks Library tables. Both features
+// were stripped out in the redesign; this guarantees fresh installs
+// don't carry orphaned tables forward.
 try {
   db.exec(`DROP TABLE IF EXISTS transcripts_fts`);
+  db.exec(`DROP TABLE IF EXISTS video_hooks`);
+  db.exec(`DROP TABLE IF EXISTS hooks_library`);
 } catch {
   /* table didn't exist or rare concurrent issue — moving on either way */
 }
@@ -492,6 +498,14 @@ export type Channel = {
   monetization_status?: "monetized" | "pending" | "not_eligible" | null;
   notes?: string | null;
   expected_videos_per_month?: number | null;
+  // Per-channel context fields (set via /my-channels). DEFAULT '' in
+  // the schema means existing rows already have an empty string after
+  // the migration ran, so these are always strings, never null.
+  niche?: string;
+  positioning?: string;
+  audience?: string;
+  voice?: string;
+  external_sources?: string;
 };
 
 /**
@@ -520,6 +534,46 @@ export function updateChannelMeta(channelId: string, patch: ChannelMeta): void {
   if (sets.length === 0) return;
   args.push(channelId);
   db.prepare(`UPDATE channels SET ${sets.join(", ")} WHERE id = ?`).run(...args);
+}
+
+/**
+ * Channel context fields edited on /my-channels. Snake-case here is the
+ * column name; the API route maps the camelCase `externalSources` wire
+ * shape to `external_sources` before calling this. Separate from
+ * updateChannelMeta because the two pages have different concerns:
+ * /integrations owns billing/monetization meta, /my-channels owns the
+ * strategy/voice context that downstream AI features consume.
+ */
+export type ChannelContextField =
+  | "niche"
+  | "positioning"
+  | "audience"
+  | "voice"
+  | "external_sources";
+
+const CHANNEL_CONTEXT_FIELDS: readonly ChannelContextField[] = [
+  "niche",
+  "positioning",
+  "audience",
+  "voice",
+  "external_sources",
+] as const;
+
+export function updateChannelContext(
+  channelId: string,
+  field: ChannelContextField,
+  value: string
+): Channel | null {
+  if (!CHANNEL_CONTEXT_FIELDS.includes(field)) return null;
+  db.prepare(`UPDATE channels SET ${field} = ? WHERE id = ?`).run(
+    value,
+    channelId
+  );
+  return (
+    (db.prepare(`SELECT * FROM channels WHERE id = ?`).get(channelId) as
+      | Channel
+      | undefined) ?? null
+  );
 }
 
 /* ---------- Tags ---------- */
@@ -1383,7 +1437,7 @@ db.exec(`
   const channelCols = (
     db.prepare(`PRAGMA table_info(channels)`).all() as { name: string }[]
   ).map((c) => c.name);
-  const newColumns: { name: string; type: string }[] = [
+  const newColumns: { name: string; type: string; default?: string }[] = [
     // Who edits videos for this channel — used by the editor billing
     // card to group "you owe John X, you owe Anna Y".
     { name: "editor_name", type: "TEXT" },
@@ -1409,11 +1463,23 @@ db.exec(`
     // each = $160/month forecast"); the dashboard sums this across
     // every channel for total expected monthly editor cost.
     { name: "expected_videos_per_month", type: "INTEGER" },
+    // Per-channel context fields edited on /my-channels. Every AI
+    // feature downstream (outliers explainer, topic validator, ideation,
+    // daily market watch, chat) reads these on every invocation, so they
+    // must always be safe to concatenate into a prompt — DEFAULT '' means
+    // existing rows get an empty string immediately and the API never
+    // returns NULL.
+    { name: "niche", type: "TEXT", default: "''" },
+    { name: "positioning", type: "TEXT", default: "''" },
+    { name: "audience", type: "TEXT", default: "''" },
+    { name: "voice", type: "TEXT", default: "''" },
+    { name: "external_sources", type: "TEXT", default: "''" },
   ];
   for (const col of newColumns) {
     if (channelCols.includes(col.name)) continue;
     try {
-      db.exec(`ALTER TABLE channels ADD COLUMN ${col.name} ${col.type}`);
+      const def = col.default ? ` NOT NULL DEFAULT ${col.default}` : "";
+      db.exec(`ALTER TABLE channels ADD COLUMN ${col.name} ${col.type}${def}`);
     } catch (err) {
       // eslint-disable-next-line no-console
       console.warn(
@@ -2643,17 +2709,30 @@ export function clearLogs(opts: { level?: LogLevel; olderThanSec?: number } = {}
  * own channel.
  * ============================================================ */
 
+// Fresh-install shape. Note: NO `UNIQUE` on channel_id — uniqueness is now
+// per (user_channel_id, channel_id) pair, enforced by a partial unique
+// index created AFTER the rebuild block runs (so existing installs have
+// the new column to index on). The previous global UNIQUE forbade
+// tracking the same competitor under two of the user's channels.
+//
+// Indexes referencing user_channel_id are intentionally NOT in this exec
+// block: on existing installs the CREATE TABLE IF NOT EXISTS is a no-op
+// against the legacy shape, so the index would fail with "no such column".
+// Indexes that don't reference user_channel_id stay here.
 db.exec(`
   CREATE TABLE IF NOT EXISTS competitors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id TEXT UNIQUE,                -- UCxxxx; null until first sync resolves it
+    channel_id TEXT,                        -- UCxxxx; null until first sync resolves it
     handle TEXT,                            -- @handle or full URL given by user
     title TEXT,
     avatar_url TEXT,
     subscriber_count INTEGER,
     video_count INTEGER,
     added_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    last_sync_at INTEGER
+    last_sync_at INTEGER,
+    user_channel_id TEXT,                   -- one of the user's channels.id
+    tier TEXT NOT NULL DEFAULT 'authority', -- authority|breakthrough|adjacent|far
+    tier_set_at INTEGER
   );
   CREATE INDEX IF NOT EXISTS idx_competitors_channel ON competitors(channel_id);
 
@@ -2692,6 +2771,114 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_comp_alerts_unread ON competitor_alerts(read_at, detected_at DESC);
 `);
 
+// One-shot rebuild for existing installs whose `competitors` table still
+// carries the legacy `UNIQUE` on channel_id (which blocks tracking the
+// same competitor under two of the user's channels). Idempotent via the
+// `competitors.rebuiltForUserChannelScoping` settings flag.
+//
+// Critical detail: `DROP TABLE competitors` with foreign_keys=ON performs
+// an implicit `DELETE FROM competitors` first, which cascade-deletes all
+// rows in competitor_videos and competitor_alerts. PRAGMA defer_foreign_keys
+// only delays constraint *checks*, NOT cascade *actions* — so we MUST flip
+// foreign_keys=OFF for the duration of the rebuild. PRAGMA foreign_keys is
+// a no-op inside a transaction, so it is set OUTSIDE.
+//
+// Pre-existing rows land with user_channel_id = NULL (intentional — the
+// /competitors page shows a migration banner so the user assigns each
+// one to the right channel manually) and tier = 'authority' (from the
+// CREATE TABLE default). tier_set_at stays NULL until they re-tag.
+{
+  const rebuiltFlag = getSetting("competitors.rebuiltForUserChannelScoping");
+  if (rebuiltFlag !== "1") {
+    const cols = (
+      db.prepare(`PRAGMA table_info(competitors)`).all() as { name: string }[]
+    ).map((c) => c.name);
+    const alreadyOnNewShape = cols.includes("user_channel_id");
+    if (alreadyOnNewShape) {
+      // Fresh install — CREATE TABLE IF NOT EXISTS already laid down the
+      // new shape, nothing to rebuild. Just mark the flag so we don't
+      // do this check on every boot.
+      setSetting("competitors.rebuiltForUserChannelScoping", "1");
+    } else {
+      // foreign_keys MUST be toggled outside the transaction.
+      db.pragma("foreign_keys = OFF");
+      try {
+        const rebuild = db.transaction(() => {
+          db.exec(`
+            CREATE TABLE competitors_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              channel_id TEXT,
+              handle TEXT,
+              title TEXT,
+              avatar_url TEXT,
+              subscriber_count INTEGER,
+              video_count INTEGER,
+              added_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+              last_sync_at INTEGER,
+              user_channel_id TEXT,
+              tier TEXT NOT NULL DEFAULT 'authority',
+              tier_set_at INTEGER
+            )
+          `);
+          db.exec(`
+            INSERT INTO competitors_new
+              (id, channel_id, handle, title, avatar_url,
+               subscriber_count, video_count, added_at, last_sync_at)
+            SELECT
+              id, channel_id, handle, title, avatar_url,
+              subscriber_count, video_count, added_at, last_sync_at
+            FROM competitors
+          `);
+          db.exec(`DROP TABLE competitors`);
+          db.exec(`ALTER TABLE competitors_new RENAME TO competitors`);
+          db.exec(`CREATE INDEX IF NOT EXISTS idx_competitors_channel ON competitors(channel_id)`);
+          db.exec(`CREATE INDEX IF NOT EXISTS idx_competitors_user_channel ON competitors(user_channel_id)`);
+          db.exec(`
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_competitors_user_yt_unique
+              ON competitors(user_channel_id, channel_id)
+              WHERE user_channel_id IS NOT NULL AND channel_id IS NOT NULL
+          `);
+        });
+        rebuild();
+        // foreign_key_check returns rows for any dangling FK refs — if
+        // this rebuild went sideways we want to know loudly.
+        const dangling = db.prepare(`PRAGMA foreign_key_check`).all() as unknown[];
+        if (dangling.length > 0) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[db] competitors rebuild left dangling FKs:",
+            dangling
+          );
+        }
+        setSetting("competitors.rebuiltForUserChannelScoping", "1");
+        // eslint-disable-next-line no-console
+        console.warn("[db] competitors table rebuilt for user-channel scoping");
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn("[db] competitors rebuild failed (will retry on next boot):", err);
+      } finally {
+        db.pragma("foreign_keys = ON");
+      }
+    }
+  }
+}
+
+// Indexes that reference the new `user_channel_id` column. These run
+// AFTER the rebuild so existing installs have the column to index. Both
+// are CREATE … IF NOT EXISTS so re-running on a fresh install is a no-op.
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_competitors_user_channel
+      ON competitors(user_channel_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_competitors_user_yt_unique
+      ON competitors(user_channel_id, channel_id)
+      WHERE user_channel_id IS NOT NULL AND channel_id IS NOT NULL;
+  `);
+} catch (err) {
+  // eslint-disable-next-line no-console
+  console.warn("[db] competitors user-channel indexes failed (ignored):", err);
+}
+
 export type Competitor = {
   id: number;
   channel_id: string | null;
@@ -2702,7 +2889,20 @@ export type Competitor = {
   video_count: number | null;
   added_at: number;
   last_sync_at: number | null;
+  user_channel_id: string | null;
+  tier: CompetitorTier;
+  tier_set_at: number | null;
 };
+
+export const COMPETITOR_TIERS = ["authority", "breakthrough", "adjacent", "far"] as const;
+export type CompetitorTier = (typeof COMPETITOR_TIERS)[number];
+
+export function isCompetitorTier(v: unknown): v is CompetitorTier {
+  return (
+    typeof v === "string" &&
+    (COMPETITOR_TIERS as readonly string[]).includes(v)
+  );
+}
 
 export type CompetitorVideo = {
   competitor_id: number;
@@ -2730,7 +2930,29 @@ export type CompetitorAlert = {
   read_at: number | null;
 };
 
-export function listCompetitors(): Competitor[] {
+/**
+ * List competitors. Pass a userChannelId to scope to that user channel,
+ * pass the literal "unassigned" sentinel to get only NULL-user_channel_id
+ * rows (the migration view), or omit entirely to get every row across
+ * channels (used by the page's migration banner to compute totals).
+ */
+export function listCompetitors(
+  userChannelId?: string | "unassigned"
+): Competitor[] {
+  if (userChannelId === "unassigned") {
+    return db
+      .prepare(
+        `SELECT * FROM competitors WHERE user_channel_id IS NULL ORDER BY added_at DESC`
+      )
+      .all() as Competitor[];
+  }
+  if (typeof userChannelId === "string" && userChannelId.length > 0) {
+    return db
+      .prepare(
+        `SELECT * FROM competitors WHERE user_channel_id = ? ORDER BY added_at DESC`
+      )
+      .all(userChannelId) as Competitor[];
+  }
   return db
     .prepare(`SELECT * FROM competitors ORDER BY added_at DESC`)
     .all() as Competitor[];
@@ -2742,23 +2964,98 @@ export function getCompetitor(id: number): Competitor | undefined {
     | undefined;
 }
 
-export function getCompetitorByChannelId(channelId: string): Competitor | undefined {
+/**
+ * Pair-scoped lookup. Returns the row owned by `userChannelId` that
+ * tracks competitor `channelId`. Used by POST /api/competitors to
+ * return 409 before inserting a duplicate. The legacy global lookup
+ * has been removed because the same competitor may now legitimately
+ * be tracked under multiple user channels.
+ */
+export function getCompetitorByUserChannelAndYouTubeId(
+  userChannelId: string,
+  channelId: string
+): Competitor | undefined {
   return db
-    .prepare(`SELECT * FROM competitors WHERE channel_id = ?`)
-    .get(channelId) as Competitor | undefined;
+    .prepare(
+      `SELECT * FROM competitors WHERE user_channel_id = ? AND channel_id = ?`
+    )
+    .get(userChannelId, channelId) as Competitor | undefined;
+}
+
+/**
+ * Pre-sync dedup by handle within a user channel. The first sync
+ * resolves the real UC-id; without this check, the post-sync UPDATE
+ * would race against the partial unique index.
+ */
+export function getCompetitorByUserChannelAndHandle(
+  userChannelId: string,
+  handle: string
+): Competitor | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM competitors WHERE user_channel_id = ? AND handle = ? COLLATE NOCASE`
+    )
+    .get(userChannelId, handle) as Competitor | undefined;
+}
+
+export function countUnassignedCompetitors(): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM competitors WHERE user_channel_id IS NULL`
+    )
+    .get() as { n: number };
+  return row.n;
 }
 
 export function addCompetitor(input: {
   handle?: string | null;
   channel_id?: string | null;
   title?: string | null;
+  user_channel_id: string;
+  tier: CompetitorTier;
 }): number {
   const info = db
     .prepare(
-      `INSERT INTO competitors (handle, channel_id, title) VALUES (?, ?, ?)`
+      `INSERT INTO competitors
+         (handle, channel_id, title, user_channel_id, tier, tier_set_at)
+       VALUES (?, ?, ?, ?, ?, strftime('%s','now'))`
     )
-    .run(input.handle ?? null, input.channel_id ?? null, input.title ?? null);
+    .run(
+      input.handle ?? null,
+      input.channel_id ?? null,
+      input.title ?? null,
+      input.user_channel_id,
+      input.tier
+    );
   return Number(info.lastInsertRowid);
+}
+
+/**
+ * Patch the per-competitor user/tier assignment. Used by the migration
+ * banner ("assign to channel X") and the inline tier dropdown on each
+ * competitor card. tier_set_at gets bumped whenever tier changes.
+ */
+export function updateCompetitorAssignment(
+  id: number,
+  patch: { user_channel_id?: string | null; tier?: CompetitorTier }
+): Competitor | null {
+  const sets: string[] = [];
+  const args: (string | number | null)[] = [];
+  if ("user_channel_id" in patch) {
+    sets.push(`user_channel_id = ?`);
+    args.push(patch.user_channel_id ?? null);
+  }
+  if (patch.tier !== undefined) {
+    sets.push(`tier = ?`);
+    args.push(patch.tier);
+    sets.push(`tier_set_at = strftime('%s','now')`);
+  }
+  if (sets.length === 0) return getCompetitor(id) ?? null;
+  args.push(id);
+  db.prepare(`UPDATE competitors SET ${sets.join(", ")} WHERE id = ?`).run(
+    ...args
+  );
+  return getCompetitor(id) ?? null;
 }
 
 export function updateCompetitorAfterSync(
@@ -2881,8 +3178,25 @@ export function recordCompetitorAlert(a: {
   );
 }
 
-export function listCompetitorAlerts(opts: { unreadOnly?: boolean; limit?: number } = {}): (CompetitorAlert & { competitor_title: string | null; competitor_handle: string | null })[] {
-  const where = opts.unreadOnly ? "WHERE a.read_at IS NULL" : "";
+export function listCompetitorAlerts(
+  opts: {
+    unreadOnly?: boolean;
+    limit?: number;
+    userChannelId?: string | null;
+  } = {}
+): (CompetitorAlert & {
+  competitor_title: string | null;
+  competitor_handle: string | null;
+})[] {
+  const whereParts: string[] = [];
+  const args: (string | number | null)[] = [];
+  if (opts.unreadOnly) whereParts.push("a.read_at IS NULL");
+  if (opts.userChannelId) {
+    whereParts.push("c.user_channel_id = ?");
+    args.push(opts.userChannelId);
+  }
+  const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+  args.push(opts.limit ?? 100);
   return db
     .prepare(
       `SELECT a.*, c.title AS competitor_title, c.handle AS competitor_handle
@@ -2892,7 +3206,7 @@ export function listCompetitorAlerts(opts: { unreadOnly?: boolean; limit?: numbe
        ORDER BY a.detected_at DESC
        LIMIT ?`
     )
-    .all(opts.limit ?? 100) as (CompetitorAlert & {
+    .all(...args) as (CompetitorAlert & {
     competitor_title: string | null;
     competitor_handle: string | null;
   })[];
@@ -2904,7 +3218,20 @@ export function markCompetitorAlertRead(id: number): void {
   ).run(id);
 }
 
-export function unreadCompetitorAlertCount(): number {
+export function unreadCompetitorAlertCount(
+  userChannelId?: string | null
+): number {
+  if (userChannelId) {
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS n
+         FROM competitor_alerts a
+         JOIN competitors c ON c.id = a.competitor_id
+         WHERE a.read_at IS NULL AND c.user_channel_id = ?`
+      )
+      .get(userChannelId) as { n: number };
+    return row.n;
+  }
   const row = db
     .prepare(`SELECT COUNT(*) AS n FROM competitor_alerts WHERE read_at IS NULL`)
     .get() as { n: number };
@@ -2937,7 +3264,9 @@ function tokeniseTitle(title: string): string[] {
     .filter((w) => w.length >= 4 && !STOPWORDS.has(w));
 }
 
-export function competitorGapAnalysis(opts: { topN?: number } = {}): Array<{
+export function competitorGapAnalysis(
+  opts: { topN?: number; userChannelId?: string | null } = {}
+): Array<{
   word: string;
   competitorUses: number;
   competitorTotalViews: number;
@@ -2945,30 +3274,34 @@ export function competitorGapAnalysis(opts: { topN?: number } = {}): Array<{
   exampleCompetitorTitle: string;
 }> {
   const top = opts.topN ?? 25;
-  // "Own" titles must be the ACTIVE channel only — otherwise we'd mix
-  // in titles from a different connected channel and call them "ours",
-  // hiding gap-words that are actually opportunities for THIS channel.
-  const activeId = getActiveChannelId();
-  const ownTitles = activeId
+  // "Own" titles AND competitor pool must both be scoped to the user
+  // channel the analysis is for, otherwise gap words leak across channels.
+  const scopeChannelId = opts.userChannelId ?? getActiveChannelId();
+  const ownTitles = scopeChannelId
     ? (db
         .prepare(`SELECT title FROM videos WHERE channel_id = ?`)
-        .all(activeId) as { title: string }[])
+        .all(scopeChannelId) as { title: string }[])
     : [];
   const ownWords = new Set<string>();
   for (const r of ownTitles) {
     for (const w of tokeniseTitle(r.title)) ownWords.add(w);
   }
 
-  // Pull each competitor video's title + views. Aggregate frequency
-  // and total views per word; subtract words already in the user's
-  // catalogue at the end.
-  const compVideos = db
-    .prepare(
-      `SELECT title, views FROM competitor_videos
-       ORDER BY views DESC
-       LIMIT 1000`
-    )
-    .all() as { title: string; views: number }[];
+  // Pull each competitor video's title + views — but only from competitors
+  // belonging to this user channel. Aggregate frequency and total views
+  // per word; subtract words already in the user's catalogue at the end.
+  const compVideos = scopeChannelId
+    ? (db
+        .prepare(
+          `SELECT cv.title, cv.views
+             FROM competitor_videos cv
+             JOIN competitors c ON c.id = cv.competitor_id
+            WHERE c.user_channel_id = ?
+            ORDER BY cv.views DESC
+            LIMIT 1000`
+        )
+        .all(scopeChannelId) as { title: string; views: number }[])
+    : ([] as { title: string; views: number }[]);
 
   type Agg = { uses: number; totalViews: number; sampleTitle: string };
   const stats = new Map<string, Agg>();
@@ -2996,444 +3329,6 @@ export function competitorGapAnalysis(opts: { topN?: number } = {}): Array<{
     .filter((r) => r.competitorUses >= 2) // need at least 2 sightings to be a "pattern"
     .sort((a, b) => b.competitorTotalViews - a.competitorTotalViews)
     .slice(0, top);
-}
-
-/* ============================================================
- * HOOK LAB (Phase C)
- *
- * AI scoring of each video's opening 30-60 seconds — the "hook".
- * Captures both a formula classification (direct question, mystery,
- * personal story, etc.) and seven 1-10 quality scores covering the
- * dimensions the mentor framework identifies: open loop, value promise,
- * conflict, specific language, identification, pacing, benefit.
- * One row per video, regenerated on demand.
- * ============================================================ */
-
-export const HOOK_FORMULAS = [
-  "direct_question",
-  "statistic",
-  "comment_reference",
-  "personal_story",
-  "mystery",
-  "character_place_date",
-  "provocation",
-  "other",
-] as const;
-export type HookFormula = (typeof HOOK_FORMULAS)[number];
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS video_hooks (
-    video_id TEXT PRIMARY KEY,
-    hook_text TEXT NOT NULL,
-    formula_type TEXT NOT NULL,
-    -- Seven quality dimensions (1-10 each). Stored as columns rather
-    -- than a JSON blob so SQL aggregations (averages, sorting) stay
-    -- fast and the chat SQL tool can reason about them directly.
-    score_open_loop INTEGER NOT NULL,
-    score_value_promise INTEGER NOT NULL,
-    score_conflict INTEGER NOT NULL,
-    score_specific_language INTEGER NOT NULL,
-    score_identification INTEGER NOT NULL,
-    score_pacing INTEGER NOT NULL,
-    score_benefit INTEGER NOT NULL,
-    overall_score REAL NOT NULL,
-    -- Free-form strengths + improvement suggestions from the analyzer.
-    fortalezas TEXT,
-    mejoras TEXT,
-    analyzed_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    analyzer_model TEXT,
-    FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
-  );
-  CREATE INDEX IF NOT EXISTS idx_hooks_score ON video_hooks(overall_score DESC);
-  CREATE INDEX IF NOT EXISTS idx_hooks_formula ON video_hooks(formula_type);
-`);
-
-export type VideoHook = {
-  video_id: string;
-  hook_text: string;
-  formula_type: HookFormula;
-  score_open_loop: number;
-  score_value_promise: number;
-  score_conflict: number;
-  score_specific_language: number;
-  score_identification: number;
-  score_pacing: number;
-  score_benefit: number;
-  overall_score: number;
-  fortalezas: string | null; // JSON array
-  mejoras: string | null;    // JSON array
-  analyzed_at: number;
-  analyzer_model: string | null;
-};
-
-export function upsertVideoHook(h: VideoHook): void {
-  db.prepare(
-    `INSERT INTO video_hooks
-       (video_id, hook_text, formula_type,
-        score_open_loop, score_value_promise, score_conflict, score_specific_language,
-        score_identification, score_pacing, score_benefit, overall_score,
-        fortalezas, mejoras, analyzed_at, analyzer_model)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), ?)
-     ON CONFLICT(video_id) DO UPDATE SET
-       hook_text = excluded.hook_text,
-       formula_type = excluded.formula_type,
-       score_open_loop = excluded.score_open_loop,
-       score_value_promise = excluded.score_value_promise,
-       score_conflict = excluded.score_conflict,
-       score_specific_language = excluded.score_specific_language,
-       score_identification = excluded.score_identification,
-       score_pacing = excluded.score_pacing,
-       score_benefit = excluded.score_benefit,
-       overall_score = excluded.overall_score,
-       fortalezas = excluded.fortalezas,
-       mejoras = excluded.mejoras,
-       analyzed_at = strftime('%s','now'),
-       analyzer_model = excluded.analyzer_model`
-  ).run(
-    h.video_id,
-    h.hook_text,
-    h.formula_type,
-    h.score_open_loop,
-    h.score_value_promise,
-    h.score_conflict,
-    h.score_specific_language,
-    h.score_identification,
-    h.score_pacing,
-    h.score_benefit,
-    h.overall_score,
-    h.fortalezas ?? null,
-    h.mejoras ?? null,
-    h.analyzer_model ?? null
-  );
-}
-
-export function getVideoHook(videoId: string): VideoHook | undefined {
-  return db
-    .prepare(`SELECT * FROM video_hooks WHERE video_id = ?`)
-    .get(videoId) as VideoHook | undefined;
-}
-
-/**
- * List hooks joined to their videos. Used by /hooks dashboards — the
- * Rankings tab wants both the score and the source title/views in the
- * same row so it can sort by either dimension without an N+1 join.
- */
-export type HookWithVideo = VideoHook & {
-  title: string;
-  views: number;
-  published_at: number | null;
-  thumbnail_url: string | null;
-};
-
-export function listHooksWithVideos(opts: {
-  formula?: HookFormula;
-  limit?: number;
-  orderBy?: "score" | "views" | "recent";
-} = {}): HookWithVideo[] {
-  const order =
-    opts.orderBy === "views"
-      ? "v.views DESC"
-      : opts.orderBy === "recent"
-        ? "v.published_at DESC"
-        : "h.overall_score DESC";
-  // Always scope to the active channel — the dashboard / chat user
-  // expects "the hooks on MY current channel", not a cross-channel pool.
-  const activeId = getActiveChannelId();
-  if (!activeId) return [];
-  const whereParts: string[] = ["v.channel_id = ?"];
-  const args: unknown[] = [activeId];
-  if (opts.formula) {
-    whereParts.push("h.formula_type = ?");
-    args.push(opts.formula);
-  }
-  args.push(opts.limit ?? 200);
-  return db
-    .prepare(
-      `SELECT h.*, v.title, v.views, v.published_at, v.thumbnail_url
-       FROM video_hooks h
-       JOIN videos v ON v.id = h.video_id
-       WHERE ${whereParts.join(" AND ")}
-       ORDER BY ${order}
-       LIMIT ?`
-    )
-    .all(...args) as HookWithVideo[];
-}
-
-/**
- * Per-formula aggregates for the dashboard chart — how many hooks of
- * each type the channel ships, and what their average views look like.
- * "Winning formula" is just the formula with the highest avg views.
- */
-export function hookFormulaStats(): Array<{
-  formula: HookFormula;
-  count: number;
-  avgViews: number;
-  avgScore: number;
-}> {
-  const activeId = getActiveChannelId();
-  if (!activeId) return [];
-  return db
-    .prepare(
-      `SELECT
-         h.formula_type AS formula,
-         COUNT(*) AS count,
-         CAST(AVG(v.views) AS INTEGER) AS avgViews,
-         ROUND(AVG(h.overall_score), 1) AS avgScore
-       FROM video_hooks h
-       JOIN videos v ON v.id = h.video_id
-       WHERE v.channel_id = ?
-       GROUP BY h.formula_type
-       ORDER BY avgViews DESC`
-    )
-    .all(activeId) as Array<{
-    formula: HookFormula;
-    count: number;
-    avgViews: number;
-    avgScore: number;
-  }>;
-}
-
-export function hookOverallStats(): {
-  analyzed: number;
-  totalVideos: number;
-  avgScore: number;
-  topFormula: HookFormula | null;
-} {
-  const activeId = getActiveChannelId();
-  if (!activeId) {
-    return { analyzed: 0, totalVideos: 0, avgScore: 0, topFormula: null };
-  }
-  // Both counts and the avg must be channel-scoped — otherwise we'd
-  // mix hooks/videos from every connected channel into a single number.
-  const analyzed = (
-    db
-      .prepare(
-        `SELECT COUNT(*) AS n
-         FROM video_hooks h
-         JOIN videos v ON v.id = h.video_id
-         WHERE v.channel_id = ?`
-      )
-      .get(activeId) as { n: number }
-  ).n;
-  const totalVideos = (
-    db
-      .prepare(`SELECT COUNT(*) AS n FROM videos WHERE channel_id = ?`)
-      .get(activeId) as { n: number }
-  ).n;
-  const avgRow = db
-    .prepare(
-      `SELECT ROUND(AVG(h.overall_score), 1) AS avg
-       FROM video_hooks h
-       JOIN videos v ON v.id = h.video_id
-       WHERE v.channel_id = ?`
-    )
-    .get(activeId) as { avg: number | null } | undefined;
-  const formulas = hookFormulaStats();
-  return {
-    analyzed,
-    totalVideos,
-    avgScore: avgRow?.avg ?? 0,
-    topFormula: formulas[0]?.formula ?? null,
-  };
-}
-
-/** Videos that still need analysis — used by the batch analyzer. */
-export function listVideosPendingHookAnalysis(limit = 200): Array<{
-  id: string;
-  title: string;
-}> {
-  return db
-    .prepare(
-      `SELECT v.id, v.title
-       FROM videos v
-       LEFT JOIN video_hooks h ON h.video_id = v.id
-       LEFT JOIN transcripts t ON t.video_id = v.id
-       WHERE h.video_id IS NULL AND t.video_id IS NOT NULL
-       ORDER BY v.views DESC
-       LIMIT ?`
-    )
-    .all(limit) as Array<{ id: string; title: string }>;
-}
-
-/* ============================================================
- * FORMULA ANALYZER (Phase D)
- *
- * Pure SQL aggregations over the user's own video catalogue —
- * surface which title patterns / lengths / keywords have actually
- * pulled views on THIS channel. No AI: this is the "what did
- * you ship and what worked" view.
- * ============================================================ */
-
-const FORMULA_STOPWORDS = new Set([
-  "the","a","an","and","or","but","if","of","in","on","for","to","with","is","are","was","were","be","been",
-  "this","that","these","those","i","you","he","she","it","we","they","my","your","his","her","its","our","their",
-  "do","does","did","done","have","has","had","not","no","yes","at","by","from","as","than","then","so","very",
-  "what","when","where","why","how","who","which","there","here","just","like","get","got","make","made",
-  "will","would","can","could","should","shall","may","might","one","two","three","new","video","watch",
-]);
-
-function tokeniseForFormula(s: string): string[] {
-  return (s ?? "")
-    .toLowerCase()
-    .replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
-    .split(/\s+/)
-    .filter((w) => w.length >= 3 && !FORMULA_STOPWORDS.has(w));
-}
-
-export type FormulaWordStat = {
-  word: string;
-  uses: number;
-  totalViews: number;
-  avgViews: number;
-  successRate: number; // share of uses where views >= median × 1.5
-  exampleTitle: string;
-};
-
-/**
- * Per-word stats across the user's own video titles. We grade a word
- * as "successful" on a video when that video's views land at least
- * 1.5× the channel median — i.e. an above-average upload. successRate
- * is the share of a word's uses that cleared that bar.
- *
- * Returns words sorted by aggregate views (the actually-tested
- * keywords; obscure one-shot words sink to the bottom).
- */
-export function titleWordStats(opts: { minUses?: number; topN?: number } = {}): FormulaWordStat[] {
-  const minUses = opts.minUses ?? 2;
-  const topN = opts.topN ?? 60;
-  const activeId = getActiveChannelId();
-  if (!activeId) return [];
-  const rows = db
-    .prepare(
-      `SELECT title, views
-       FROM videos
-       WHERE title IS NOT NULL AND channel_id = ?`
-    )
-    .all(activeId) as { title: string; views: number }[];
-  if (rows.length === 0) return [];
-
-  // Channel median — used as the "did this video over-perform?" baseline.
-  const sortedViews = [...rows].map((r) => r.views).sort((a, b) => a - b);
-  const median =
-    sortedViews.length % 2 === 1
-      ? sortedViews[(sortedViews.length - 1) / 2]
-      : (sortedViews[sortedViews.length / 2 - 1] +
-          sortedViews[sortedViews.length / 2]) /
-        2;
-  const successThreshold = median * 1.5;
-
-  type Agg = {
-    uses: number;
-    totalViews: number;
-    successes: number;
-    sampleTitle: string;
-  };
-  const stats = new Map<string, Agg>();
-  for (const r of rows) {
-    const words = new Set(tokeniseForFormula(r.title));
-    for (const w of words) {
-      const cur = stats.get(w);
-      if (cur) {
-        cur.uses += 1;
-        cur.totalViews += r.views;
-        if (r.views >= successThreshold) cur.successes += 1;
-      } else {
-        stats.set(w, {
-          uses: 1,
-          totalViews: r.views,
-          successes: r.views >= successThreshold ? 1 : 0,
-          sampleTitle: r.title,
-        });
-      }
-    }
-  }
-  return Array.from(stats.entries())
-    .filter(([, s]) => s.uses >= minUses)
-    .map(([word, s]) => ({
-      word,
-      uses: s.uses,
-      totalViews: s.totalViews,
-      avgViews: Math.round(s.totalViews / s.uses),
-      successRate: Math.round((s.successes / s.uses) * 100),
-      exampleTitle: s.sampleTitle,
-    }))
-    .sort((a, b) => b.totalViews - a.totalViews)
-    .slice(0, topN);
-}
-
-/**
- * Title-length performance buckets. Splits the catalogue into
- * <=8 / 9-12 / 13-16 / 17+ word ranges and reports average views per
- * bucket so the dashboard can show "long titles win" or "short ones
- * win" at a glance.
- */
-export function titleLengthBuckets(): Array<{
-  bucket: string;
-  videos: number;
-  avgViews: number;
-}> {
-  const activeId = getActiveChannelId();
-  if (!activeId) {
-    return [
-      { bucket: "≤ 8 words", videos: 0, avgViews: 0 },
-      { bucket: "9–12 words", videos: 0, avgViews: 0 },
-      { bucket: "13–16 words", videos: 0, avgViews: 0 },
-      { bucket: "17+ words", videos: 0, avgViews: 0 },
-    ];
-  }
-  const rows = db
-    .prepare(
-      `SELECT title, views
-       FROM videos
-       WHERE title IS NOT NULL AND channel_id = ?`
-    )
-    .all(activeId) as { title: string; views: number }[];
-  const buckets = {
-    "≤ 8 words": [] as number[],
-    "9–12 words": [] as number[],
-    "13–16 words": [] as number[],
-    "17+ words": [] as number[],
-  };
-  for (const r of rows) {
-    const n = (r.title ?? "").trim().split(/\s+/).filter(Boolean).length;
-    if (n <= 8) buckets["≤ 8 words"].push(r.views);
-    else if (n <= 12) buckets["9–12 words"].push(r.views);
-    else if (n <= 16) buckets["13–16 words"].push(r.views);
-    else buckets["17+ words"].push(r.views);
-  }
-  return Object.entries(buckets).map(([bucket, arr]) => ({
-    bucket,
-    videos: arr.length,
-    avgViews:
-      arr.length > 0
-        ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length)
-        : 0,
-  }));
-}
-
-/**
- * Top vs bottom video titles — splits the catalogue at the 80th
- * percentile by views, surfaces top + bottom 10 for side-by-side
- * inspection. Used by the Title Patterns block of the dashboard.
- */
-export function topVsBottomTitles(): {
-  top: Array<{ id: string; title: string; views: number }>;
-  bottom: Array<{ id: string; title: string; views: number }>;
-} {
-  const activeId = getActiveChannelId();
-  if (!activeId) return { top: [], bottom: [] };
-  const all = db
-    .prepare(
-      `SELECT id, title, views
-       FROM videos
-       WHERE title IS NOT NULL AND channel_id = ?
-       ORDER BY views DESC`
-    )
-    .all(activeId) as { id: string; title: string; views: number }[];
-  if (all.length === 0) return { top: [], bottom: [] };
-  const top = all.slice(0, Math.min(10, all.length));
-  const bottom = all.slice(Math.max(0, all.length - 10)).reverse();
-  return { top, bottom };
 }
 
 /* ============================================================
@@ -3509,110 +3404,3 @@ export function upsertCommentAnalysis(a: CommentAnalysis): void {
   );
 }
 
-/* ============================================================
- * HOOKS LIBRARY (Phase D)
- *
- * User-curated list of standout comments / quotes the creator
- * wants to re-use as hooks in future videos. Sourced manually
- * from /videos/:id/comments via a "+ Hooks Library" button,
- * or via the AI Comment Analysis "Best Hook Candidates" list.
- * Tracks usage so the same line doesn't end up in two videos.
- * ============================================================ */
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS hooks_library (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    -- Optional FK back to a real comment row; null when the hook
-    -- was entered by hand or pulled from an external source.
-    comment_id TEXT,
-    source_video_id TEXT,
-    quote TEXT NOT NULL,
-    author TEXT,
-    score INTEGER,            -- 1-5, user-assigned vibe rating
-    status TEXT NOT NULL DEFAULT 'available',  -- 'available' | 'used'
-    used_in_video_id TEXT,
-    note TEXT,
-    added_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    FOREIGN KEY (source_video_id) REFERENCES videos(id) ON DELETE SET NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_hooks_library_status ON hooks_library(status);
-  CREATE INDEX IF NOT EXISTS idx_hooks_library_added ON hooks_library(added_at DESC);
-`);
-
-export type HooksLibraryEntry = {
-  id: number;
-  comment_id: string | null;
-  source_video_id: string | null;
-  quote: string;
-  author: string | null;
-  score: number | null;
-  status: "available" | "used";
-  used_in_video_id: string | null;
-  note: string | null;
-  added_at: number;
-};
-
-export function listHooksLibrary(): (HooksLibraryEntry & {
-  source_video_title: string | null;
-})[] {
-  return db
-    .prepare(
-      `SELECT h.*, v.title AS source_video_title
-       FROM hooks_library h
-       LEFT JOIN videos v ON v.id = h.source_video_id
-       ORDER BY h.added_at DESC`
-    )
-    .all() as (HooksLibraryEntry & { source_video_title: string | null })[];
-}
-
-export function addHookToLibrary(input: {
-  comment_id?: string | null;
-  source_video_id?: string | null;
-  quote: string;
-  author?: string | null;
-  score?: number | null;
-  note?: string | null;
-}): number {
-  const info = db
-    .prepare(
-      `INSERT INTO hooks_library
-         (comment_id, source_video_id, quote, author, score, note)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      input.comment_id ?? null,
-      input.source_video_id ?? null,
-      input.quote,
-      input.author ?? null,
-      input.score ?? null,
-      input.note ?? null
-    );
-  return Number(info.lastInsertRowid);
-}
-
-export function updateHookLibraryEntry(
-  id: number,
-  patch: Partial<HooksLibraryEntry>
-): void {
-  const keys = Object.keys(patch) as (keyof HooksLibraryEntry)[];
-  if (keys.length === 0) return;
-  const setClause = keys.map((k) => `${k} = ?`).join(", ");
-  const values = keys.map((k) => patch[k] as unknown);
-  db.prepare(`UPDATE hooks_library SET ${setClause} WHERE id = ?`).run(
-    ...values,
-    id
-  );
-}
-
-export function deleteHookLibraryEntry(id: number): void {
-  db.prepare(`DELETE FROM hooks_library WHERE id = ?`).run(id);
-}
-
-/** Look up by comment_id so the UI's "+ Save" button can dedupe. */
-export function hookLibraryEntryForComment(
-  commentId: string
-): HooksLibraryEntry | undefined {
-  return db
-    .prepare(`SELECT * FROM hooks_library WHERE comment_id = ?`)
-    .get(commentId) as HooksLibraryEntry | undefined;
-}

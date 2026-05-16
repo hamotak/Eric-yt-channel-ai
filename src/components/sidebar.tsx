@@ -1,5 +1,6 @@
 "use client";
 
+import { Fragment } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -14,9 +15,8 @@ import {
   ScrollText,
   Bell,
   Search,
-  Sparkles,
-  BarChart3,
-  BookmarkPlus,
+  Users,
+  BookOpen,
 } from "lucide-react";
 import { useI18n } from "@/lib/i18n/provider";
 import { cn } from "@/lib/utils";
@@ -51,20 +51,8 @@ export function Sidebar() {
 
   const items = [
     { href: "/", label: t.nav.dashboard, icon: LayoutDashboard, badge: 0 },
+    { href: "/my-channels", label: "My Channels", icon: Users, badge: 0 },
     { href: "/videos", label: t.nav.videos, icon: Video, badge: 0 },
-    { href: "/hooks", label: "Hook Lab", icon: Sparkles, badge: 0 },
-    {
-      href: "/formula-analyzer",
-      label: "Formula Analyzer",
-      icon: BarChart3,
-      badge: 0,
-    },
-    {
-      href: "/hooks-library",
-      label: "Hooks Library",
-      icon: BookmarkPlus,
-      badge: 0,
-    },
     { href: "/chat", label: t.nav.chat, icon: MessageSquare, badge: 0 },
     {
       href: "/competitors",
@@ -77,6 +65,13 @@ export function Sidebar() {
     { href: "/import", label: t.nav.import, icon: Upload, badge: 0 },
     { href: "/logs", label: t.nav.logs, icon: ScrollText, badge: 0 },
     { href: "/settings", label: t.nav.settings, icon: Settings, badge: 0 },
+    {
+      href: "/tutorial",
+      label: "Tutorial",
+      icon: BookOpen,
+      badge: 0,
+      separator: true,
+    },
   ];
 
   return (
@@ -100,25 +95,33 @@ export function Sidebar() {
                 : pathname === item.href || pathname.startsWith(item.href + "/");
             const Icon = item.icon;
             return (
-              <li key={item.href}>
-                <Link
-                  href={item.href}
-                  className={cn(
-                    "flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors",
-                    active
-                      ? "bg-primary/10 text-primary font-medium"
-                      : "text-sidebar-foreground/80 hover:bg-accent hover:text-accent-foreground"
-                  )}
-                >
-                  <Icon className="h-4 w-4" />
-                  <span className="flex-1">{item.label}</span>
-                  {item.badge > 0 && (
-                    <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
-                      {item.badge}
-                    </span>
-                  )}
-                </Link>
-              </li>
+              <Fragment key={item.href}>
+                {item.separator && (
+                  <li
+                    aria-hidden
+                    className="my-2 border-t border-sidebar-border/60"
+                  />
+                )}
+                <li>
+                  <Link
+                    href={item.href}
+                    className={cn(
+                      "flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors",
+                      active
+                        ? "bg-primary/10 text-primary font-medium"
+                        : "text-sidebar-foreground/80 hover:bg-accent hover:text-accent-foreground"
+                    )}
+                  >
+                    <Icon className="h-4 w-4" />
+                    <span className="flex-1">{item.label}</span>
+                    {item.badge > 0 && (
+                      <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
+                        {item.badge}
+                      </span>
+                    )}
+                  </Link>
+                </li>
+              </Fragment>
             );
           })}
         </ul>

@@ -11,9 +11,7 @@ import {
   ChevronUp,
   Search,
   Download,
-  BookmarkPlus,
   Sparkles,
-  Check,
   Lightbulb,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
@@ -177,32 +175,6 @@ export function VideoCommentsPanel({
       setAnalysisError(e instanceof Error ? e.message : "failed");
     } finally {
       setAnalysing(false);
-    }
-  };
-
-  // Hooks Library — when the user clicks "+ Save" we POST to the
-  // library API, then locally mark this commentId so the button
-  // becomes "Saved" without a full refetch.
-  const [savedHookIds, setSavedHookIds] = useState<Set<string>>(new Set());
-  const saveAsHook = async (
-    commentId: string,
-    quote: string,
-    author: string | null
-  ) => {
-    try {
-      await fetch("/api/hooks-library", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          comment_id: commentId,
-          source_video_id: videoId,
-          quote,
-          author,
-        }),
-      });
-      setSavedHookIds((prev) => new Set(prev).add(commentId));
-    } catch {
-      /* swallow — UI just won't flip */
     }
   };
 
@@ -405,11 +377,11 @@ export function VideoCommentsPanel({
                   </div>
                 )}
 
-                {/* Hook candidates */}
+                {/* Standout quote candidates */}
                 {analysis.hook_candidates.length > 0 && (
                   <div className="md:col-span-2">
                     <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                      Best hook candidates
+                      Standout quote candidates
                     </div>
                     <ul className="space-y-1.5 text-xs">
                       {analysis.hook_candidates.map((h, i) => (
@@ -417,31 +389,7 @@ export function VideoCommentsPanel({
                           key={i}
                           className="rounded border border-border/60 p-2"
                         >
-                          <div className="flex items-start justify-between gap-2">
-                            <span className="font-medium">@{h.author}</span>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              onClick={() =>
-                                fetch("/api/hooks-library", {
-                                  method: "POST",
-                                  headers: {
-                                    "Content-Type": "application/json",
-                                  },
-                                  body: JSON.stringify({
-                                    source_video_id: videoId,
-                                    quote: h.quote,
-                                    author: h.author,
-                                    note: h.why,
-                                  }),
-                                })
-                              }
-                              className="h-5 gap-1 text-[10px]"
-                            >
-                              <BookmarkPlus className="h-2.5 w-2.5" />
-                              Save
-                            </Button>
-                          </div>
+                          <div className="font-medium">@{h.author}</div>
                           <div className="mt-0.5 text-foreground">
                             &ldquo;{h.quote}&rdquo;
                           </div>
@@ -498,13 +446,7 @@ export function VideoCommentsPanel({
         ) : (
           <ul className="divide-y divide-border">
             {filtered.map((c) => (
-              <CommentItem
-                key={c.id}
-                videoId={videoId}
-                comment={c}
-                isSaved={savedHookIds.has(c.id)}
-                onSaveAsHook={() => saveAsHook(c.id, c.text, c.author)}
-              />
+              <CommentItem key={c.id} videoId={videoId} comment={c} />
             ))}
           </ul>
         )}
@@ -540,13 +482,9 @@ export function VideoCommentsPanel({
 function CommentItem({
   videoId,
   comment,
-  isSaved,
-  onSaveAsHook,
 }: {
   videoId: string;
   comment: Comment;
-  isSaved: boolean;
-  onSaveAsHook: () => void;
 }) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
@@ -667,34 +605,6 @@ function CommentItem({
                   : t.comments.viewReplies.replace("{n}", String(comment.reply_count))}
               </button>
             )}
-            <button
-              type="button"
-              onClick={onSaveAsHook}
-              disabled={isSaved}
-              className={cn(
-                "ml-auto inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors",
-                isSaved
-                  ? "text-emerald-600 dark:text-emerald-400"
-                  : "text-muted-foreground hover:bg-primary/10 hover:text-primary"
-              )}
-              title={
-                isSaved
-                  ? "Already in Hooks Library"
-                  : "Save this comment to Hooks Library"
-              }
-            >
-              {isSaved ? (
-                <>
-                  <Check className="h-3 w-3" />
-                  Saved
-                </>
-              ) : (
-                <>
-                  <BookmarkPlus className="h-3 w-3" />
-                  Save as hook
-                </>
-              )}
-            </button>
           </div>
 
           {expanded && (

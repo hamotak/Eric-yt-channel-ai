@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { listCompetitors } from "@/lib/db";
+import { getActiveChannelId, listCompetitors } from "@/lib/db";
 import { syncCompetitor } from "@/lib/competitor-sync";
 import { log } from "@/lib/logger";
 
@@ -9,13 +9,33 @@ export const runtime = "nodejs";
 export const maxDuration = 300;
 
 /**
- * POST /api/competitors/sync-all — kick off a fresh sync for every
- * tracked competitor in sequence. We deliberately serialise rather
- * than parallelise because Apify rate-limits per actor and parallel
- * runs would just queue anyway, with worse error attribution.
+ * POST /api/competitors/sync-all
+ * Body: { userChannelId?: string, allChannels?: boolean }
+ *
+ * Default behaviour: sync every competitor under the active user channel
+ * (or the user channel named in `userChannelId`). The legacy global
+ * "sync every competitor regardless of channel" path is preserved behind
+ * an explicit `allChannels: true` opt-in for cases like a one-off refresh
+ * after import.
+ *
+ * Serialised rather than parallelised because Apify rate-limits per actor.
  */
-export async function POST() {
-  const competitors = listCompetitors();
+export async function POST(req: Request) {
+  const body = (await req
+    .json()
+    .catch(() => ({}))) as {
+    userChannelId?: unknown;
+    allChannels?: unknown;
+  };
+
+  const competitors = body.allChannels === true
+    ? listCompetitors() // legacy global behaviour
+    : listCompetitors(
+        typeof body.userChannelId === "string" && body.userChannelId.length > 0
+          ? body.userChannelId
+          : (getActiveChannelId() ?? undefined)
+      );
+
   const results: Array<{
     id: number;
     ok: boolean;

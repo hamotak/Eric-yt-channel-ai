@@ -127,7 +127,7 @@ const TOOL_DEFS: {
     key: "strategy",
     label: "Strategy (this app's analyses)",
     description:
-      "Read-only access to Hook Lab, Formula Analyzer, AI Comment Analysis, Hooks Library and Competitor tracking. The AI can see every dashboard you see — use for 'what should I make next', 'what works on my channel', 'what are competitors doing I'm not'.",
+      "Read-only access to your tracked competitors, outlier alerts, and AI Comment Analysis on your own videos. Use for 'what should I make next', 'what are competitors doing I'm not', 'what does my audience actually want'.",
     requires: null,
     icon: Sparkles,
   },
