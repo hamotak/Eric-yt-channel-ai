@@ -47,7 +47,7 @@ export function Sidebar() {
 
   const items = [
     { href: "/", label: t.nav.dashboard, icon: LayoutDashboard, badge: 0 },
-    { href: "/my-channels", label: "My Channels", icon: Users, badge: 0 },
+    { href: "/channel-info", label: "Channel Info", icon: Users, badge: 0 },
     { href: "/videos", label: t.nav.videos, icon: Video, badge: 0 },
     { href: "/chat", label: t.nav.chat, icon: MessageSquare, badge: 0 },
     {

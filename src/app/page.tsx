@@ -150,7 +150,7 @@ export default function DashboardPage() {
             Refresh
           </Button>
           {channel && viewMode === "channel" && (
-            <Link href="/channel">
+            <Link href="/channel-info">
               <Button variant="outline" size="sm" className="gap-2">
                 <ArrowUpRight className="h-3.5 w-3.5" />
                 {t.dashboard.channelDetails}

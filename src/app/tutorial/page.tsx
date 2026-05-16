@@ -71,10 +71,12 @@ export default function TutorialPage() {
           </li>
           <li>
             Open{" "}
-            <Link href="/my-channels" className="text-primary hover:underline">
-              My Channels
+            <Link href="/channel-info" className="text-primary hover:underline">
+              Channel Info
             </Link>{" "}
-            → fill in niche, positioning, audience, voice for each channel.
+            → fill in niche, positioning, audience, voice — or click
+            &ldquo;Analyze with AI&rdquo; to auto-populate from recent
+            videos.
           </li>
           <li>
             Open{" "}
@@ -102,10 +104,17 @@ export default function TutorialPage() {
             top performers. Use the channel picker top-right to switch focus.
           </PageDescription>
 
-          <PageDescription name="My Channels" href="/my-channels" status="active">
-            Where you describe each of your channels to the AI: niche,
-            positioning, audience, voice, off-YouTube research sources. Every
-            AI feature in the app reads from this — fill it in carefully.
+          <PageDescription name="Channel Info" href="/channel-info" status="active">
+            Where you describe each channel to the AI — niche, positioning,
+            audience, voice, off-YouTube research sources — and where the
+            per-channel detail view lives (themes, transcripts coverage,
+            audience, revenue). One channel selected → full detail card.
+            &ldquo;All channels&rdquo; selected → summary table with a
+            &ldquo;Context filled&rdquo; / &ldquo;Needs context&rdquo;
+            status per channel. The &ldquo;Analyze with AI&rdquo; button
+            asks Claude to propose all 5 context fields from your recent
+            videos and transcripts. Every AI feature in the app reads
+            from this — fill it in carefully.
           </PageDescription>
 
           <PageDescription name="Videos" href="/videos" status="active">

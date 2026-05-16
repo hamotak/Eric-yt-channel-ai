@@ -19,6 +19,8 @@ const nextConfig: NextConfig = {
       { source: "/import",       destination: "/settings/import",       permanent: false },
       { source: "/logs",         destination: "/settings/logs",         permanent: false },
       { source: "/alerts",       destination: "/settings/alerts",       permanent: false },
+      { source: "/my-channels",  destination: "/channel-info",          permanent: false },
+      { source: "/channel",      destination: "/channel-info",          permanent: false },
     ];
   },
 };
