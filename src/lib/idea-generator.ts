@@ -17,8 +17,22 @@ import {
 } from "./mentor-method";
 import { listOutliersForActiveChannel } from "./outliers";
 import { log } from "./logger";
+import {
+  validateIdeaAgainstOwnCatalog,
+  type ValidateResult,
+} from "./validate-idea";
 
 const RATE_LIMIT_WINDOW_SEC = 5 * 60;
+
+// Ideation-only tightening (NOT a methodology change — MENTOR_METHOD §2
+// stays at 2× as the outlier definition). 5× isolates the genuinely big
+// hits worth borrowing; 60d keeps the signal current; 3 minimum candidates
+// ensures we never feed Claude a single-source sample that would produce
+// brittle ideas. If the filter under-fills, we 409 with an explicit ask
+// rather than silently lowering.
+const IDEATION_MIN_MULTIPLIER = 5;
+const IDEATION_WINDOW_DAYS = 60;
+const IDEATION_MIN_CANDIDATES = 3;
 
 export type Idea = {
   topic: string;
@@ -26,6 +40,7 @@ export type Idea = {
   angle: string;
   confidence: number;
   sourceOutlierVideoId: string;
+  validation: ValidateResult;
 };
 
 export type GenerateIdeasResult =
@@ -58,6 +73,12 @@ export type GenerateIdeasResult =
 export async function generateIdeasForChannel(opts: {
   userChannelId: string;
   outlierVideoIds?: string[];
+  // Explicit override knobs — agent leaves them undefined for the
+  // tightened defaults (≥5× / 60d / ≥3 candidates). Setting either
+  // requires an explicit user request per the operating rules; the
+  // chat tool description tells the LLM not to lower these silently.
+  windowDays?: number;
+  minMultiplier?: number;
 }): Promise<GenerateIdeasResult> {
   const userChannelId = opts.userChannelId?.trim();
   if (!userChannelId) {
@@ -96,17 +117,30 @@ export async function generateIdeasForChannel(opts: {
     };
   }
 
-  // Pick the outlier sample. Caller-supplied IDs win; otherwise auto-pick
-  // the channel's current top 10 outliers by multiplier.
+  // Pick the outlier sample. Caller-supplied IDs win (treated as the
+  // user's explicit choice — bypasses the ≥5× filter since the agent
+  // is asking for ideation off a curated set). Otherwise auto-pick at
+  // the tightened ideation thresholds.
+  const windowDays = opts.windowDays ?? IDEATION_WINDOW_DAYS;
+  const minMultiplier = opts.minMultiplier ?? IDEATION_MIN_MULTIPLIER;
   let outlierIds = opts.outlierVideoIds?.filter(
     (v): v is string => typeof v === "string" && v.length > 0
   );
   if (!outlierIds || outlierIds.length === 0) {
     const auto = listOutliersForActiveChannel({
       userChannelId,
+      windowDays: windowDays as 7 | 30 | 60 | 90,
+      minMultiplier,
       limit: 10,
     });
     outlierIds = auto.outliers.map((o) => o.videoId);
+    if (outlierIds.length < IDEATION_MIN_CANDIDATES) {
+      return {
+        ok: false,
+        status: 409,
+        error: `No strong outliers (≥${minMultiplier}×) in the last ${windowDays} days — only ${outlierIds.length} candidate${outlierIds.length === 1 ? "" : "s"} pass${outlierIds.length === 1 ? "es" : ""}, need at least ${IDEATION_MIN_CANDIDATES}. Ask the user whether to widen the window or lower the multiplier before retrying; do NOT silently lower these thresholds.`,
+      };
+    }
   } else {
     outlierIds = outlierIds.slice(0, 20);
   }
@@ -206,7 +240,7 @@ export async function generateIdeasForChannel(opts: {
   ].join("\n");
 
   const model = providerModelId("claude");
-  let ideas: Idea[] = [];
+  let parsedIdeas: ParsedIdea[] = [];
   try {
     const client = new Anthropic({ apiKey });
     const resp = await client.messages.create({
@@ -233,21 +267,39 @@ export async function generateIdeasForChannel(opts: {
         error: "AI returned malformed JSON. Try again.",
       };
     }
-    ideas = parsed;
+    parsedIdeas = parsed;
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Claude call failed";
     log.error("claude", `Outlier-ideas ${userChannelId}: ${msg}`, err);
     return { ok: false, status: 502, error: msg };
   }
 
+  // Validation pass — annotate each idea with an own-catalog check so the
+  // chat agent never finalises a recommendation without ground-truth on
+  // whether the user already covered the topic. Keeps the LLM honest:
+  // a hallucinated "you didn't cover this" can't survive a SQL lookup.
+  const ideas: Idea[] = parsedIdeas.map((i) => ({
+    ...i,
+    validation: validateIdeaAgainstOwnCatalog({
+      topic: i.topic,
+      userChannelId,
+    }),
+  }));
+
   setSetting(rateKey, String(now));
   log.info(
     "claude",
-    `Outlier-ideas ${userChannelId}: ${ideas.length} ideas (${outlierRows.length} outlier sample)`
+    `Outlier-ideas ${userChannelId}: ${ideas.length} ideas (${outlierRows.length} outlier sample, validated)`
   );
 
   return { ok: true, ideas, generatedAt: now, model };
 }
+
+/**
+ * Parsed-but-not-yet-validated idea shape. parseIdeas returns these; the
+ * outer function maps them to full Idea objects with validation results.
+ */
+type ParsedIdea = Omit<Idea, "validation">;
 
 function fmtAge(ts: number): string {
   const diff = Math.floor(Date.now() / 1000 - ts);
@@ -257,7 +309,7 @@ function fmtAge(ts: number): string {
   return `${Math.floor(diff / (86400 * 365))}y ago`;
 }
 
-function parseIdeas(raw: string, knownIds: Set<string>): Idea[] | null {
+function parseIdeas(raw: string, knownIds: Set<string>): ParsedIdea[] | null {
   let text = raw.trim();
   if (text.startsWith("```")) {
     text = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
@@ -274,7 +326,7 @@ function parseIdeas(raw: string, knownIds: Set<string>): Idea[] | null {
   if (!parsed || typeof parsed !== "object") return null;
   const rawIdeas = (parsed as { ideas?: unknown }).ideas;
   if (!Array.isArray(rawIdeas)) return null;
-  const ideas: Idea[] = [];
+  const ideas: ParsedIdea[] = [];
   for (const raw of rawIdeas) {
     if (!raw || typeof raw !== "object") continue;
     const r = raw as Record<string, unknown>;

@@ -467,21 +467,66 @@ const STRATEGY_TOOLS: Tool[] = [
   {
     name: "generate_ideas",
     description:
-      "Synthesise 5-10 new video ideas for the user's active channel, grounded in their channel context AND in real competitor outliers. If `outlierVideoIds` is omitted, the top 10 outliers by multiplier in the active scope are auto-picked. Each idea references a specific source outlier and uses one lever from §9. Rate-limited to 1 call per channel per 5 min. Returns: { ideas: [{ topic, suggestedTitle, angle, confidence, sourceOutlierVideoId }] }.",
+      "Synthesise 5-10 new video ideas for the user's active channel, grounded in their channel context AND in real competitor outliers. The ideation path is tightened: auto-pick uses ≥5× outliers in the last 60 days and requires at least 3 strong candidates. If fewer pass, returns status 409 with a 'no strong outliers' message — surface that in plain English and ASK the user whether to widen (windowDays) or lower the bar (minMultiplier) before retrying; do NOT silently lower these thresholds. Each returned idea includes a `validation` field with `verdict` ('fresh' | 'covered_recently' | 'covered_old' | 'covered_underperformed'), `verdictCopy` (echo this verbatim or paraphrase tightly), and `primaryMatches` from the user's own catalog with performanceBand annotations. Never finalise an idea without surfacing its validation. Rate-limited to 1 call per channel per 5 min. Returns: { ideas: [{ topic, suggestedTitle, angle, confidence, sourceOutlierVideoId, validation }] }.",
     input_schema: {
       type: "object",
       properties: {
-        outlierVideoIds: { type: "array", items: { type: "string" } },
+        outlierVideoIds: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional curated set of outlier video ids to ideate FROM. When provided, bypasses the ≥5× auto-filter — treats the user's choice as authoritative.",
+        },
+        windowDays: {
+          type: "number",
+          description:
+            "Override the 60-day ideation window. Only set when the user has explicitly asked to widen.",
+        },
+        minMultiplier: {
+          type: "number",
+          description:
+            "Override the ≥5× ideation threshold. Only set when the user has explicitly asked to lower (e.g. small/new channels where 5× candidates don't exist).",
+        },
       },
     },
   },
   {
     name: "list_format_patterns",
     description:
-      "List the active channel's extracted title-format patterns (per MENTOR_METHOD §4). Each pattern is a structural template like \"[Place]'s most [Adjective] [Thing]\" plus its avg multiplier, total monthly views, and rising rate. Sorted by rising rate DESC. Pre-requisite: the user has run 'Extract format patterns' on the /outliers Patterns tab — without that this returns an empty array. Returns: { formats: [{ template, avgMultiplier, totalViewsMonth, risingRate, exampleVideoIds: string[] }] }.",
+      "List the active channel's extracted title-format patterns (per MENTOR_METHOD §4). Each pattern is a structural template like \"[Place]'s most [Adjective] [Thing]\" plus its avg multiplier, total monthly views, and rising rate. Sorted by rising rate DESC. Defaults to patterns with ≥3 example videos (the 'proven' threshold) — formats with fewer examples are filtered out. Pass minExamples=1 to surface emerging patterns; when you do, label them 'emerging, not proven' in your reply. Pre-requisite: the user has run 'Extract format patterns' on the /outliers Patterns tab — without that this returns an empty array. Returns: { formats: [{ template, avgMultiplier, totalViewsMonth, risingRate, exampleVideoIds: string[] }] }.",
     input_schema: {
       type: "object",
-      properties: { limit: { type: "number", default: 20 } },
+      properties: {
+        limit: { type: "number", default: 20 },
+        minExamples: {
+          type: "number",
+          description:
+            "Minimum example-video count per pattern. Default 3 ('proven'). Pass 1 to include emerging patterns.",
+          default: 3,
+        },
+      },
+    },
+  },
+  {
+    name: "validate_idea",
+    description:
+      "Search the active channel's own catalog for similar or adjacent topics before recommending an idea. Primary window = last 60 days (videos that would directly compete with a new upload), secondary = 60-90 days (covered-old territory). Returns a verdict ('fresh' | 'covered_recently' | 'covered_old' | 'covered_underperformed'), a plain-English `verdictCopy` line you should echo or paraphrase tightly, and matching videos with their performanceBand ('hit hard' / 'above average' / 'average' / 'underperformed'). Call this BEFORE recommending any topic the user hasn't already explicitly tied to a competitor outlier — operating rule 7-equivalent: validate first, recommend second. The active channel is resolved server-side. Returns: { topic, verdict, verdictCopy, primaryMatches: [{ videoId, title, publishedAt, views, multiplier, performanceBand, matchedKeywords }], adjacentMatches: [...] }.",
+    input_schema: {
+      type: "object",
+      properties: {
+        topic: {
+          type: "string",
+          description:
+            "The proposed topic to validate — short phrase, e.g. 'James Webb biosignatures' or 'Voyager 2 anomalies'.",
+        },
+        windowDays: {
+          type: "number",
+          description:
+            "Primary window in days. Default 60. Secondary window (covered_old) extends to 90.",
+          default: 60,
+        },
+      },
+      required: ["topic"],
     },
   },
   {
@@ -1021,10 +1066,21 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
         const outlierVideoIds = Array.isArray(input.outlierVideoIds)
           ? input.outlierVideoIds.filter((v): v is string => typeof v === "string")
           : undefined;
+        const windowDays =
+          typeof input.windowDays === "number" && Number.isFinite(input.windowDays)
+            ? input.windowDays
+            : undefined;
+        const minMultiplier =
+          typeof input.minMultiplier === "number" &&
+          Number.isFinite(input.minMultiplier)
+            ? input.minMultiplier
+            : undefined;
         const { generateIdeasForChannel } = await import("./idea-generator");
         const r = await generateIdeasForChannel({
           userChannelId: activeId,
           outlierVideoIds,
+          windowDays,
+          minMultiplier,
         });
         if (!r.ok) {
           return {
@@ -1049,8 +1105,20 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
           };
         }
         const limit = Math.min(50, Math.max(1, Number(input.limit) || 20));
+        // Default to ≥3 examples ("proven"). Agent can pass 1 to surface
+        // emerging patterns, but the tool description tells it to label
+        // those as 'emerging, not proven' in the user-facing reply.
+        const minExamples = Math.max(
+          1,
+          typeof input.minExamples === "number" &&
+            Number.isFinite(input.minExamples)
+            ? Math.floor(input.minExamples)
+            : 3
+        );
         const { getFormatsForChannel } = await import("./outlier-formats");
-        const formats = getFormatsForChannel(activeId, limit);
+        const formats = getFormatsForChannel(activeId, limit).filter(
+          (f) => f.examples.length >= minExamples
+        );
         return {
           ok: true,
           data: {
@@ -1061,8 +1129,42 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
               risingRate: f.risingRate,
               exampleVideoIds: f.examples.map((e) => e.videoId),
             })),
+            minExamplesApplied: minExamples,
           },
         };
+      }
+      case "validate_idea": {
+        const activeId = getActiveChannelId();
+        if (!activeId) {
+          return {
+            ok: false,
+            error:
+              "No active channel — set one from the top-right channel picker before validating.",
+          };
+        }
+        const topic =
+          typeof input.topic === "string" ? input.topic.trim() : "";
+        if (!topic) {
+          return { ok: false, error: "topic required" };
+        }
+        const windowDays =
+          typeof input.windowDays === "number" &&
+          Number.isFinite(input.windowDays)
+            ? Math.max(1, Math.floor(input.windowDays))
+            : 60;
+        const { validateIdeaAgainstOwnCatalog } = await import(
+          "./validate-idea"
+        );
+        const result = validateIdeaAgainstOwnCatalog({
+          topic,
+          userChannelId: activeId,
+          primaryWindowDays: windowDays,
+          // Secondary window grows proportionally — 1.5× the primary —
+          // so "covered_old" still catches stuff just outside the
+          // primary window when the agent widens.
+          secondaryWindowDays: Math.max(windowDays + 30, 90),
+        });
+        return { ok: true, data: result };
       }
       case "update_channel_context": {
         const activeId = getActiveChannelId();
@@ -1361,10 +1463,11 @@ export function buildSystemPrompt(
         `- competitor_gap_analysis — keywords frequent in competitor top videos that you've NEVER used`,
         ``,
         `### Outliers + ideation (the §2 + §9 engine)`,
-        `- list_outliers — competitor videos beating their own median. Default mode (60d window, ≥2×, sorted by multiplier) for "what's working broadly". Pass recent_only=true for the discovery log (≥1.5× floor, sorted by detection time DESC) when the user asks "what's new" or "any viral hits since I last looked"; combine with unreadOnly=true to filter to unacknowledged.`,
+        `- list_outliers — competitor videos beating their own median. Default mode (60d window, ≥2×, sorted by multiplier) for "what's working broadly". Pass recent_only=true for the discovery log (≥1.5× floor, sorted by detection time DESC) when the user asks "what's new" or "any viral hits since I last looked"; combine with unreadOnly=true to filter to unacknowledged. The ideation path (generate_ideas) tightens this to ≥5× internally — list_outliers itself stays general-purpose.`,
         `- explain_outlier — 2-3 §9 levers + reasoning for a specific outlier (cached permanently)`,
-        `- generate_ideas — 5–10 ideas grounded in §1/§7/§9, traceable to source outliers (rate-limited 1/5min per channel)`,
-        `- list_format_patterns — title-format templates extracted from outliers (§4 structural patterns)`,
+        `- generate_ideas — 5–10 ideas grounded in §1/§7/§9, traceable to source outliers. Tightened: ≥5× outliers in the last 60d, requires ≥3 candidates or 409s with a 'no strong outliers' message. Each idea ships with a validation field — never finalise an idea without echoing validation.verdictCopy. Rate-limited 1/5min per channel.`,
+        `- list_format_patterns — title-format templates extracted from outliers (§4). Defaults to formats with ≥3 example videos ('proven'). Pass minExamples=1 to surface emerging patterns and label them 'emerging, not proven'.`,
+        `- validate_idea — search the user's own catalog for similar/adjacent topics before recommending one. Returns verdict + verdictCopy + per-video performance bands. Use BEFORE recommending any topic that didn't come straight out of generate_ideas (which auto-validates).`,
         `- update_channel_context — propose/apply edits to the active channel's niche/positioning/audience/voice/external_sources. MUST follow the two-step confirm: first call returns a diff, second call (after user says yes) writes.`,
         ``,
         `### Audience (your own videos)`,
@@ -1382,7 +1485,19 @@ export function buildSystemPrompt(
     `4. For ideation questions: list_outliers → optionally list_format_patterns → generate_ideas. Don't skip to generate_ideas without the source.`,
     `5. For "why did X work" questions: list_outliers (or accept the videoId from context) → explain_outlier.`,
     `6. Avoid retrying the same tool+input combination — the dispatcher rejects duplicates.`,
-    `7. To update channel context (niche/positioning/audience/voice/external_sources), always propose a diff first via update_channel_context with confirm:false. Show the diff to the user, get an explicit yes, THEN call again with confirm:true and the same payload. Never blanket-clear fields without per-field confirmation — when the user says something like "delete my channel context", ask which field(s) and confirm one at a time.`
+    `7. To update channel context (niche/positioning/audience/voice/external_sources), always propose a diff first via update_channel_context with confirm:false. Show the diff to the user, get an explicit yes, THEN call again with confirm:true and the same payload. Never blanket-clear fields without per-field confirmation — when the user says something like "delete my channel context", ask which field(s) and confirm one at a time.`,
+    `8. When you report ANY video's performance — competitor outlier OR own-channel video — translate raw multipliers to human bands BEFORE writing the line:`,
+    `     ≥ 5×        → "hit hard" (or "blew up" for the very biggest)`,
+    `     2× to < 5×  → "above average"`,
+    `     0.8× to < 2× → "average for this channel"`,
+    `     < 0.8×      → "underperformed" (or "flopped")`,
+    `   The raw multiplier may appear in parentheses for transparency, never naked.`,
+    `     Bad:  "your 'JWST biosignatures' video was 33× median"`,
+    `     Good: "your 'JWST biosignatures' video hit hard (33×)"`,
+    `     Bad:  "competitor X did 0.4× their median"`,
+    `     Good: "competitor X's video underperformed (0.4×)"`,
+    `   Validation responses already include a performanceBand field — use it verbatim rather than re-classifying.`,
+    `9. Per MENTOR_METHOD §3, a topic is evergreen only if it's been validated across multiple channels and time periods. The validate_idea tool checks YOUR catalog (different question). §3 validation is the cross-channel step — use list_outliers + competitor data for that, never a single competitor outlier. When generate_ideas returns ideas, the validation field covers only your own-catalog check; the cross-channel §3 check is on you.`
   );
 
   // Tell the executor about the advisor ONLY when it's actually wired up for
