@@ -206,6 +206,11 @@ export async function POST(req: Request) {
     async start(controller) {
       const send = (e: object) => controller.enqueue(encodeSSE(e));
       let finalAssistantText = "";
+      // Anthropic extended-thinking text accumulated across every iteration
+      // + the forced synthesis round. Persisted on the assistant row + sent
+      // via SSE before "done" so the chat UI's "Show thinking" pill picks
+      // it up without a page refresh.
+      let thinkingAcc = "";
       const startedAt = Date.now();
       const toolCallCounts: Record<string, { ok: number; fail: number }> = {};
       let iterationsUsed = 0;
@@ -259,6 +264,20 @@ export async function POST(req: Request) {
           });
 
           stopReason = turn.stopReason;
+
+          // Scoop thinking blocks out of the unified content array. Anthropic
+          // ships them inline as { type: "thinking", thinking: string }; the
+          // ai-provider adapter passes the raw Anthropic content through on
+          // `turn.content`, so a duck-typed check covers it without us
+          // having to widen the UnifiedContentBlock union.
+          for (const block of turn.content as Array<{
+            type: string;
+            thinking?: string;
+          }>) {
+            if (block.type === "thinking" && typeof block.thinking === "string" && block.thinking) {
+              thinkingAcc += (thinkingAcc ? "\n\n---\n\n" : "") + block.thinking;
+            }
+          }
 
           log.debug("chat", "Turn usage", {
             provider,
@@ -413,12 +432,32 @@ export async function POST(req: Request) {
           sumCacheWrite += synthTurn.usage.cacheWriteTokens;
           sumCacheRead += synthTurn.usage.cacheReadTokens;
           finalAssistantText = synthText;
+          // Same thinking-scoop pattern as the iter loop.
+          for (const block of synthTurn.content as Array<{
+            type: string;
+            thinking?: string;
+          }>) {
+            if (block.type === "thinking" && typeof block.thinking === "string" && block.thinking) {
+              thinkingAcc += (thinkingAcc ? "\n\n---\n\n" : "") + block.thinking;
+            }
+          }
         }
 
         if (finalAssistantText.trim().length > 0) {
-          addMessage(session.id, "assistant", finalAssistantText);
+          addMessage(
+            session.id,
+            "assistant",
+            finalAssistantText,
+            undefined,
+            thinkingAcc || null
+          );
         }
 
+        // Push the thinking text to the client BEFORE done so the pill
+        // appears the moment the answer is finalized. Skipped when empty.
+        if (thinkingAcc) {
+          send({ type: "thinking", text: thinkingAcc });
+        }
         send({ type: "done" });
 
         log.info("chat", "Chat turn completed", {

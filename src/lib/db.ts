@@ -175,10 +175,15 @@ function initSchema() {
   `);
 
   // Lightweight migration for existing DBs — add the attachments column on first boot.
+  // Also adds `thinking` so assistant rows can carry Anthropic extended-thinking
+  // text for the "Show thinking" pill in /chat. Both are idempotent.
   try {
     const cols = db.prepare(`PRAGMA table_info(chat_messages)`).all() as { name: string }[];
     if (!cols.some((c) => c.name === "attachments")) {
       db.exec(`ALTER TABLE chat_messages ADD COLUMN attachments TEXT`);
+    }
+    if (!cols.some((c) => c.name === "thinking")) {
+      db.exec(`ALTER TABLE chat_messages ADD COLUMN thinking TEXT`);
     }
   } catch {
     /* noop */
@@ -383,6 +388,14 @@ export type ChatMessage = {
   content: string;
   created_at: number;
   attachments?: StoredAttachment[];
+  /**
+   * Anthropic extended-thinking text accumulated across the assistant
+   * turn (every iteration's thinking blocks concatenated, separated by
+   * `\n\n---\n\n`). Persisted so the /chat UI's "Show thinking" pill
+   * survives page reloads. Empty/undefined when thinking was disabled
+   * or the model emitted no thinking blocks.
+   */
+  thinking?: string;
 };
 
 export type StoredAttachment =
@@ -520,15 +533,19 @@ export function getSession(id: string): ChatSession | undefined {
 export function getMessages(sessionId: string): ChatMessage[] {
   const rows = db
     .prepare(
-      `SELECT id, session_id, role, content, created_at, attachments
+      `SELECT id, session_id, role, content, created_at, attachments, thinking
        FROM chat_messages
        WHERE session_id = ?
        ORDER BY id ASC`
     )
-    .all(sessionId) as (ChatMessage & { attachments: string | null })[];
+    .all(sessionId) as (ChatMessage & {
+    attachments: string | null;
+    thinking: string | null;
+  })[];
   return rows.map((r) => ({
     ...r,
     attachments: r.attachments ? safeJsonArray(r.attachments) : undefined,
+    thinking: r.thinking ?? undefined,
   }));
 }
 
@@ -545,23 +562,34 @@ export function addMessage(
   sessionId: string,
   role: "user" | "assistant",
   content: string,
-  attachments?: StoredAttachment[]
+  attachments?: StoredAttachment[],
+  thinking?: string | null
 ): ChatMessage {
   const info = db
     .prepare(
-      `INSERT INTO chat_messages (session_id, role, content, attachments, created_at)
-       VALUES (?, ?, ?, ?, strftime('%s','now'))`
+      `INSERT INTO chat_messages (session_id, role, content, attachments, thinking, created_at)
+       VALUES (?, ?, ?, ?, ?, strftime('%s','now'))`
     )
-    .run(sessionId, role, content, attachments?.length ? JSON.stringify(attachments) : null);
+    .run(
+      sessionId,
+      role,
+      content,
+      attachments?.length ? JSON.stringify(attachments) : null,
+      thinking && thinking.length > 0 ? thinking : null
+    );
   const row = db
     .prepare(
-      `SELECT id, session_id, role, content, created_at, attachments
+      `SELECT id, session_id, role, content, created_at, attachments, thinking
        FROM chat_messages WHERE id = ?`
     )
-    .get(info.lastInsertRowid) as ChatMessage & { attachments: string | null };
+    .get(info.lastInsertRowid) as ChatMessage & {
+    attachments: string | null;
+    thinking: string | null;
+  };
   return {
     ...row,
     attachments: row.attachments ? safeJsonArray(row.attachments) : undefined,
+    thinking: row.thinking ?? undefined,
   };
 }
 

@@ -23,6 +23,9 @@ import {
   Activity,
   ImagePlus,
   AlertCircle,
+  ChevronRight,
+  ChevronDown,
+  Brain,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -63,6 +66,11 @@ type Message = {
   pending?: boolean;
   toolCalls?: ToolCall[];
   attachments?: AttachmentRef[];
+  // Anthropic extended-thinking text accumulated across the assistant
+  // turn. Populated either from the SSE `thinking` event at end-of-
+  // stream OR from the persisted column when the session is re-hydrated
+  // on page load. Drives the "Show thinking" pill in MessageBubble.
+  thinking?: string;
 };
 
 type ToolGroup = "youtube" | "analytics" | "research" | "exa" | "apify" | "yt_analytics" | "strategy";
@@ -532,6 +540,7 @@ function ChatPageInner() {
               | { type: "tool_use"; name: string; input: unknown }
               | { type: "tool_result"; name: string; ok: boolean; preview: string }
               | { type: "reset_text" }
+              | { type: "thinking"; text: string }
               | { type: "done" }
               | { type: "error"; message: string };
 
@@ -540,6 +549,18 @@ function ChatPageInner() {
                 prev.map((m) =>
                   m.id === assistantMsg.id
                     ? { ...m, content: m.content + event.text }
+                    : m
+                )
+              );
+            } else if (event.type === "thinking") {
+              // End-of-turn signal carrying the accumulated thinking text.
+              // The server sends this right before "done" so the pill
+              // appears as soon as the final answer is on screen.
+              const thinkingText = String(event.text ?? "");
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantMsg.id
+                    ? { ...m, thinking: thinkingText }
                     : m
                 )
               );
@@ -1180,6 +1201,9 @@ function MessageBubble({ message }: { message: Message }) {
           </div>
         ) : (
           <>
+            {message.thinking && message.thinking.length > 0 && (
+              <ThinkingPill text={message.thinking} />
+            )}
             {message.toolCalls && message.toolCalls.length > 0 && (
               <div className="mb-2 space-y-1">
                 {message.toolCalls.map((c, i) => (
@@ -1224,6 +1248,48 @@ function MarkdownBody({ content, pending }: { content: string; pending: boolean 
   return (
     <div className="prose prose-sm max-w-none dark:prose-invert [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_pre]:bg-background [&_pre]:text-foreground [&_code]:text-xs">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    </div>
+  );
+}
+
+/**
+ * Collapsed pill above an assistant message that surfaces the model's
+ * extended-thinking trace. Click to expand inline; click again to hide.
+ *
+ * Token count is an estimate (≈ chars/4) because Anthropic's usage
+ * stats lump thinking into output_tokens without a separate breakout.
+ * The tilde in the label signals approximation.
+ */
+function ThinkingPill({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const tokens = Math.ceil(text.length / 4);
+  return (
+    <div className="mb-2" data-testid="thinking-pill">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="inline-flex items-center gap-1.5 rounded-full border border-border bg-background/60 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
+        aria-expanded={open}
+      >
+        {open ? (
+          <ChevronDown className="h-3 w-3" />
+        ) : (
+          <ChevronRight className="h-3 w-3" />
+        )}
+        <Brain className="h-3 w-3" />
+        {open ? "Hide thinking" : "Show thinking"}
+        <span className="text-muted-foreground/60">
+          · ~{tokens.toLocaleString()} tokens
+        </span>
+      </button>
+      {open && (
+        <div
+          className="mt-2 max-h-[420px] overflow-y-auto rounded-md border border-border/40 bg-background/40 p-3 text-[11px] italic leading-relaxed text-muted-foreground/90 whitespace-pre-wrap"
+          data-testid="thinking-pill-content"
+        >
+          {text}
+        </div>
+      )}
     </div>
   );
 }
