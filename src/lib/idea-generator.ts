@@ -6,6 +6,7 @@ import {
   getExampleVideosForFormat,
   getIntegration,
   listAllChannels,
+  listChannelMemory,
 } from "./db";
 import { providerModelId } from "./ai-provider-types";
 import {
@@ -18,10 +19,28 @@ import { listOutliersForActiveChannel } from "./outliers";
 import { getFormatsForChannel } from "./outlier-formats";
 import { log } from "./logger";
 import {
+  checkTopicFrequency,
+  type TopicFrequencyResult,
   validateIdeaAgainstOwnCatalog,
   type ValidateResult,
 } from "./validate-idea";
 import { scoreOriginality } from "./idea-originality";
+
+// Drop reasons accumulated server-side during the post-LLM pass. Returned
+// to the chat tool so the agent's "Skipped" research-block bullet can
+// surface what got filtered + why. Visibility = trust.
+export type DroppedIdea = {
+  topicLabel: string;
+  proposedTitle: string;
+  reason:
+    | "title_too_long"
+    | "title_too_short"
+    | "banned_word"
+    | "banned_topic"
+    | "topic_overused"
+    | "originality";
+  detail?: string;
+};
 
 // Ideation-only tightening (NOT a methodology change — MENTOR_METHOD §2
 // stays at 2× as the outlier definition). Viral-topic pool uses ≥5× /
@@ -37,6 +56,32 @@ const MIN_VIRAL_CANDIDATES = 3;
 const FORMAT_MIN_EXAMPLES = 3;
 const FORMAT_LIMIT = 6;
 const MIN_FORMAT_CANDIDATES = 2;
+
+// Default ideation slate size after all filters (length, banned words,
+// banned topics, topic frequency, originality). We over-fetch from the
+// LLM to absorb the drop cascade — see OVER_FETCH_CLUSTERS.
+const MAX_IDEAS = 10;
+// Ask the LLM for this many candidate clusters so the post-pass has room
+// to drop weak slots without leaving the user with 4 ideas. 12 keeps
+// the compose call within the 12k max_tokens budget below.
+const OVER_FETCH_CLUSTERS = 12;
+
+// Title-length contract (T1). Proposed titles land in one of three
+// bands; only "ideal" + "acceptable" survive, anything over 100 chars
+// drops outright after one regenerate attempt.
+const TITLE_LEN_IDEAL_MIN = 50;
+const TITLE_LEN_IDEAL_MAX = 70;
+const TITLE_LEN_HARD_MAX = 80;
+const TITLE_LEN_RETRY_MAX = 100;
+const TITLE_LEN_DROP_FLOOR = 35; // anything <35 chars is also dropped
+
+// Banned-words contract (T2). Single regex catches all 11 banned terms
+// listed in operating rule 13. `\b` word boundaries handle multi-word
+// phrases (the inner space is matched literally; boundaries land at
+// the outer letter↔non-letter transitions). Any match forces regenerate
+// (max 1 retry) or drop.
+const BANNED_WORDS_RE =
+  /(\bcinematic\b|\bsensory\b|\bvisceral\b|\bprofound\b|\bdesolate expanse\b|\bhumanity has ever charted\b|\bhumanity has ever mapped\b|\binexorable\b|\bvastest\b|\bthe most absolute\b|\bphysically impossible\b)/i;
 
 // Originality guard. Thresholds live in idea-originality.ts (token-overlap
 // ratio, shared-noun count, longest consecutive-word run — three independent
@@ -102,12 +147,30 @@ export type ProposedIdea = {
   confidence: number;
   originalityScore: number;
   validation: ValidateResult;
+  // T1: which length band this title sits in. Both "ideal" and "acceptable"
+  // ship; "rejected" is filtered out of the surviving slate (kept on the
+  // dropped-ideas accumulator so the agent's Skipped section can report it).
+  titleLengthBand: "ideal" | "acceptable" | "rejected";
+  // T4: own-catalog frequency check. matches=N means the topic overlaps
+  // N of the channel's last 20 uploads. overused=true (≥2 matches)
+  // drops the slot; surviving ideas always have overused=false.
+  topicFrequencyCheck: {
+    matches: number;
+    matchedVideos: TopicFrequencyResult["matchedVideos"];
+  };
 };
 
 export type GenerateIdeasResult =
   | {
       ok: true;
       ideas: ProposedIdea[];
+      // What was filtered out and why. The chat agent surfaces this in
+      // the pre-ideation research block's "Skipped" line so the user
+      // sees the cost of the guardrails (not just the survivors).
+      dropped: DroppedIdea[];
+      // The per-channel banned-topics list as parsed from channel_memory.
+      // Drives the "Skipped" line's banned-topic explanation.
+      bannedTopics: string[];
       generatedAt: number;
       model: string;
     }
@@ -294,11 +357,18 @@ export async function generateIdeasForChannel(opts: {
   const sec9 = extractSection(md, 9);
   const ctx = channel as unknown as ChannelCtx;
 
+  // T5: per-channel banned topics from channel_memory. Parsed at the top
+  // of the call so we can (a) inject them into the compose prompt as an
+  // explicit NEVER-propose constraint, (b) drop any cluster whose
+  // topicLabel or proposedTitle matches a banned term as substring.
+  const bannedTopics = readBannedTopics(userChannelId);
+
   const systemPrompt = buildSystemPromptForCompose({
     sec1,
     sec4,
     sec7,
     sec9,
+    bannedTopics,
   });
 
   const userBody = buildUserBodyForCompose({
@@ -306,6 +376,7 @@ export async function generateIdeasForChannel(opts: {
     formats,
     outliers: outlierLites,
     supplied,
+    bannedTopics,
   });
 
   const model = providerModelId("claude");
@@ -314,10 +385,11 @@ export async function generateIdeasForChannel(opts: {
     const client = new Anthropic({ apiKey });
     const resp = await client.messages.create({
       model,
-      // Bumped from 3000 → 8000 to accommodate the thinking budget below.
-      // Anthropic requires max_tokens > budget_tokens; we hold ~2k headroom
-      // for the actual ideas JSON output.
-      max_tokens: 8000,
+      // 12k = 6k thinking + ~6k for the JSON output. Bumped from 8000
+      // when the default slate grew to 10 ideas (T3) + 12-cluster
+      // over-fetch — at ~300 output tokens per cluster the previous
+      // 2k headroom over thinking would overflow.
+      max_tokens: 12000,
       // Extended thinking REQUIRES temperature=1 (the default). Setting
       // any other value returns 400 "thinking.* requires temperature=1".
       // We previously ran at 0.8 for tighter outputs; we trade that off
@@ -395,7 +467,213 @@ export async function generateIdeasForChannel(opts: {
     };
   };
 
-  let annotated: Annotated[] = rawIdeas.map(score);
+  // Accumulator for every slot the post-LLM pass drops. The chat agent
+  // surfaces this in the "Skipped" line of the pre-ideation research
+  // block so the user sees the guardrails' cost, not just survivors.
+  const dropped: DroppedIdea[] = [];
+
+  // --- Pre-originality filters (T1 length, T2 banned words, T5 banned
+  //     topics, T4 topic frequency). Banned-topic + topic-frequency are
+  //     hard drops; length + banned-words allow one regenerate pass via
+  //     the existing originality retry loop (flagReason markers).
+  type PreFilterResult = {
+    surviving: RawComposedIdea[];
+    titleRetry: Array<RawComposedIdea & { reason: "title_too_long" | "banned_word"; detail: string }>;
+    topicFrequency: Map<string, TopicFrequencyResult>;
+  };
+  const prefilter = ((): PreFilterResult => {
+    const surviving: RawComposedIdea[] = [];
+    const titleRetry: PreFilterResult["titleRetry"] = [];
+    const topicFrequency = new Map<string, TopicFrequencyResult>();
+
+    for (const idea of rawIdeas) {
+      // T5: banned topics (substring match on topicLabel + proposedTitle).
+      const bannedHit = bannedTopicMatch(
+        idea.topicLabel,
+        idea.proposedTitle,
+        bannedTopics
+      );
+      if (bannedHit) {
+        dropped.push({
+          topicLabel: idea.topicLabel,
+          proposedTitle: idea.proposedTitle,
+          reason: "banned_topic",
+          detail: `matched banned term "${bannedHit}"`,
+        });
+        continue;
+      }
+
+      // T4: topic frequency (≥2 matching titles in last 20 own-channel
+      // uploads). Cache the result so survivors can carry it through.
+      const freq = checkTopicFrequency(idea.topicLabel, userChannelId, 20);
+      topicFrequency.set(idea.topicLabel, freq);
+      if (freq.overused) {
+        dropped.push({
+          topicLabel: idea.topicLabel,
+          proposedTitle: idea.proposedTitle,
+          reason: "topic_overused",
+          detail: `${freq.matches} of your last 20 uploads cover this`,
+        });
+        continue;
+      }
+
+      // T1: title length. Reject < floor or > retry-max outright;
+      // 81-100 chars → one regenerate via the existing retry loop;
+      // 50-80 chars → ship.
+      const band = titleLengthBandFor(idea.proposedTitle);
+      if (band === "rejected") {
+        dropped.push({
+          topicLabel: idea.topicLabel,
+          proposedTitle: idea.proposedTitle,
+          reason:
+            idea.proposedTitle.length < TITLE_LEN_DROP_FLOOR
+              ? "title_too_short"
+              : "title_too_long",
+          detail: `${idea.proposedTitle.length} chars`,
+        });
+        continue;
+      }
+      if (band === "too_long") {
+        titleRetry.push({
+          ...idea,
+          reason: "title_too_long",
+          detail: `${idea.proposedTitle.length} chars > ${TITLE_LEN_HARD_MAX} hard ceiling`,
+        });
+        continue;
+      }
+
+      // T2: banned words. Single regen attempt — if it sneaks back, drop.
+      const bannedWord = bannedWordMatch(idea.proposedTitle);
+      if (bannedWord) {
+        titleRetry.push({
+          ...idea,
+          reason: "banned_word",
+          detail: `contains banned term "${bannedWord}"`,
+        });
+        continue;
+      }
+
+      surviving.push(idea);
+    }
+    return { surviving, titleRetry, topicFrequency };
+  })();
+
+  let annotated: Annotated[] = prefilter.surviving.map(score);
+
+  // Run the title-length / banned-word regenerate pass through the same
+  // originality retry plumbing — mark slots flagged with the appropriate
+  // reason so buildRegenerateBody can emit a custom remix instruction.
+  // After this single forced retry, anything still failing length or
+  // banned-words is moved to `dropped` and not retried again.
+  if (prefilter.titleRetry.length > 0) {
+    log.debug(
+      "claude",
+      `Outlier-ideas ${userChannelId}: title/banned-word regenerate — ${prefilter.titleRetry.length} slots`
+    );
+    const titleRegenBody = buildTitleRetryBody(prefilter.titleRetry, formats);
+    try {
+      const client = new Anthropic({ apiKey });
+      const resp = await client.messages.create({
+        model,
+        max_tokens: 4000,
+        system: systemPrompt,
+        messages: [{ role: "user", content: titleRegenBody }],
+        thinking: {
+          type: "enabled",
+          budget_tokens: IDEATION_RETRY_THINKING_BUDGET,
+        },
+      });
+      const text = resp.content
+        .filter((b) => b.type === "text")
+        .map((b) => (b as { text: string }).text)
+        .join("\n")
+        .trim();
+      const parsedRetry = parseRegenerated(text);
+      if (parsedRetry) {
+        const retryByLabel = new Map(parsedRetry.map((r) => [r.topicLabel, r]));
+        for (const f of prefilter.titleRetry) {
+          const replacement = retryByLabel.get(f.topicLabel);
+          if (!replacement) {
+            dropped.push({
+              topicLabel: f.topicLabel,
+              proposedTitle: f.proposedTitle,
+              reason: f.reason,
+              detail: `${f.detail}; retry produced no replacement`,
+            });
+            continue;
+          }
+          const merged: RawComposedIdea = {
+            ...f,
+            proposedTitle: replacement.proposedTitle,
+            angle: replacement.angle || f.angle,
+            confidence: replacement.confidence ?? f.confidence,
+          };
+          // Re-check: length, banned-word, banned-topic on the new title.
+          const reBanned = bannedTopicMatch(
+            merged.topicLabel,
+            merged.proposedTitle,
+            bannedTopics
+          );
+          if (reBanned) {
+            dropped.push({
+              topicLabel: merged.topicLabel,
+              proposedTitle: merged.proposedTitle,
+              reason: "banned_topic",
+              detail: `regen drifted into banned term "${reBanned}"`,
+            });
+            continue;
+          }
+          const reBand = titleLengthBandFor(merged.proposedTitle);
+          if (reBand === "rejected" || reBand === "too_long") {
+            dropped.push({
+              topicLabel: merged.topicLabel,
+              proposedTitle: merged.proposedTitle,
+              reason: "title_too_long",
+              detail: `${merged.proposedTitle.length} chars after retry`,
+            });
+            continue;
+          }
+          const reBannedWord = bannedWordMatch(merged.proposedTitle);
+          if (reBannedWord) {
+            dropped.push({
+              topicLabel: merged.topicLabel,
+              proposedTitle: merged.proposedTitle,
+              reason: "banned_word",
+              detail: `regen still contains "${reBannedWord}"`,
+            });
+            continue;
+          }
+          annotated.push(score(merged));
+        }
+      } else {
+        log.warn(
+          "claude",
+          `Outlier-ideas ${userChannelId}: title-retry returned malformed JSON; dropping ${prefilter.titleRetry.length} slots`
+        );
+        for (const f of prefilter.titleRetry) {
+          dropped.push({
+            topicLabel: f.topicLabel,
+            proposedTitle: f.proposedTitle,
+            reason: f.reason,
+            detail: `${f.detail}; retry parse failed`,
+          });
+        }
+      }
+    } catch (err) {
+      log.warn(
+        "claude",
+        `Outlier-ideas ${userChannelId}: title-retry call failed: ${err instanceof Error ? err.message : "?"}`
+      );
+      for (const f of prefilter.titleRetry) {
+        dropped.push({
+          topicLabel: f.topicLabel,
+          proposedTitle: f.proposedTitle,
+          reason: f.reason,
+          detail: `${f.detail}; retry call errored`,
+        });
+      }
+    }
+  }
 
   for (let pass = 0; pass < MAX_RETRY_PASSES; pass++) {
     const flagged = annotated.filter((a) => a.flagged);
@@ -472,8 +750,22 @@ export async function generateIdeasForChannel(opts: {
     }
   }
 
-  // Drop slots that still overlap too much after retries.
-  const surviving = annotated.filter((a) => !a.flagged);
+  // Drop slots that still overlap too much after retries. Accumulate the
+  // dropped originality slots for the Skipped research-block line.
+  for (const a of annotated.filter((x) => x.flagged)) {
+    dropped.push({
+      topicLabel: a.topicLabel,
+      proposedTitle: a.proposedTitle,
+      reason: "originality",
+      detail: a.flagReason ?? `overlap=${a.maxOverlap.toFixed(2)}`,
+    });
+  }
+  // Cap surviving slate at MAX_IDEAS (T3). Sort by confidence so we keep
+  // the strongest survivors when the over-fetch overshoots.
+  const survivingSorted = annotated
+    .filter((a) => !a.flagged)
+    .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
+  const surviving = survivingSorted.slice(0, MAX_IDEAS);
 
   // --- 5. Validate each surviving idea against own catalog + hydrate
   //        secondary citation block (otherFormatExamples) ----------------
@@ -526,15 +818,38 @@ export async function generateIdeasForChannel(opts: {
       confidence: a.confidence,
       originalityScore: Math.round(a.originalityScore * 100) / 100,
       validation,
+      titleLengthBand:
+        titleLengthBandFor(a.proposedTitle) === "ideal" ? "ideal" : "acceptable",
+      topicFrequencyCheck: {
+        matches: prefilter.topicFrequency.get(a.topicLabel)?.matches ?? 0,
+        matchedVideos:
+          prefilter.topicFrequency.get(a.topicLabel)?.matchedVideos ?? [],
+      },
     };
   });
 
   log.info(
     "claude",
-    `Outlier-ideas ${userChannelId}: ${ideas.length} ideas (${formats.length} formats × ${outlierLites.length} viral outliers; ${annotated.length - surviving.length} dropped for overlap)`
+    `Outlier-ideas ${userChannelId}: ${ideas.length} ideas (target ${MAX_IDEAS}, ${dropped.length} dropped — ${dropped
+      .map((d) => d.reason)
+      .reduce(
+        (acc: Record<string, number>, r) => {
+          acc[r] = (acc[r] ?? 0) + 1;
+          return acc;
+        },
+        {}
+      )
+      .toString?.() ?? "{}"}); formats=${formats.length}, viralOutliers=${outlierLites.length}`
   );
 
-  return { ok: true, ideas, generatedAt: now, model };
+  return {
+    ok: true,
+    ideas,
+    dropped,
+    bannedTopics,
+    generatedAt: now,
+    model,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -546,16 +861,33 @@ function buildSystemPromptForCompose(opts: {
   sec4: string;
   sec7: string;
   sec9: string;
+  bannedTopics: string[];
 }): string {
+  const bannedBlock =
+    opts.bannedTopics.length > 0
+      ? [
+          "# BANNED TOPICS (per channel_memory)",
+          "NEVER propose ideas touching the following. If a viral outlier cluster matches any banned term as a substring (case-insensitive), skip that cluster entirely — do NOT compose a title for it.",
+          ...opts.bannedTopics.map((t) => `- ${t}`),
+          "",
+        ]
+      : [];
   return [
     "You compose NEW YouTube video titles by APPLYING trending title formats to currently-viral topics. The format is a structural skeleton; the topic is the subject. Your job is to glue them — never to paraphrase a source outlier's specific phrasing.",
     "",
     "Workflow (in order):",
-    "1. Group the VIRAL OUTLIERS by topic theme. Same topic across multiple channels → ONE cluster. Two videos on the same topic with different angles still cluster together. Quality of clustering matters: a sloppy cluster makes a sloppy title.",
-    "2. For each top cluster (pick the 5-8 strongest), select ONE format from TRENDING FORMATS that best fits the topic's natural structure.",
-    "3. Compose ONE new title that fills the format's slots with the topic. The new title must NOT share significant phrasing with any source outlier in the cluster — apply the format anew, don't echo.",
+    `1. Group the VIRAL OUTLIERS by topic theme. Same topic across multiple channels → ONE cluster. Two videos on the same topic with different angles still cluster together. Quality of clustering matters: a sloppy cluster makes a sloppy title.`,
+    `2. Pick the TOP ${OVER_FETCH_CLUSTERS} strongest clusters (we'll filter down to ${MAX_IDEAS} after server-side guards run). For each, select ONE format from TRENDING FORMATS that best fits the topic's natural structure.`,
+    "3. Compose ONE new title per cluster that fills the format's slots with the topic. The new title must NOT share significant phrasing with any source outlier in the cluster — apply the format anew, don't echo.",
     "4. Match the channel's voice — terse vs poetic, tabloid vs measured. Voice trumps style ties.",
     "",
+    "# TITLE LANGUAGE — plain words only",
+    "Every proposedTitle MUST be readable by a 14-year-old in under 2 seconds. Mirror the lexical register of competitor outliers (\"huge\", \"hiding\", \"hard\", \"real\", \"big\", \"found\", \"moved\"). Prefer Anglo-Saxon over Latinate. NEVER use any of these words/phrases: cinematic, sensory, visceral, profound, desolate expanse, humanity has ever charted, humanity has ever mapped, inexorable, vastest, the most absolute, physically impossible. Server-side regex enforces this — titles containing any banned term will be regenerated or dropped.",
+    "",
+    "# TITLE LENGTH",
+    `Every proposedTitle MUST land in 50-80 characters (ideal 50-70). Titles over 80 chars are regenerated once then dropped if still over. Titles under ${TITLE_LEN_DROP_FLOOR} are dropped outright.`,
+    "",
+    ...bannedBlock,
     "From MENTOR_METHOD.md §1 (Competitor mapping — the B&S Method):",
     opts.sec1 || "(section unavailable)",
     "",
@@ -572,10 +904,10 @@ function buildSystemPromptForCompose(opts: {
     LEVERS.map((l) => `"${l}"`).join(", "),
     "",
     "# Hard rules",
-    "- Output 5–8 ideas. Quality over quantity.",
+    `- Output ${OVER_FETCH_CLUSTERS} candidate ideas — the server will drop some via length/banned-word/banned-topic/topic-frequency/originality filters and ship up to ${MAX_IDEAS}. Quality over quantity.`,
     "- Each idea cites the SOURCE FORMAT (by id) and the SOURCE OUTLIER VIDEO IDS (up to 3) the topic cluster came from.",
     "- topicLabel is 4–8 words, the subject area, NOT the proposed title.",
-    "- proposedTitle is YOUR composed title applying the format's slots to the topic. Never copy a source title's phrasing.",
+    "- proposedTitle is YOUR composed title applying the format's slots to the topic. Never copy a source title's phrasing. 50-70 chars ideal, 80 chars hard ceiling.",
     "- angle is one §9 lever — the dominant lever the source cluster leans on, applied through the format.",
     "- confidence (0.0–1.0): higher when (a) the format has many examples + high rising rate, (b) the topic cluster has multiple sources, (c) the topic naturally fits the channel's niche.",
     "- Authority + Breakthrough tier sources carry more weight than Adjacent + Far.",
@@ -602,8 +934,9 @@ function buildUserBodyForCompose(opts: {
   formats: FormatLite[];
   outliers: OutlierLite[];
   supplied: boolean;
+  bannedTopics: string[];
 }): string {
-  const { ctx, formats, outliers, supplied } = opts;
+  const { ctx, formats, outliers, supplied, bannedTopics } = opts;
   return [
     "# USER CHANNEL CONTEXT",
     `- Niche: ${ctx.niche || "(empty)"}`,
@@ -612,6 +945,13 @@ function buildUserBodyForCompose(opts: {
     `- Voice: ${ctx.voice || "(empty)"}`,
     `- External sources: ${ctx.external_sources || "(empty)"}`,
     "",
+    ...(bannedTopics.length > 0
+      ? [
+          `# BANNED TOPICS (skip clusters touching any of these as substring)`,
+          ...bannedTopics.map((t) => `- ${t}`),
+          "",
+        ]
+      : []),
     `# TRENDING FORMATS (${formats.length}, ≥${FORMAT_MIN_EXAMPLES} examples, sorted by rising rate)`,
     ...formats.map(
       (f) =>
@@ -623,6 +963,48 @@ function buildUserBodyForCompose(opts: {
       (o) =>
         `- [${o.videoId}] "${o.title}" — ${o.competitorTitle ?? "(unknown)"} (${o.tier}) — ${o.multiplier.toFixed(1)}× median — ${o.views.toLocaleString("en-US")} views — ${o.publishedAt ? fmtAge(o.publishedAt) : "unknown"}`
     ),
+  ].join("\n");
+}
+
+/**
+ * Title-length / banned-word forced retry body. Sent ONCE per turn for
+ * any slot that violated T1 (length > 80) or T2 (banned word in title).
+ * The model rewrites just those titles; surviving slots flow through the
+ * downstream originality pass unchanged.
+ */
+function buildTitleRetryBody(
+  flagged: Array<{
+    topicLabel: string;
+    sourceFormatId: number;
+    proposedTitle: string;
+    reason: "title_too_long" | "banned_word";
+    detail: string;
+  }>,
+  formats: FormatLite[]
+): string {
+  const fmtById = new Map(formats.map((f) => [f.id, f]));
+  return [
+    "# FORCED RETRY — title-length or banned-word violations",
+    "",
+    `Your previous titles broke one of two contracts. Rewrite each, keeping the same topicLabel and sourceFormatId. Hard constraints:`,
+    `  - Length: 50-70 chars ideal, 80 chars hard ceiling. < 35 or > 100 = dropped.`,
+    `  - Language: NEVER use cinematic, sensory, visceral, profound, desolate expanse, humanity has ever charted, humanity has ever mapped, inexorable, vastest, the most absolute, physically impossible. Plain words a 14-year-old reads in <2 seconds. Mirror competitor outlier register ("huge", "hiding", "real", "found").`,
+    "",
+    "Return JSON ONLY:",
+    "{",
+    '  "regenerated": [',
+    '    { "topicLabel": string, "proposedTitle": string, "angle": string, "confidence": number }',
+    "  ]",
+    "}",
+    "",
+    ...flagged.map((f) => {
+      const fmt = fmtById.get(f.sourceFormatId);
+      return [
+        `## ${f.topicLabel}`,
+        `- Format [F-${f.sourceFormatId}]: "${fmt?.template ?? "(unknown)"}"`,
+        `- BLOCKED previous attempt (${f.detail}): "${f.proposedTitle}"`,
+      ].join("\n");
+    }),
   ].join("\n");
 }
 
@@ -709,6 +1091,69 @@ function fmtAge(ts: number): string {
 // explicit thumbnail_url — every published video has /vi/<id>/mqdefault.jpg.
 function ytThumbnail(videoId: string): string {
   return `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
+}
+
+/**
+ * Parse the per-channel banned_topics row from channel_memory into a
+ * normalized lowercase list. Tolerant of trailing commas + whitespace.
+ * Returns [] when no row exists or value is empty.
+ */
+function readBannedTopics(channelId: string): string[] {
+  const rows = listChannelMemory(channelId);
+  const row = rows.find((r) => r.key === "banned_topics");
+  if (!row || !row.value) return [];
+  return row.value
+    .split(",")
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t.length > 0);
+}
+
+/**
+ * T1 — title-length classifier. Returns the band a title falls into:
+ *   ideal       50-70 chars
+ *   acceptable  71-80 chars (no retry needed but flagged)
+ *   too_short   <50 chars but ≥TITLE_LEN_DROP_FLOOR (will be regenerated)
+ *   too_long    81-100 chars (will be regenerated once)
+ *   rejected    <TITLE_LEN_DROP_FLOOR or >100 (drop, no retry)
+ */
+function titleLengthBandFor(
+  title: string
+): "ideal" | "acceptable" | "too_short" | "too_long" | "rejected" {
+  const len = title.length;
+  if (len > TITLE_LEN_RETRY_MAX || len < TITLE_LEN_DROP_FLOOR) return "rejected";
+  if (len <= TITLE_LEN_IDEAL_MAX && len >= TITLE_LEN_IDEAL_MIN) return "ideal";
+  if (len <= TITLE_LEN_HARD_MAX) return "acceptable";
+  if (len < TITLE_LEN_IDEAL_MIN) return "too_short";
+  return "too_long";
+}
+
+/**
+ * T2 — banned-words check. Single regex covers all 11 terms from
+ * operating rule 13 (the word-boundary anchors handle multi-word phrases
+ * because the inner space is matched literally, with boundaries at the
+ * outer letter↔non-letter transitions). Returns the offending term so
+ * the retry prompt can quote it back to the model.
+ */
+function bannedWordMatch(title: string): string | null {
+  const m = title.match(BANNED_WORDS_RE);
+  return m ? m[0] : null;
+}
+
+/**
+ * T5 — per-channel banned-topic substring scan. Returns the first
+ * matching term so the drop accumulator can surface "why".
+ */
+function bannedTopicMatch(
+  topicLabel: string,
+  proposedTitle: string,
+  bannedTopics: string[]
+): string | null {
+  if (bannedTopics.length === 0) return null;
+  const haystack = `${topicLabel} ${proposedTitle}`.toLowerCase();
+  for (const t of bannedTopics) {
+    if (t && haystack.includes(t)) return t;
+  }
+  return null;
 }
 
 function parseJsonObject(raw: string): unknown {

@@ -136,6 +136,95 @@ function videosInWindow(
     .all(channelId, withinDays) as VideoLite[];
 }
 
+// Most-recent N videos for a channel by published/imported date desc.
+// Inline SQL (rather than reusing listVideos) so we can scope by explicit
+// channelId — listVideos is active-channel-scoped and would silently
+// mis-target if the generator's intended channel differs from the
+// active pointer.
+function ownChannelLastN(
+  channelId: string,
+  limit: number
+): VideoLite[] {
+  return db
+    .prepare(
+      `SELECT id, title, published_at, COALESCE(views, 0) AS views
+       FROM videos
+       WHERE channel_id = ?
+       ORDER BY COALESCE(published_at, imported_at) DESC
+       LIMIT ?`
+    )
+    .all(channelId, limit) as VideoLite[];
+}
+
+/**
+ * Topic-frequency guardrail. Checks whether the user has covered a topic
+ * 2+ times across their last N uploads — if so, propose-again is overuse
+ * and the slot should be dropped before the originality guard even runs.
+ *
+ * Same tokenization rules as validateIdeaAgainstOwnCatalog (4+ char tokens,
+ * stopwords stripped). Match rule: ≥2 keyword hits between the topic and
+ * a video title counts that video. overused := matches >= 2.
+ */
+export type TopicFrequencyResult = {
+  matches: number;
+  matchedVideos: Array<{
+    videoId: string;
+    title: string;
+    publishedAt: number | null;
+  }>;
+  overused: boolean;
+};
+
+export function checkTopicFrequency(
+  topic: string,
+  channelId: string,
+  lookbackVideos: number = 20
+): TopicFrequencyResult {
+  const keywords = (function tokenize(s: string): string[] {
+    // Reuse the file's tokenizer logic — exported separately would be
+    // nicer but the closure keeps the existing function private.
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const raw of s
+      .toLowerCase()
+      .replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
+      .split(/\s+/)) {
+      if (!raw || raw.length < 4) continue;
+      if (STOPWORDS.has(raw)) continue;
+      if (seen.has(raw)) continue;
+      seen.add(raw);
+      out.push(raw);
+    }
+    return out;
+  })(topic);
+
+  if (keywords.length === 0 || !channelId) {
+    return { matches: 0, matchedVideos: [], overused: false };
+  }
+
+  const videos = ownChannelLastN(channelId, Math.max(1, lookbackVideos));
+  const matched: TopicFrequencyResult["matchedVideos"] = [];
+  for (const v of videos) {
+    const titleLower = v.title.toLowerCase();
+    let hits = 0;
+    for (const kw of keywords) {
+      if (titleLower.includes(kw)) hits++;
+    }
+    if (hits >= 2) {
+      matched.push({
+        videoId: v.id,
+        title: v.title,
+        publishedAt: v.published_at,
+      });
+    }
+  }
+  return {
+    matches: matched.length,
+    matchedVideos: matched,
+    overused: matched.length >= 2,
+  };
+}
+
 function transcriptTextFor(videoIds: string[]): Map<string, string> {
   const out = new Map<string, string>();
   if (videoIds.length === 0) return out;
