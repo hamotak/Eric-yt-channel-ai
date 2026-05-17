@@ -40,36 +40,43 @@ export type DroppedIdea = {
     | "banned_topic"
     | "topic_overused"
     | "originality"
-    | "format_dup"
+    | "topic_dup"
     | "own_channel";
   detail?: string;
 };
 
-// Ideation-only tightening (NOT a methodology change — MENTOR_METHOD §2
-// stays at 2× as the outlier definition). Viral-topic pool uses ≥5× /
-// 14d to surface what's working RIGHT NOW. Trending formats are pulled
-// from the channel's extracted patterns (last 60d window) so the format
-// slot structures are recent. The agent should never silently relax
-// these — 409 with an explicit ask instead.
-const VIRAL_MIN_MULTIPLIER = 5;
-const VIRAL_WINDOW_DAYS = 14;
-const VIRAL_LIMIT = 30;
-const MIN_VIRAL_CANDIDATES = 3;
+// Outliers-primary pool. Soften pass (T2 of follow-up PR): the prior
+// format×topic pipeline required ≥5× / 14d outliers AND ≥3-example
+// formats — both gates were too strict on HAmo's pool. New shape:
+//
+//   Outliers are the PRIMARY inspiration. Formats are OPTIONAL
+//   remix templates the LLM may use for ~40% of titles, with the
+//   remaining ~60% free-form in the channel's voice.
+//
+// Floor matches the methodology's outlier definition (≥1.5× — the alert
+// generation floor in MENTOR_METHOD §2); the 28d window catches anything
+// that's broken out in the last month without going so wide that stale
+// hits dominate. Source pool is sorted by (multiplier DESC, publishedAt
+// DESC) and capped at 30 — same scan cost as the old viral pool.
+const OUTLIER_MIN_MULTIPLIER = 1.5;
+const OUTLIER_WINDOW_DAYS = 28;
+const OUTLIER_LIMIT = 30;
+const MIN_OUTLIER_CANDIDATES = 3;
 
-const FORMAT_MIN_EXAMPLES = 3;
-const FORMAT_LIMIT = 6;
-const MIN_FORMAT_CANDIDATES = 2;
+// Formats are now optional flavor — drop the prior MIN_FORMAT_CANDIDATES
+// hard floor (extraction can ship 0-2 formats without blocking ideation).
+// We still bound the pool size so the prompt body doesn't bloat.
+const FORMAT_MIN_EXAMPLES = 2;
+const FORMAT_LIMIT = 5;
 
 // Default ideation slate size after all filters (length, banned words,
-// banned topics, topic frequency, originality, format-cluster dedup).
+// banned topics, topic frequency, originality, topic-cluster dedup).
 // We over-fetch from the LLM to absorb the drop cascade.
 const MAX_IDEAS = 10;
-// Bumped 12 → 20 (DEF-I4): the drop cascade — own-channel filter +
-// banned-topic + frequency + length + banned-word + originality +
-// format-cluster dedup — was leaving us with 5 ideas. 20 clusters
-// gives enough buffer to ship 10 after all gates. Stays well within
-// the 12k compose max_tokens budget (≈300 output tokens per cluster).
-const OVER_FETCH_CLUSTERS = 20;
+// Over-fetch budget. The new outliers-primary flow asks for 1 idea per
+// outlier (rather than clustering them first), so the cap matches the
+// source pool size. After all gates the slate is trimmed to MAX_IDEAS.
+const OVER_FETCH_IDEAS = 16;
 
 // Title-length contract (T1). Proposed titles land in one of three
 // bands; only "ideal" + "acceptable" survive, anything over 100 chars
@@ -121,12 +128,18 @@ export type ProposedIdea = {
   // populated to the first entry of sourceTopicOutliers. Anything still
   // reading the old shape keeps working until we clean up.
   sourceOutlierVideoId: string;
+  // Soften pass (T2 of follow-up PR): sourceFormat is now nullable. The
+  // new outliers-primary pipeline asks the LLM to remix with a format
+  // template for ~40% of titles and leave the rest as free-form
+  // compositions in the channel's voice; free-form ideas ship with
+  // sourceFormat === null and the agent's structured markdown omits
+  // the "Format:" line for them.
   sourceFormat: {
     id: number;
     template: string;
     risingRate: number | null;
     exampleCount: number;
-  };
+  } | null;
   sourceTopicOutliers: Array<{
     videoId: string;
     title: string;
@@ -224,33 +237,49 @@ type OutlierLite = {
 };
 
 /**
- * Format × Topic ideation. Pipeline:
- *   1. Pull top trending formats (≥3 examples, last 60d, sorted by rising
- *      rate). These are the structural skeletons.
- *   2. Pull viral outliers (≥5× their channel median, last 14d). These
- *      are the topic raw material.
- *   3. One Claude call: cluster the outliers by topic theme, then for
- *      each top cluster pick the best-fit format and compose a NEW title
- *      applying the format's slot structure to the topic. Never mirror a
- *      source outlier's specific phrasing.
- *   4. Server-side originality scorer: token-overlap between each
- *      proposed title and every source outlier title in its cluster. If
- *      > MAX_OVERLAP, mark for regenerate. Up to MAX_RETRY_PASSES focused
- *      regenerate calls; surviving flagged slots are dropped.
- *   5. validateIdeaAgainstOwnCatalog per idea — same as before — so the
- *      chat agent gets ground-truth "you already covered this" data.
+ * Outliers-primary ideation. Pipeline (post-soften redesign):
+ *   1. Pull the source pool: top 30 competitor outliers ≥1.5× channel
+ *      median in the last 28 days, sorted (multiplier DESC, publishedAt
+ *      DESC). Already-hidden videos + self-tracked-as-competitor rows
+ *      are filtered at the SQL layer. Banned-topic substring filter is
+ *      applied in JS before the LLM sees the pool.
+ *   2. Pull the OPTIONAL format pool: top 5 trending formats by rising
+ *      rate (≥2 examples, non-banned). May be empty — that's fine; the
+ *      LLM is told formats are optional flavor, not a requirement.
+ *   3. One Claude call: 1 idea per outlier (~16 outputs over-fetched).
+ *      For each, the LLM may either remix with a format template
+ *      (sourceFormatId set) or compose a free-form title in the
+ *      channel's voice (sourceFormatId null). Target mix: ~40% format,
+ *      ~60% free-form, but the model is told to drop the format entirely
+ *      when none fit naturally.
+ *   4. Standard post-LLM drop cascade: title length, banned words,
+ *      banned topics (re-check post-compose), topic frequency (≥1 hit in
+ *      last 20 own uploads), originality. Up to MAX_RETRY_PASSES focused
+ *      regenerate passes per flagged slot.
+ *   5. Topic-cluster dedup: if ≥2 surviving ideas share a topicLabel,
+ *      keep the highest-scoring, drop the rest. Replaces the prior
+ *      format-cluster dedup — variety is now measured by topic diversity.
+ *   6. validateIdeaAgainstOwnCatalog + findTopicSimilarOutliers per idea.
  *
  * No rate limit. The whole point of the new flow is iterating until the
  * user likes the slate.
+ *
+ * Caller knobs:
+ *   - outlierVideoIds: bypass auto-pick. Trust the caller's curation.
+ *   - windowDays / minMultiplier: override the source pool gates.
+ *     The chat agent should only set these when the USER explicitly asks
+ *     to widen — operating rule 11 enforces that.
+ *   - mode: "mixed" (default — ~40% format, ~60% free-form) or
+ *     "free-form" (skip format pool entirely; every idea ships
+ *     sourceFormat:null). HAmo can request "no format templates" in chat
+ *     and the agent passes mode:"free-form".
  */
 export async function generateIdeasForChannel(opts: {
   userChannelId: string;
-  // Caller-supplied outliers bypass auto-pick and the ≥5× / 14d filter.
   outlierVideoIds?: string[];
-  // Overrides — agent leaves undefined for the defaults. Wider-window
-  // requires explicit user request per the operating rules.
   windowDays?: number;
   minMultiplier?: number;
+  mode?: "mixed" | "free-form";
 }): Promise<GenerateIdeasResult> {
   const userChannelId = opts.userChannelId?.trim();
   if (!userChannelId) {
@@ -276,35 +305,14 @@ export async function generateIdeasForChannel(opts: {
     };
   }
 
-  // --- 1. Trending formats -------------------------------------------------
-  const formats: FormatLite[] = getFormatsForChannel(userChannelId, 30)
-    .filter((f) => f.examples.length >= FORMAT_MIN_EXAMPLES)
-    .sort((a, b) => (b.risingRate ?? 0) - (a.risingRate ?? 0))
-    .slice(0, FORMAT_LIMIT)
-    .map((f) => ({
-      id: f.id,
-      template: f.template,
-      examples: f.examples.length,
-      risingRate: f.risingRate,
-      avgMultiplier: f.avgMultiplier,
-    }));
-
-  if (formats.length < MIN_FORMAT_CANDIDATES) {
-    return {
-      ok: false,
-      status: 409,
-      error: `No trending formats available (need ≥${MIN_FORMAT_CANDIDATES} formats with ≥${FORMAT_MIN_EXAMPLES} examples each). Tell the user to run 'Re-extract trending formats' on the /outliers Trending Formats tab first, then retry.`,
-    };
-  }
-
-  // --- 2. Viral outliers ---------------------------------------------------
-  const viralWindow = opts.windowDays ?? VIRAL_WINDOW_DAYS;
-  const viralMult = opts.minMultiplier ?? VIRAL_MIN_MULTIPLIER;
+  // --- 1. Source pool: outliers ARE the primary inspiration ----------------
+  const outlierWindow = opts.windowDays ?? OUTLIER_WINDOW_DAYS;
+  const outlierMult = opts.minMultiplier ?? OUTLIER_MIN_MULTIPLIER;
   let outlierLites: OutlierLite[] = [];
   let supplied = false;
   if (opts.outlierVideoIds && opts.outlierVideoIds.length > 0) {
     supplied = true;
-    const rows = getCompetitorVideosByIds(opts.outlierVideoIds.slice(0, 30));
+    const rows = getCompetitorVideosByIds(opts.outlierVideoIds.slice(0, OUTLIER_LIMIT));
     // Hydrate multiplier per row using all-time competitor median (the
     // bookkeeping table used by the alert generator). Caller-supplied
     // IDs bypass the multiplier filter — we trust the caller's curation.
@@ -330,9 +338,9 @@ export async function generateIdeasForChannel(opts: {
   } else {
     const { outliers } = listOutliersForActiveChannel({
       userChannelId,
-      windowDays: viralWindow as 7 | 30 | 60 | 90,
-      minMultiplier: viralMult,
-      limit: VIRAL_LIMIT,
+      windowDays: outlierWindow,
+      minMultiplier: outlierMult,
+      limit: OUTLIER_LIMIT,
     });
     outlierLites = outliers.map((o) => ({
       videoId: o.videoId,
@@ -346,11 +354,11 @@ export async function generateIdeasForChannel(opts: {
       tier: o.tier,
       publishedAt: o.publishedAt,
     }));
-    if (outlierLites.length < MIN_VIRAL_CANDIDATES) {
+    if (outlierLites.length < MIN_OUTLIER_CANDIDATES) {
       return {
         ok: false,
         status: 409,
-        error: `No strong outliers (≥${viralMult}×) in the last ${viralWindow} days — only ${outlierLites.length} candidate${outlierLites.length === 1 ? "" : "s"} pass${outlierLites.length === 1 ? "es" : ""}, need ≥${MIN_VIRAL_CANDIDATES}. Ask the user whether to widen the window or lower the multiplier; do NOT silently lower these thresholds.`,
+        error: `Only ${outlierLites.length} outlier${outlierLites.length === 1 ? "" : "s"} ≥${outlierMult}× in the last ${outlierWindow} days — need ≥${MIN_OUTLIER_CANDIDATES}. Ask the user whether to widen the window or lower the multiplier; do NOT silently lower these thresholds.`,
       };
     }
   }
@@ -372,6 +380,31 @@ export async function generateIdeasForChannel(opts: {
       `Outlier-ideas ${userChannelId}: stripped ${ownChannelDrops.length} own-channel rows from inspiration pool (self-tracked-as-competitor leak — investigate competitors table)`
     );
   }
+  // Soften pass: pre-LLM banned-topic filter. The agent's banned_topics
+  // list (channel_memory) used to be applied post-LLM only, after the
+  // compose call had already paid for tokens on banned-topic ideas;
+  // moving the FIRST pass forward saves cost + keeps the source pool
+  // clean. A second pass on (topicLabel, proposedTitle) still runs
+  // post-compose below — the LLM can still drift to a banned topic from
+  // a clean source.
+  const bannedTopics = readBannedTopics(userChannelId);
+  if (bannedTopics.length > 0) {
+    const beforeBanned = outlierLites.length;
+    outlierLites = outlierLites.filter((o) => {
+      const haystack = (o.title ?? "").toLowerCase();
+      for (const term of bannedTopics) {
+        if (term && haystack.includes(term)) return false;
+      }
+      return true;
+    });
+    const removed = beforeBanned - outlierLites.length;
+    if (removed > 0) {
+      log.info(
+        "claude",
+        `Outlier-ideas ${userChannelId}: pre-LLM banned-topic filter removed ${removed} of ${beforeBanned} outliers`
+      );
+    }
+  }
   if (outlierLites.length === 0) {
     return {
       ok: false,
@@ -380,19 +413,34 @@ export async function generateIdeasForChannel(opts: {
     };
   }
 
-  // --- 3. Claude call: cluster + compose ----------------------------------
+  // --- 2. Optional format pool (OK to be empty) ----------------------------
+  // Free-form mode skips the format pool entirely so every idea ships
+  // with sourceFormatId:null. Use when HAmo explicitly asks "no format
+  // templates" — operating rule 11 governs threshold widening, not
+  // mode-flipping, so this is a normal pass-through.
+  const mode: "mixed" | "free-form" = opts.mode === "free-form" ? "free-form" : "mixed";
+  const formats: FormatLite[] =
+    mode === "free-form"
+      ? []
+      : getFormatsForChannel(userChannelId, 30)
+          .filter((f) => f.examples.length >= FORMAT_MIN_EXAMPLES)
+          .sort((a, b) => (b.risingRate ?? 0) - (a.risingRate ?? 0))
+          .slice(0, FORMAT_LIMIT)
+          .map((f) => ({
+            id: f.id,
+            template: f.template,
+            examples: f.examples.length,
+            risingRate: f.risingRate,
+            avgMultiplier: f.avgMultiplier,
+          }));
+
+  // --- 3. Claude call: compose 1 idea per outlier (~16 over-fetch) --------
   const md = loadMentorMethod();
   const sec1 = extractSection(md, 1);
   const sec4 = extractSection(md, 4);
   const sec7 = extractSection(md, 7);
   const sec9 = extractSection(md, 9);
   const ctx = channel as unknown as ChannelCtx;
-
-  // T5: per-channel banned topics from channel_memory. Parsed at the top
-  // of the call so we can (a) inject them into the compose prompt as an
-  // explicit NEVER-propose constraint, (b) drop any cluster whose
-  // topicLabel or proposedTitle matches a banned term as substring.
-  const bannedTopics = readBannedTopics(userChannelId);
 
   const systemPrompt = buildSystemPromptForCompose({
     sec1,
@@ -401,6 +449,8 @@ export async function generateIdeasForChannel(opts: {
     sec9,
     bannedTopics,
     ideationRules: (ctx.ideation_rules ?? "").trim(),
+    mode,
+    formatPoolEmpty: formats.length === 0,
   });
 
   const userBody = buildUserBodyForCompose({
@@ -409,6 +459,7 @@ export async function generateIdeasForChannel(opts: {
     outliers: outlierLites,
     supplied,
     bannedTopics,
+    mode,
   });
 
   const model = providerModelId("claude");
@@ -440,6 +491,9 @@ export async function generateIdeasForChannel(opts: {
       .trim();
     const parsed = parseComposedIdeas(
       text,
+      // The id set is passed so parseComposedIdeas can null out any
+      // sourceFormatId the LLM made up. An empty set means every
+      // sourceFormatId becomes null — exactly the free-form case.
       new Set(formats.map((f) => f.id)),
       new Set(outlierLites.map((o) => o.videoId))
     );
@@ -802,27 +856,31 @@ export async function generateIdeasForChannel(opts: {
         - ((a.confidence ?? 0) * 10 + (a.originalityScore ?? 0))
     );
 
-  // DEF-I3: format-cluster dedup. Each sourceFormatId may appear in AT
-  // MOST ONE surviving idea — keep the highest-scoring, drop the rest.
-  // Combined with the over-fetch + the prompt-side instruction, this
-  // hands the user a slate where every idea uses a different format.
-  const seenFormats = new Set<number>();
-  const afterFormatDedup: typeof preDedup = [];
+  // Topic-cluster dedup (replaces the prior format-cluster dedup). The
+  // outliers-primary pipeline composes 1 idea per outlier, so the LLM
+  // can drift into clustering around the same hot topic. We collapse by
+  // a normalised topicLabel — keep the highest-scoring, drop the rest.
+  // Goal: 10 distinct topics across 10 ideas.
+  const normaliseTopic = (t: string): string =>
+    t.toLowerCase().replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ").trim().replace(/\s+/g, " ");
+  const seenTopics = new Set<string>();
+  const afterTopicDedup: typeof preDedup = [];
   for (const a of preDedup) {
-    if (seenFormats.has(a.sourceFormatId)) {
+    const key = normaliseTopic(a.topicLabel);
+    if (seenTopics.has(key)) {
       dropped.push({
         topicLabel: a.topicLabel,
         proposedTitle: a.proposedTitle,
-        reason: "format_dup",
-        detail: `format ${a.sourceFormatId} already used by a higher-scoring idea`,
+        reason: "topic_dup",
+        detail: `topic "${a.topicLabel}" already covered by a higher-scoring idea`,
       });
       continue;
     }
-    seenFormats.add(a.sourceFormatId);
-    afterFormatDedup.push(a);
+    seenTopics.add(key);
+    afterTopicDedup.push(a);
   }
   // Cap surviving slate at MAX_IDEAS.
-  const surviving = afterFormatDedup.slice(0, MAX_IDEAS);
+  const surviving = afterTopicDedup.slice(0, MAX_IDEAS);
 
   // DEF-I4: per-reason attrition logging. Drives the agent's "Skipped"
   // research-block line and helps HAmo see where the cascade lost ideas.
@@ -832,7 +890,7 @@ export async function generateIdeasForChannel(opts: {
   }
   log.info(
     "claude",
-    `Outlier-ideas ${userChannelId}: attrition — LLM raw=${rawIdeas.length}, prefilter survived=${prefilter.surviving.length}, post-originality=${annotated.filter((x) => !x.flagged).length}, post-format-dedup=${afterFormatDedup.length}, shipped=${Math.min(surviving.length, MAX_IDEAS)}; drops=${JSON.stringify(dropCounts)}`
+    `Outlier-ideas ${userChannelId}: attrition — LLM raw=${rawIdeas.length}, prefilter survived=${prefilter.surviving.length}, post-originality=${annotated.filter((x) => !x.flagged).length}, post-topic-dedup=${afterTopicDedup.length}, shipped=${Math.min(surviving.length, MAX_IDEAS)}; drops=${JSON.stringify(dropCounts)}`
   );
 
   // --- 5. Validate each surviving idea against own catalog + hydrate
@@ -841,7 +899,8 @@ export async function generateIdeasForChannel(opts: {
   //        who else covered the SAME TOPIC and how hard it hit, not
   //        more videos using the same shape.
   const ideas: ProposedIdea[] = surviving.map((a) => {
-    const fmt = formatById.get(a.sourceFormatId);
+    const fmt =
+      a.sourceFormatId !== null ? formatById.get(a.sourceFormatId) : null;
     const validation = validateIdeaAgainstOwnCatalog({
       topic: a.topicLabel,
       userChannelId,
@@ -854,12 +913,17 @@ export async function generateIdeasForChannel(opts: {
     );
     return {
       sourceOutlierVideoId: a.sources[0]?.videoId ?? "",
-      sourceFormat: {
-        id: a.sourceFormatId,
-        template: fmt?.template ?? "(unknown)",
-        risingRate: fmt?.risingRate ?? null,
-        exampleCount: fmt?.examples ?? 0,
-      },
+      // Free-form ideas leave sourceFormat at null; the agent's markdown
+      // omits the "Format:" line for those rows.
+      sourceFormat:
+        fmt && a.sourceFormatId !== null
+          ? {
+              id: a.sourceFormatId,
+              template: fmt.template,
+              risingRate: fmt.risingRate,
+              exampleCount: fmt.examples,
+            }
+          : null,
       sourceTopicOutliers: a.sources.map((s) => {
         const m = Math.round(s.multiplier * 10) / 10;
         return {
@@ -892,9 +956,10 @@ export async function generateIdeasForChannel(opts: {
   // The attrition log already fired before mapping survivors — see
   // dropCounts log above. This second info-line just summarises the
   // shipped slate.
+  const withFormat = ideas.filter((i) => i.sourceFormat !== null).length;
   log.info(
     "claude",
-    `Outlier-ideas ${userChannelId}: shipped ${ideas.length}/${MAX_IDEAS} ideas (${dropped.length} total drops); formats=${formats.length}, viralOutliers=${outlierLites.length}`
+    `Outlier-ideas ${userChannelId}: shipped ${ideas.length}/${MAX_IDEAS} ideas (${dropped.length} total drops); formats-available=${formats.length}, mode=${mode}, ideas-using-format=${withFormat}/${ideas.length}, outliers-in-pool=${outlierLites.length}`
   );
 
   return {
@@ -918,21 +983,18 @@ function buildSystemPromptForCompose(opts: {
   sec9: string;
   bannedTopics: string[];
   ideationRules: string;
+  mode: "mixed" | "free-form";
+  formatPoolEmpty: boolean;
 }): string {
   const bannedBlock =
     opts.bannedTopics.length > 0
       ? [
           "# BANNED TOPICS (per channel_memory)",
-          "NEVER propose ideas touching the following. If a viral outlier cluster matches any banned term as a substring (case-insensitive), skip that cluster entirely — do NOT compose a title for it.",
+          "NEVER propose ideas touching the following. If a recent outlier mentions any banned term as a substring (case-insensitive), skip that outlier entirely — do NOT compose a title for it.",
           ...opts.bannedTopics.map((t) => `- ${t}`),
           "",
         ]
       : [];
-  // T9 — per-channel HAmo-authored ideation rules. Injected verbatim
-  // (no rewriting, no summarisation). These rules sit ABOVE format/topic
-  // fit in priority: if a rule says "every title must include a number",
-  // a title without a number is wrong, even if it's the most original
-  // composition the model can produce.
   const ideationRulesBlock = opts.ideationRules
     ? [
         "# PER-CHANNEL IDEATION RULES (HAmo-authored, HARD enforcement)",
@@ -941,13 +1003,39 @@ function buildSystemPromptForCompose(opts: {
         "",
       ]
     : [];
+
+  // The mix-mode guidance differs sharply by mode. "free-form" means
+  // sourceFormatId MUST be null on every idea; "mixed" leaves the
+  // decision to the model, with the explicit target ratio and the
+  // freedom to skip the format entirely when no format fits.
+  const mixGuidance =
+    opts.mode === "free-form" || opts.formatPoolEmpty
+      ? [
+          "# COMPOSE MODE — FREE-FORM ONLY",
+          opts.mode === "free-form"
+            ? "The caller has asked for free-form titles only. The TRENDING FORMATS block below is intentionally empty. Every idea MUST set sourceFormatId to null. Compose every title in the channel's voice as a fresh free-form composition — DO NOT invent format ids."
+            : "No trending formats are available for this channel right now. Every idea MUST set sourceFormatId to null. Compose every title in the channel's voice as a fresh free-form composition.",
+          "",
+        ]
+      : [
+          "# COMPOSE MODE — MIXED (formats are OPTIONAL flavor)",
+          "Outliers are the PRIMARY inspiration. Trending formats are AVAILABLE remix templates the model MAY use, but is NOT required to.",
+          `Aim for roughly 40% of titles using a format template (sourceFormatId set to that template's id) and 60% as free-form titles in the channel's voice (sourceFormatId null). If no format fits a particular outlier naturally, set sourceFormatId to null and compose free-form — a forced fit is worse than no template.`,
+          "Variety is the goal: do NOT pick the same format twice in a row, and prefer using EVERY listed format at least once rather than stacking the most-rising one.",
+          "",
+        ];
+  const outputShape =
+    opts.mode === "free-form" || opts.formatPoolEmpty
+      ? '      "sourceFormatId": null,'
+      : '      "sourceFormatId": number | null,    // a format id from TRENDING FORMATS, OR null for a free-form composition';
+
   return [
-    "You compose NEW YouTube video titles by APPLYING trending title formats to currently-viral topics. The format is a structural skeleton; the topic is the subject. Your job is to glue them — never to paraphrase a source outlier's specific phrasing.",
+    "You propose NEW YouTube video title ideas. PRIMARY inspiration: the recent viral OUTLIERS below — competitor videos that beat their own channel's median in the last 4 weeks. Each idea MUST be inspired by exactly ONE source outlier (cite its videoId in sourceTopicOutlierIds[0]).",
     "",
-    "Workflow (in order):",
-    `1. Group the VIRAL OUTLIERS by topic theme. Same topic across multiple channels → ONE cluster. Two videos on the same topic with different angles still cluster together. Quality of clustering matters: a sloppy cluster makes a sloppy title.`,
-    `2. Pick the TOP ${OVER_FETCH_CLUSTERS} strongest clusters (we'll filter down to ${MAX_IDEAS} after server-side guards run). For each, select ONE format from TRENDING FORMATS that best fits the topic's natural structure.`,
-    "3. Compose ONE new title per cluster that fills the format's slots with the topic. The new title must NOT share significant phrasing with any source outlier in the cluster — apply the format anew, don't echo.",
+    "Workflow:",
+    "1. Pick ~16 of the strongest outliers (multiplier × age × topic fit for the channel). One idea per outlier.",
+    "2. For each outlier, propose ONE new title in the channel's voice. The new title must NOT share significant phrasing with the source outlier — apply the IDEA, not the phrasing.",
+    "3. Use the COMPOSE MODE guidance below to decide whether to remix with a format template or compose free-form.",
     "4. Match the channel's voice — terse vs poetic, tabloid vs measured. Voice trumps style ties.",
     "",
     "# TITLE LANGUAGE — plain words only",
@@ -958,6 +1046,7 @@ function buildSystemPromptForCompose(opts: {
     "",
     ...bannedBlock,
     ...ideationRulesBlock,
+    ...mixGuidance,
     "From MENTOR_METHOD.md §1 (Competitor mapping — the B&S Method):",
     opts.sec1 || "(section unavailable)",
     "",
@@ -974,13 +1063,13 @@ function buildSystemPromptForCompose(opts: {
     LEVERS.map((l) => `"${l}"`).join(", "),
     "",
     "# Hard rules",
-    `- Output ${OVER_FETCH_CLUSTERS} candidate ideas — the server will drop some via length/banned-word/banned-topic/topic-frequency/originality filters and ship up to ${MAX_IDEAS}. Quality over quantity.`,
-    "- Each idea cites the SOURCE FORMAT (by id) and the SOURCE OUTLIER VIDEO IDS (up to 3) the topic cluster came from.",
-    "- Each format ID may be used by AT MOST ONE idea. Distribute formats across the slate — do not stack 3 ideas on the same format. The server enforces this server-side (highest-scoring keeps the format, the rest are dropped) so stacking just wastes your output budget.",
-    "- topicLabel is 4–8 words, the subject area, NOT the proposed title.",
-    "- proposedTitle is YOUR composed title applying the format's slots to the topic. Never copy a source title's phrasing. 50-70 chars ideal, 80 chars hard ceiling.",
-    "- angle is one §9 lever — the dominant lever the source cluster leans on, applied through the format.",
-    "- confidence (0.0–1.0): higher when (a) the format has many examples + high rising rate, (b) the topic cluster has multiple sources, (c) the topic naturally fits the channel's niche.",
+    `- Output ${OVER_FETCH_IDEAS} candidate ideas — the server will drop some via length/banned-word/banned-topic/topic-frequency/originality/topic-dup filters and ship up to ${MAX_IDEAS}. Quality over quantity.`,
+    "- Each idea cites exactly ONE source outlier in sourceTopicOutlierIds (use exactly one element).",
+    "- sourceFormatId is either a numeric id from TRENDING FORMATS or null. NEVER invent a format id.",
+    "- topicLabel is 4–8 words, the subject area, NOT the proposed title. Two ideas on the same topic will be deduped — DIVERSIFY topics across the slate.",
+    "- proposedTitle is YOUR composed title. Never copy a source title's phrasing. 50-70 chars ideal, 80 chars hard ceiling.",
+    "- angle is one §9 lever — the dominant lever the source outlier leans on.",
+    "- confidence (0.0–1.0): higher when (a) the source outlier hit ≥3×, (b) the topic naturally fits the channel's niche, (c) when using a format, the format has many examples + high rising rate.",
     "- Authority + Breakthrough tier sources carry more weight than Adjacent + Far.",
     "",
     "Return ONLY a JSON object. No prose, no markdown, no code fence.",
@@ -989,8 +1078,8 @@ function buildSystemPromptForCompose(opts: {
     '  "ideas": [',
     "    {",
     '      "topicLabel": string,',
-    '      "sourceTopicOutlierIds": string[],',
-    '      "sourceFormatId": number,',
+    '      "sourceTopicOutlierIds": string[],   // exactly one element',
+    outputShape,
     '      "proposedTitle": string,',
     '      "angle": string,',
     '      "confidence": number',
@@ -1006,8 +1095,31 @@ function buildUserBodyForCompose(opts: {
   outliers: OutlierLite[];
   supplied: boolean;
   bannedTopics: string[];
+  mode: "mixed" | "free-form";
 }): string {
-  const { ctx, formats, outliers, supplied, bannedTopics } = opts;
+  const { ctx, formats, outliers, supplied, bannedTopics, mode } = opts;
+  const formatBlock =
+    mode === "free-form"
+      ? [
+          `# TRENDING FORMATS — DISABLED (caller requested free-form mode)`,
+          `Every idea MUST set sourceFormatId to null.`,
+          "",
+        ]
+      : formats.length > 0
+        ? [
+            `# TRENDING FORMATS (${formats.length}, ≥${FORMAT_MIN_EXAMPLES} examples, sorted by rising rate)`,
+            `OPTIONAL — use a format id ONLY when one fits the outlier's topic naturally. Free-form (sourceFormatId:null) is the right answer when no template fits.`,
+            ...formats.map(
+              (f) =>
+                `- [F-${f.id}] "${f.template}" — ${f.examples} examples — rising_rate=${(f.risingRate ?? 0).toFixed(2)}, avg_mult=${(f.avgMultiplier ?? 0).toFixed(1)}×`
+            ),
+            "",
+          ]
+        : [
+            `# TRENDING FORMATS — none extracted yet for this channel.`,
+            `Every idea MUST set sourceFormatId to null. Compose free-form titles in the channel's voice.`,
+            "",
+          ];
   return [
     "# USER CHANNEL CONTEXT",
     `- Niche: ${ctx.niche || "(empty)"}`,
@@ -1018,18 +1130,14 @@ function buildUserBodyForCompose(opts: {
     "",
     ...(bannedTopics.length > 0
       ? [
-          `# BANNED TOPICS (skip clusters touching any of these as substring)`,
+          `# BANNED TOPICS (skip outliers touching any of these as substring)`,
           ...bannedTopics.map((t) => `- ${t}`),
           "",
         ]
       : []),
-    `# TRENDING FORMATS (${formats.length}, ≥${FORMAT_MIN_EXAMPLES} examples, sorted by rising rate)`,
-    ...formats.map(
-      (f) =>
-        `- [F-${f.id}] "${f.template}" — ${f.examples} examples — rising_rate=${(f.risingRate ?? 0).toFixed(2)}, avg_mult=${(f.avgMultiplier ?? 0).toFixed(1)}×`
-    ),
-    "",
-    `# VIRAL OUTLIERS (${outliers.length}${supplied ? ", caller-supplied" : `, ≥${VIRAL_MIN_MULTIPLIER}× last ${VIRAL_WINDOW_DAYS}d`})`,
+    ...formatBlock,
+    `# RECENT OUTLIERS (${outliers.length}${supplied ? ", caller-supplied" : `, ≥${OUTLIER_MIN_MULTIPLIER}× last ${OUTLIER_WINDOW_DAYS}d`}) — the PRIMARY inspiration pool`,
+    `Sorted by (multiplier DESC, recency DESC). Compose ONE idea per outlier you pick.`,
     ...outliers.map(
       (o) =>
         `- [${o.videoId}] "${o.title}" — ${o.competitorTitle ?? "(unknown)"} (${o.tier}) — ${o.multiplier.toFixed(1)}× median — ${o.views.toLocaleString("en-US")} views — ${o.publishedAt ? fmtAge(o.publishedAt) : "unknown"}`
@@ -1046,7 +1154,7 @@ function buildUserBodyForCompose(opts: {
 function buildTitleRetryBody(
   flagged: Array<{
     topicLabel: string;
-    sourceFormatId: number;
+    sourceFormatId: number | null;
     proposedTitle: string;
     reason: "title_too_long" | "banned_word";
     detail: string;
@@ -1057,7 +1165,7 @@ function buildTitleRetryBody(
   return [
     "# FORCED RETRY — title-length or banned-word violations",
     "",
-    `Your previous titles broke one of two contracts. Rewrite each, keeping the same topicLabel and sourceFormatId. Hard constraints:`,
+    `Your previous titles broke one of two contracts. Rewrite each, keeping the same topicLabel and sourceFormatId (null stays null, a specific id stays that id). Hard constraints:`,
     `  - Length: 50-70 chars ideal, 80 chars hard ceiling. < 35 or > 100 = dropped.`,
     `  - Language: NEVER use cinematic, sensory, visceral, profound, desolate expanse, humanity has ever charted, humanity has ever mapped, inexorable, vastest, the most absolute, physically impossible. Plain words a 14-year-old reads in <2 seconds. Mirror competitor outlier register ("huge", "hiding", "real", "found").`,
     "",
@@ -1069,10 +1177,12 @@ function buildTitleRetryBody(
     "}",
     "",
     ...flagged.map((f) => {
-      const fmt = fmtById.get(f.sourceFormatId);
+      const fmt = f.sourceFormatId !== null ? fmtById.get(f.sourceFormatId) : null;
       return [
         `## ${f.topicLabel}`,
-        `- Format [F-${f.sourceFormatId}]: "${fmt?.template ?? "(unknown)"}"`,
+        fmt
+          ? `- Format [F-${f.sourceFormatId}]: "${fmt.template}"`
+          : `- Format: free-form (no template — keep it that way)`,
         `- BLOCKED previous attempt (${f.detail}): "${f.proposedTitle}"`,
       ].join("\n");
     }),
@@ -1083,7 +1193,7 @@ function buildRegenerateBody(
   flagged: Array<{
     topicLabel: string;
     sourceTopicOutlierIds: string[];
-    sourceFormatId: number;
+    sourceFormatId: number | null;
     proposedTitle: string;
     originalityScore: number;
     maxOverlap: number;
@@ -1096,9 +1206,9 @@ function buildRegenerateBody(
 ): string {
   const fmtById = new Map(formats.map((f) => [f.id, f]));
   return [
-    "# FORCED RETRY — your previous titles echoed sources too closely",
+    "# FORCED RETRY — your previous titles echoed the source outlier too closely",
     "",
-    "These are forced retries. Your previous attempts mirrored source outlier phrasing instead of applying the format anew. Be AGGRESSIVE on novelty: the format is the skeleton, the topic is the subject, but the surface phrasing must NOT mirror any source title. For each entry below, generate a TRULY DIFFERENT title that applies the SAME format to the SAME topic but with:",
+    "These are forced retries. Your previous attempts mirrored a source outlier's phrasing instead of proposing a new angle on the topic. Be AGGRESSIVE on novelty. For each entry below, generate a TRULY DIFFERENT title for the SAME topic and source outlier but with:",
     "  - different subject phrasing,",
     "  - different verb choice,",
     "  - swap at least 2 content nouns for synonyms, related concepts, or oblique references.",
@@ -1109,7 +1219,7 @@ function buildRegenerateBody(
     "  • instead of \"James Webb Found Galaxies That Shouldn't Exist\" → \"Webb's Deep Field Holds a Geometry That Breaks the Models\"",
     "  • or → \"There Are Galaxies in Webb's Data That Pre-Date the Universe\"",
     "",
-    "Keep the same topicLabel and sourceFormatId. Return JSON ONLY:",
+    "Keep the same topicLabel and sourceFormatId (null stays null). Return JSON ONLY:",
     "{",
     '  "regenerated": [',
     '    { "topicLabel": string, "proposedTitle": string, "angle": string, "confidence": number }',
@@ -1117,7 +1227,7 @@ function buildRegenerateBody(
     "}",
     "",
     ...flagged.map((f) => {
-      const fmt = fmtById.get(f.sourceFormatId);
+      const fmt = f.sourceFormatId !== null ? fmtById.get(f.sourceFormatId) : null;
       const reasonLabel =
         f.flagReason === "shared-run"
           ? `shared a ${f.longestSharedRun}-word run with a source`
@@ -1126,7 +1236,9 @@ function buildRegenerateBody(
             : `overlapped ${(f.maxOverlap * 100).toFixed(0)}% of tokens with a source`;
       return [
         `## ${f.topicLabel}`,
-        `- Format [F-${f.sourceFormatId}]: "${fmt?.template ?? "(unknown)"}"`,
+        fmt
+          ? `- Format [F-${f.sourceFormatId}]: "${fmt.template}"`
+          : `- Format: free-form (no template — stay free-form)`,
         `- BLOCKED previous attempt: "${f.proposedTitle}"`,
         `- Reason: ${reasonLabel} (originalityScore=${f.originalityScore.toFixed(2)}, maxOverlap=${f.maxOverlap.toFixed(2)}, sharedNouns=${f.sharedNouns}, longestSharedRun=${f.longestSharedRun})`,
         f.worstSourceTitle
@@ -1144,7 +1256,8 @@ function buildRegenerateBody(
 type RawComposedIdea = {
   topicLabel: string;
   sourceTopicOutlierIds: string[];
-  sourceFormatId: number;
+  // Nullable post-soften-pass: free-form ideas have no format id.
+  sourceFormatId: number | null;
   proposedTitle: string;
   angle: string;
   confidence: number;
@@ -1264,8 +1377,21 @@ function parseComposedIdeas(
       typeof o.confidence === "number"
         ? Math.max(0, Math.min(1, o.confidence))
         : 0;
-    const sourceFormatId =
-      typeof o.sourceFormatId === "number" ? o.sourceFormatId : NaN;
+    // sourceFormatId is now nullable. The LLM is told to set null for
+    // free-form ideas; anything that doesn't match a known format id
+    // collapses to null too (rather than dropping the whole idea — a
+    // free-form composition with a made-up id is still a usable idea).
+    const rawFormatId = o.sourceFormatId;
+    let sourceFormatId: number | null = null;
+    if (rawFormatId === null) {
+      sourceFormatId = null;
+    } else if (
+      typeof rawFormatId === "number" &&
+      Number.isFinite(rawFormatId) &&
+      knownFormatIds.has(rawFormatId)
+    ) {
+      sourceFormatId = rawFormatId;
+    }
     const sourceTopicOutlierIdsRaw = Array.isArray(o.sourceTopicOutlierIds)
       ? o.sourceTopicOutlierIds
           .filter((v): v is string => typeof v === "string")
@@ -1278,8 +1404,6 @@ function parseComposedIdeas(
       !topicLabel ||
       !proposedTitle ||
       !isLever(angle) ||
-      !Number.isFinite(sourceFormatId) ||
-      !knownFormatIds.has(sourceFormatId) ||
       sourceTopicOutlierIds.length === 0
     ) {
       continue;

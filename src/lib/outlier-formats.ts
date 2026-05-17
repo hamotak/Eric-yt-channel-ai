@@ -21,6 +21,11 @@ export type ExtractResult =
       formatsCreated: number;
       videosLinked: number;
       lastExtractedAt: number;
+      // T1 (soften pass): even on success we surface the survivor count so
+      // the UI can warn the user when the pool was thin ("only 2 formats
+      // passed validation — try syncing more competitors"). When the count
+      // is healthy (≥3) the page treats this as a normal success.
+      formatsPassed: number;
     }
   | { ok: false; status: number; error: string; retryAfterSec?: number };
 
@@ -204,10 +209,15 @@ export async function extractFormatsFromOutliers(
       "claude",
       `Format-extract ${channelId}: 0 templates survived dedup/validation. Raw: ${raw.slice(0, 200)}`
     );
+    // Soften-pass copy: tell the user exactly what happened (zero passed)
+    // and what to try (more competitors, broader sync window). The
+    // per-criterion drop counts are in the dev log line above for HAmo to
+    // audit if the data feels right but the result feels wrong.
     return {
       ok: false,
       status: 502,
-      error: "Extracted templates failed validation (grammar/dedup). Try again.",
+      error:
+        "Only 0 formats passed validation. Try syncing more competitors or widening the outlier window.",
     };
   }
 
@@ -232,10 +242,11 @@ export async function extractFormatsFromOutliers(
 
   for (const f of parsed) {
     const validIds = f.videoIds.filter((id) => knownIds.has(id));
-    // ≥3 raised from ≥2 to match the "proven" trending-formats threshold
-    // surfaced in the UI + chat tool. Anything thinner is "emerging",
-    // not proven, and shouldn't ship as a stored format row.
-    if (validIds.length < 3) continue;
+    // Defense-in-depth: validateAndDedupFormats already enforces the
+    // minimum (currently MIN_EXAMPLES_PER_FORMAT — softened to 2 in the
+    // soften pass). Skip anything below the floor in case a future
+    // refactor regresses the upstream filter.
+    if (validIds.length < MIN_EXAMPLES_PER_FORMAT) continue;
 
     const multipliers = validIds.map((id) => multByVideo.get(id) ?? 0);
     const avgMult =
@@ -298,6 +309,12 @@ export async function extractFormatsFromOutliers(
     formatsCreated,
     videosLinked,
     lastExtractedAt: now,
+    // Mirrors parsed.length — the count of templates that survived every
+    // validation gate (slot count, anchor fit, marker order, dedup,
+    // per-example mult, ≥N examples, avg mult, cross-channel, lexical
+    // overlap, cap). The UI surfaces a "thin pool" warning when this is
+    // 1 or 2, even though the upsert loop happily wrote them.
+    formatsPassed: parsed.length,
   };
 }
 
@@ -368,10 +385,18 @@ export function getFormatsForChannel(
  * Per-criterion drop counts logged so HAmo can see which gate fired.
  */
 const MAX_TRENDING_FORMATS = 8;
-const PER_EXAMPLE_MIN_MULTIPLIER = 3;
-const AVG_MULTIPLIER_MIN = 5;
+// Soften pass (T1 of follow-up PR): the prior cc7ef77 gates (≥3× per
+// example, ≥5× avg, ≤50% lexical overlap, ≥3 examples) were rejecting
+// nearly every candidate on HAmo's current 4-competitor pool. New
+// thresholds are still defensible — ≥2× per example matches the
+// MENTOR_METHOD §2 outlier floor, ≥3× avg keeps the "this is a trend,
+// not a one-off" guarantee, ≤60% overlap leaves room for two examples
+// that happen to share a few common nouns without being the same topic.
+const PER_EXAMPLE_MIN_MULTIPLIER = 2;
+const MIN_EXAMPLES_PER_FORMAT = 2;
+const AVG_MULTIPLIER_MIN = 3;
 const MIN_DISTINCT_COMPETITORS = 2;
-const MAX_CONTENT_OVERLAP = 0.5;
+const MAX_CONTENT_OVERLAP = 0.6;
 
 const VALIDATE_STOPWORDS = new Set([
   "the","a","an","and","or","but","if","of","in","on","for","to","with",
@@ -564,8 +589,13 @@ function validateAndDedupFormats(
     droppedByPerExampleMult += before - f.examples.length;
   }
 
-  // --- T1-ii: ≥3 surviving examples per template.
-  const afterMinSize = fitsByFormat.filter((f) => f.examples.length >= 3);
+  // --- min-examples gate. Soften pass dropped this from ≥3 to ≥2 so a
+  //     format with two cross-channel examples still ships (cross-channel
+  //     gate below carries the "is this a trend?" burden — the example
+  //     count just guards against literal-copy templates).
+  const afterMinSize = fitsByFormat.filter(
+    (f) => f.examples.length >= MIN_EXAMPLES_PER_FORMAT
+  );
   const droppedTooFew = fitsByFormat.length - afterMinSize.length;
 
   // --- T1-v: avg multiplier ≥5× across surviving examples.
@@ -619,7 +649,7 @@ function validateAndDedupFormats(
 
   log.info(
     "claude",
-    `Format-validate: raw=${parsed.length} → slot=${slotPassed.length} (F3 drop ${droppedF3}) → minSize=${afterMinSize.length} (per-example<3× drop ${droppedByPerExampleMult}, <3 examples drop ${droppedTooFew}) → avg≥5×=${afterAvg.length} (drop ${droppedByAvg}) → cross-channel=${afterCrossChannel.length} (drop ${droppedSingleChannel}) → overlap≤50%=${afterContentOverlap.length} (drop ${droppedByOverlap}) → cap${MAX_TRENDING_FORMATS}=${final.length} (drop ${droppedByCap}).`
+    `Format-validate: raw=${parsed.length} → slot=${slotPassed.length} (F3 drop ${droppedF3}) → minSize=${afterMinSize.length} (per-example<${PER_EXAMPLE_MIN_MULTIPLIER}× drop ${droppedByPerExampleMult}, <${MIN_EXAMPLES_PER_FORMAT} examples drop ${droppedTooFew}) → avg≥${AVG_MULTIPLIER_MIN}×=${afterAvg.length} (drop ${droppedByAvg}) → cross-channel=${afterCrossChannel.length} (drop ${droppedSingleChannel}) → overlap≤${MAX_CONTENT_OVERLAP * 100}%=${afterContentOverlap.length} (drop ${droppedByOverlap}) → cap${MAX_TRENDING_FORMATS}=${final.length} (drop ${droppedByCap}).`
   );
 
   return final.map((f) => ({

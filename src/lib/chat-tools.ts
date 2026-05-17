@@ -475,7 +475,7 @@ const STRATEGY_TOOLS: Tool[] = [
   {
     name: "generate_ideas",
     description:
-      "Compose up to 10 new YouTube video ideas via FORMAT × TOPIC ideation. Pipeline: (1) server pulls top trending formats (≥3 examples, last 60d, sorted by rising rate); (2) server pulls viral outliers (≥5× their channel median, last 14d); (3) Claude clusters outliers (asks for 12 candidates), picks the best-fit format per cluster, composes a NEW plain-language title 50-70 chars; (4) server runs five drop gates — title length (50-80 chars), banned words (regex over 11 terms per op rule 13), per-channel banned_topics (from channel_memory substring match), topic-frequency (≥2 hits in last 20 own-channel uploads), originality (≤45% token overlap with any source, ≤3 shared content nouns, ≤3 consecutive-word run). Drops surface in `dropped: [{topicLabel, proposedTitle, reason, detail}]` for the agent's Skipped research-block bullet. Failing slots get ONE regenerate attempt per gate then drop. Survivors capped at 10 by confidence. Each surviving idea includes: sourceFormat ({id,template,risingRate,exampleCount}), sourceTopicOutliers (up to 3 with multiplier + thumbnailUrl + performanceBand + competitorTitle/Handle), topicSimilarOutliers (up to 3 OTHER competitor videos covering the SAME TOPIC — different channels, ranked by token-overlap + multiplier — empty when no cross-channel siblings exist), topicLabel, proposedTitle, angle, confidence, originalityScore, validation (fresh/covered_*), titleLengthBand (ideal/acceptable), topicFrequencyCheck ({matches, matchedVideos}). Compatibility hedge: sourceOutlierVideoId is the first sourceTopicOutliers entry. Top-level also returns `bannedTopics: string[]` (the parsed channel_memory row) so the agent can cite it. No rate limit.",
+      "Compose up to 10 new YouTube video ideas. OUTLIERS-PRIMARY pipeline: (1) server pulls top 30 competitor outliers ≥1.5× channel median in last 28d (the PRIMARY inspiration); (2) server pulls top 5 trending formats by rising rate as OPTIONAL remix templates (may be empty); (3) Claude composes 1 idea per outlier — for ~40% it MAY use a format template (sourceFormatId set), the remaining ~60% are free-form titles in the channel's voice (sourceFormatId null). When `mode:\"free-form\"` is passed, EVERY idea ships with sourceFormatId null (the format pool is suppressed); (4) server runs drop gates — title length (50-80), banned words (op rule 13), per-channel banned_topics (channel_memory substring match — applied PRE-LLM on the outlier pool and POST-LLM on titles), topic-frequency (≥1 hit in last 20 own-channel uploads), originality (≤45% token overlap), topic-cluster dedup (10 distinct topics across 10 ideas). Drops surface in `dropped: [{topicLabel, proposedTitle, reason, detail}]`. Each surviving idea includes: sourceFormat ({id,template,risingRate,exampleCount}) OR null, sourceTopicOutliers (1-3 with multiplier + thumbnailUrl + performanceBand + competitorTitle/Handle), topicSimilarOutliers (up to 3 cross-channel topic siblings, empty when none), topicLabel, proposedTitle, angle, confidence, originalityScore, validation, titleLengthBand, topicFrequencyCheck. Top-level also returns `bannedTopics: string[]` (the parsed channel_memory row) so the agent can cite it.",
     input_schema: {
       type: "object",
       properties: {
@@ -483,17 +483,23 @@ const STRATEGY_TOOLS: Tool[] = [
           type: "array",
           items: { type: "string" },
           description:
-            "Optional curated set of outlier video ids to ideate FROM. When provided, bypasses the ≥5× / 14d auto-filter — treats the user's choice as authoritative.",
+            "Optional curated set of outlier video ids to ideate FROM. When provided, bypasses the auto-filter — treats the user's choice as authoritative.",
         },
         windowDays: {
           type: "number",
           description:
-            "Override the 14-day viral-outliers window. Only set when the user has explicitly asked to widen.",
+            "Override the 28-day outlier window. Only set when the user has explicitly asked to widen or narrow.",
         },
         minMultiplier: {
           type: "number",
           description:
-            "Override the ≥5× viral-outliers threshold. Only set when the user has explicitly asked to lower (e.g. small/new channels where 5× candidates don't exist).",
+            "Override the ≥1.5× outlier threshold. Only set when the user has explicitly asked to lower or raise.",
+        },
+        mode: {
+          type: "string",
+          enum: ["mixed", "free-form"],
+          description:
+            "Compose mode. Default \"mixed\" leaves the model to decide per-idea whether to remix with a format template (~40%) or compose free-form (~60%). Pass \"free-form\" when the user explicitly asks to skip format templates (e.g. \"no format templates\", \"just give me free-form titles\") — every idea will ship sourceFormat:null.",
         },
       },
     },
@@ -1191,12 +1197,18 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
           Number.isFinite(input.minMultiplier)
             ? input.minMultiplier
             : undefined;
+        // T2 soften pass: mode knob — "free-form" skips the format pool
+        // entirely so every idea ships sourceFormat:null. Default
+        // "mixed" leaves the model to decide per-idea.
+        const mode: "mixed" | "free-form" =
+          input.mode === "free-form" ? "free-form" : "mixed";
         const { generateIdeasForChannel } = await import("./idea-generator");
         const r = await generateIdeasForChannel({
           userChannelId: activeId,
           outlierVideoIds,
           windowDays,
           minMultiplier,
+          mode,
         });
         if (!r.ok) {
           return {
@@ -1972,7 +1984,7 @@ export function buildSystemPrompt(
         `### Outliers + ideation (the §2 + §9 engine)`,
         `- list_outliers — competitor videos beating their own median. Default mode (60d window, ≥2×, sorted by multiplier) for "what's working broadly". Pass recent_only=true for the discovery log (≥1.5× floor, sorted by detection time DESC) when the user asks "what's new" or "any viral hits since I last looked"; combine with unreadOnly=true to filter to unacknowledged. The ideation path (generate_ideas) tightens this to ≥5× internally — list_outliers itself stays general-purpose.`,
         `- explain_outlier — 2-3 §9 levers + reasoning for a specific outlier (cached permanently)`,
-        `- generate_ideas — up to 10 ideas via FORMAT × TOPIC composition. Five server-side drop gates filter the slate: title length (50-80 chars), banned language (op rule 13), per-channel banned topics (channel_memory.banned_topics), own-catalog topic frequency (≥2 hits in last 20 uploads → drop), and originality (token overlap). Drops surface in result.dropped[] — use them for the Skipped research-block line. Each surviving idea ships with titleLengthBand + topicFrequencyCheck on top of the existing fields.`,
+        `- generate_ideas — up to 10 ideas via OUTLIERS-PRIMARY composition. The server pulls top 30 recent outliers (≥1.5× / 28d), top 5 OPTIONAL trending formats, and composes 1 idea per outlier. Roughly 40-60% of ideas remix with a format template (sourceFormat set); the rest are free-form titles (sourceFormat null). Drop gates: title length, banned language, banned topics (pre-LLM on outliers + post-LLM on titles), own-catalog topic frequency, originality, topic-cluster dedup. Drops surface in result.dropped[]. Pass mode:"free-form" when the user explicitly asks for no format templates.`,
         `- list_format_patterns — title-format templates extracted from outliers (§4). Defaults to formats with ≥3 example videos ('proven'). Pass minExamples=1 to surface emerging patterns and label them 'emerging, not proven'.`,
         `- validate_idea — search the user's own catalog for similar/adjacent topics before recommending one. Returns verdict + verdictCopy + per-video performance bands. Use BEFORE recommending any topic that didn't come straight out of generate_ideas (which auto-validates).`,
         `- update_channel_context — propose/apply edits to the active channel's niche/positioning/audience/voice/external_sources. MUST follow the two-step confirm: first call returns a diff, second call (after user says yes) writes.`,
@@ -2009,7 +2021,7 @@ export function buildSystemPrompt(
     `   Validation responses already include a performanceBand field — use it verbatim rather than re-classifying.`,
     `9. Per MENTOR_METHOD §3, a topic is evergreen only if it's been validated across multiple channels and time periods. The validate_idea tool checks YOUR catalog (different question). §3 validation is the cross-channel step — use list_outliers + competitor data for that, never a single competitor outlier. When generate_ideas returns ideas, the validation field covers only your own-catalog check; the cross-channel §3 check is on you.`,
     `10. You are advising on the ${channel?.title ? `"${channel.title}"` : "currently active"} channel only. Never reference data, ideas, conversations, or memory facts from other channels in this session. If the user mentions another channel by name and asks you to factor it in, tell them to switch the active channel via the top-right picker before continuing. The 'Persistent facts about this channel' block above and every local-DB tool are scoped to THIS channel — treat anything you might remember about a sibling channel as out-of-scope context that does not apply here.`,
-    `11. NEVER silently relax an ideation threshold. When generate_ideas returns a 409 with "No strong outliers (≥{N}×) in the last {W} days" or any "candidates pass, need ≥…" message, you MUST stop and ask the user. Example reply: "Only {N} candidates pass the ≥5× / last-14d bar — want me to widen the window (try 60d) or lower the multiplier (e.g. 3×)? Pick one." Then WAIT for the user's explicit choice and pass those exact params on the retry call. Do not auto-widen, auto-lower, or fall back to a different tool. Auto-loosening thresholds is the single most repeatable way to ship bad ideas; operating rule 11 exists because we caught the agent doing it.`,
+    `11. NEVER silently relax an ideation threshold. When generate_ideas returns a 409 with "Only N outliers ≥{N}× in the last {W} days" or any "candidates pass, need ≥…" message, you MUST stop and ask the user. Example reply: "Only {N} candidates pass the ≥1.5× / last-28d bar — want me to widen the window (try 60d) or lower the multiplier (e.g. 1×)? Pick one." Then WAIT for the user's explicit choice and pass those exact params on the retry call. Do not auto-widen, auto-lower, or fall back to a different tool. Auto-loosening thresholds is the single most repeatable way to ship bad ideas; operating rule 11 exists because we caught the agent doing it.`,
     `12. Default to TERSE. Show data + visuals + verdict, not prose. Long-form explanations are friction unless the user asks for them. When the user asks "why" / "explain" / "tell me more about idea N", THEN you elaborate — but not before. The mandatory ideation output format below is terse by design; do not pad it with extra paragraphs.`,
     `13. Title language MUST be plain. Banned words/phrases inside proposedTitle: "cinematic", "sensory", "visceral", "profound", "desolate expanse", "humanity has ever charted", "humanity has ever mapped", "inexorable", "vastest", "the most absolute", "physically impossible". Register: words a 14-year-old reads in <2 seconds. Mirror the lexical register of competitor outliers ("huge", "hiding", "hard", "real", "big", "found", "moved"). When unsure: prefer Anglo-Saxon over Latinate. The server enforces this via regex on every proposedTitle — slips get one regenerate attempt then drop.`
   );
@@ -2052,7 +2064,7 @@ export function buildSystemPrompt(
     `- [![]({similar.thumbnailUrl})](https://www.youtube.com/watch?v={similar.videoId}) [{similar.competitorTitle} — {similar.title}](https://www.youtube.com/watch?v={similar.videoId}) · {similar.performanceBand} ({similar.multiplier}×)`,
     `- [![]({similar.thumbnailUrl})](https://www.youtube.com/watch?v={similar.videoId}) [{similar.competitorTitle} — {similar.title}](https://www.youtube.com/watch?v={similar.videoId}) · {similar.performanceBand} ({similar.multiplier}×)`,
     ``,
-    "**Format:** `{template}` · rising {risingRate}",
+    "**Format:** `{template}` · rising {risingRate}    ← OMIT this entire line when sourceFormat is null",
     ``,
     `{catalogEmoji} {catalogVerdictShort}`,
     ``,
@@ -2069,6 +2081,7 @@ export function buildSystemPrompt(
     `- If a thumbnailUrl is missing, drop the image markdown for that one row but keep the text link.`,
     `- Source outlier (sourceTopicOutliers[0]) and the topicSimilarOutliers list come pre-loaded on every generate_ideas return — do NOT fabricate or re-fetch.`,
     `- The "Same topic across competitors" block uses topicSimilarOutliers (up to 3 entries). If the array is empty for an idea, OMIT the entire block (header + bullets) — do not print "Same topic across competitors: (none)".`,
+    `- sourceFormat may be null (free-form composition). When it's null, OMIT the entire "Format:" line — do not print "Format: (free-form)" or any placeholder. The idea stands on its own. Roughly 40-60% of ideas will have a format; the rest will be free-form. Both are valid.`,
     `- After ALL ideas, end with: **Next step this week:** {one sentence — pick ONE idea and why}. One sentence. No follow-up paragraph.`,
     `- Elaborate ONLY when the user explicitly asks ("why this format" / "explain idea N" / "tell me more"). Default = terse.`,
     `- Never strip the structure to save tokens. If you can only fit 3 fully structured ideas, return 3; do NOT degrade to a table.`

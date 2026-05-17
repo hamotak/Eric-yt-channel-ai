@@ -5,7 +5,6 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowUp,
-  Check,
   ExternalLink,
   Eye,
   Flame,
@@ -339,7 +338,6 @@ function RecentTab({ scope }: { scope: string | "all" | null }) {
   const [sort, setSort] = useState<AlertSort>("outlier");
   const [windowKey, setWindowKey] = useState<AlertWindow>("all");
   const [minMult, setMinMult] = useState<number>(2);
-  const [openOutlier, setOpenOutlier] = useState<Outlier | null>(null);
   // T7: optimistic-hide state. videoId keys keep this aligned with the
   // POST body shape and the row's own identity column.
   const [pendingHideIds, setPendingHideIds] = useState<Set<string>>(
@@ -391,10 +389,6 @@ function RecentTab({ scope }: { scope: string | "all" | null }) {
     refresh();
   }, [refresh]);
 
-  const markRead = async (id: number) => {
-    await fetch(`/api/competitors/alerts/${id}/read`, { method: "POST" });
-    await refresh();
-  };
 
   // T7: optimistic hide. Replaced window.confirm with fade-out:
   //   1) mark videoId pending → row fades to opacity-0 (200ms)
@@ -582,18 +576,10 @@ function RecentTab({ scope }: { scope: string | "all" | null }) {
               tier={a.competitor_tier}
               isUnread={!a.read_at}
               pending={pendingHideIds.has(a.video_id)}
-              onMarkRead={() => markRead(a.id)}
-              onExplain={() => setOpenOutlier(alertToOutlier(a))}
               onHide={() => hideOutlier(a.video_id, a.competitor_id)}
             />
           ))}
         </ul>
-      )}
-      {openOutlier && (
-        <ExplainModal
-          outlier={openOutlier}
-          onClose={() => setOpenOutlier(null)}
-        />
       )}
     </>
   );
@@ -869,10 +855,11 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
  * (per-competitor detail, /chat result cards) can reuse the same shape.
  *
  * Optional knobs:
- *   - isUnread          → amber unread accent
- *   - onExplain         → click anywhere on the row opens the ExplainModal;
- *                          also renders a Sparkles affordance on the right
- *   - onMarkRead        → renders a Check button when isUnread
+ *   - isUnread          → amber unread accent (visual only — the
+ *                          mark-read button was removed in T3 of the
+ *                          soften-pass PR; the agent doesn't use the
+ *                          read state, so the affordance was pure
+ *                          visual debt)
  *   - onHide            → renders an XCircle button; click suppresses the
  *                          row from every outlier surface for this channel
  *   - durationSeconds   → small overlay on the thumbnail
@@ -895,8 +882,6 @@ type OutlierRowProps = {
   // user clicks X; the row fades to 0 opacity over 200ms before the
   // parent removes it from the list entirely.
   pending?: boolean;
-  onExplain?: () => void;
-  onMarkRead?: () => void;
   onHide?: () => void;
 };
 
@@ -906,16 +891,13 @@ function OutlierRow(props: OutlierRowProps) {
   // (competitor_videos row deleted but alert remains).
   const uploadTs = props.publishedAt ?? props.detectedAt ?? null;
   const uploadLabel = props.publishedAt !== null ? "uploaded" : "detected";
-  const clickable = !!props.onExplain;
   return (
     <li
-      onClick={clickable && !props.pending ? props.onExplain : undefined}
       className={cn(
         "group flex flex-wrap items-start gap-3 rounded-md border p-3 transition-all duration-200",
         props.isUnread
           ? "border-amber-500/40 bg-amber-500/5"
           : "border-border bg-background",
-        clickable && !props.pending && "cursor-pointer hover:bg-accent/40",
         props.pending && "pointer-events-none opacity-0"
       )}
     >
@@ -982,34 +964,6 @@ function OutlierRow(props: OutlierRowProps) {
           )}
         </div>
       </div>
-      {clickable && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onExplain?.();
-          }}
-          className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-          aria-label="Explain why this worked"
-          title="Explain why this worked"
-        >
-          <Sparkles className="h-3.5 w-3.5" />
-        </button>
-      )}
-      {props.isUnread && props.onMarkRead && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onMarkRead?.();
-          }}
-          className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-          aria-label="Mark read"
-          title="Mark read"
-        >
-          <Check className="h-3.5 w-3.5" />
-        </button>
-      )}
       {props.onHide && (
         <button
           type="button"
@@ -1235,6 +1189,7 @@ function PatternsTab({ scope }: { scope: string | "all" | null }) {
       const d = (await r.json()) as {
         formatsCreated?: number;
         videosLinked?: number;
+        formatsPassed?: number;
         error?: string;
         retryAfterSec?: number;
       };
@@ -1246,9 +1201,20 @@ function PatternsTab({ scope }: { scope: string | "all" | null }) {
         );
         return;
       }
-      setExtractStatus(
-        `Extracted ${d.formatsCreated} formats covering ${d.videosLinked} videos.`
-      );
+      // T1 soften: extraction is now best-effort — even 1-2 survivors
+      // ship instead of erroring out. When the pool is thin, surface a
+      // warning copy alongside the success count so HAmo knows to sync
+      // more competitors.
+      const passed = d.formatsPassed ?? d.formatsCreated ?? 0;
+      if (passed <= 2) {
+        setExtractStatus(
+          `Only ${passed} format${passed === 1 ? "" : "s"} passed validation, covering ${d.videosLinked ?? 0} videos. Try syncing more competitors or widening the outlier window for richer patterns.`
+        );
+      } else {
+        setExtractStatus(
+          `Extracted ${d.formatsCreated} formats covering ${d.videosLinked} videos.`
+        );
+      }
       await load();
     } catch (e) {
       setExtractError(e instanceof Error ? e.message : "Network error.");

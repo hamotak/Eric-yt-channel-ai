@@ -40,5 +40,6 @@ export async function POST(req: Request) {
     formatsCreated: result.formatsCreated,
     videosLinked: result.videosLinked,
     lastExtractedAt: result.lastExtractedAt,
+    formatsPassed: result.formatsPassed,
   });
 }
