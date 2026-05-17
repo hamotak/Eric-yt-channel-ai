@@ -2832,6 +2832,51 @@ try {
   console.warn("[db] competitors user-channel indexes failed (ignored):", err);
 }
 
+// Async-sync columns: rows queued by POST /api/competitors are picked up
+// later by the worker route. DEFAULT 'synced' (not 'queued') is critical —
+// pre-existing rows must NOT flip into the queue on first boot of the new
+// schema, otherwise every add migration would re-sync the entire catalogue.
+// similarity_score is the AI-scored 0–100 niche/audience match from §1.
+{
+  const competitorsCols = (
+    db.prepare(`PRAGMA table_info(competitors)`).all() as { name: string }[]
+  ).map((c) => c.name);
+  const newColumns: { name: string; sql: string }[] = [
+    {
+      name: "sync_status",
+      sql: `ALTER TABLE competitors ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'synced'`,
+    },
+    { name: "sync_error", sql: `ALTER TABLE competitors ADD COLUMN sync_error TEXT` },
+    {
+      name: "similarity_score",
+      sql: `ALTER TABLE competitors ADD COLUMN similarity_score INTEGER`,
+    },
+  ];
+  for (const col of newColumns) {
+    if (!competitorsCols.includes(col.name)) {
+      try {
+        db.exec(col.sql);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`[db] adding competitors.${col.name} failed:`, err);
+      }
+    }
+  }
+  // Status partial index — speeds up the worker's "next queued row" scan.
+  try {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_competitors_sync_status
+        ON competitors(sync_status)
+        WHERE sync_status IN ('queued', 'syncing', 'failed');
+    `);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[db] competitors sync_status index failed:", err);
+  }
+}
+
+export type CompetitorSyncStatus = "queued" | "syncing" | "synced" | "failed";
+
 export type Competitor = {
   id: number;
   channel_id: string | null;
@@ -2845,6 +2890,9 @@ export type Competitor = {
   user_channel_id: string | null;
   tier: CompetitorTier;
   tier_set_at: number | null;
+  sync_status: CompetitorSyncStatus;
+  sync_error: string | null;
+  similarity_score: number | null;
 };
 
 export const COMPETITOR_TIERS = ["authority", "breakthrough", "adjacent", "far"] as const;
@@ -2967,11 +3015,14 @@ export function addCompetitor(input: {
   user_channel_id: string;
   tier: CompetitorTier;
 }): number {
+  // sync_status='queued' so the worker picks the row up on its next pass.
+  // The schema's DEFAULT is 'synced' (so existing rows don't flip) — but
+  // for fresh inserts we always want them queued, so we set explicitly.
   const info = db
     .prepare(
       `INSERT INTO competitors
-         (handle, channel_id, title, user_channel_id, tier, tier_set_at)
-       VALUES (?, ?, ?, ?, ?, strftime('%s','now'))`
+         (handle, channel_id, title, user_channel_id, tier, tier_set_at, sync_status)
+       VALUES (?, ?, ?, ?, ?, strftime('%s','now'), 'queued')`
     )
     .run(
       input.handle ?? null,
@@ -2981,6 +3032,78 @@ export function addCompetitor(input: {
       input.tier
     );
   return Number(info.lastInsertRowid);
+}
+
+/**
+ * Atomically transition the oldest queued competitor to 'syncing' and
+ * return it. Used by POST /api/competitors/sync-queued. Returns null
+ * when the queue is empty.
+ *
+ * The UPDATE … WHERE id = (SELECT MIN(id) …) form is atomic under WAL
+ * mode; better-sqlite3 also serialises writes per process so two parallel
+ * worker invocations can't both claim the same row.
+ */
+export function claimNextQueuedCompetitor(): Competitor | null {
+  const row = db
+    .prepare(
+      `UPDATE competitors
+       SET sync_status = 'syncing', sync_error = NULL
+       WHERE id = (
+         SELECT id FROM competitors
+         WHERE sync_status = 'queued'
+         ORDER BY added_at ASC, id ASC
+         LIMIT 1
+       )
+       RETURNING *`
+    )
+    .get() as Competitor | undefined;
+  return row ?? null;
+}
+
+export function markCompetitorSyncFailed(id: number, error: string): void {
+  db.prepare(
+    `UPDATE competitors SET sync_status = 'failed', sync_error = ? WHERE id = ?`
+  ).run(error.slice(0, 500), id);
+}
+
+export function markCompetitorSyncDone(id: number): void {
+  db.prepare(
+    `UPDATE competitors SET sync_status = 'synced', sync_error = NULL WHERE id = ?`
+  ).run(id);
+}
+
+/**
+ * Re-queue a single competitor (Retry button on a failed card, or "Sync
+ * now" on a synced one). The worker picks it up on the next /sync-queued
+ * tick.
+ */
+export function requeueCompetitor(id: number): void {
+  db.prepare(
+    `UPDATE competitors SET sync_status = 'queued', sync_error = NULL WHERE id = ?`
+  ).run(id);
+}
+
+export function setCompetitorSimilarityScore(id: number, score: number): void {
+  db.prepare(
+    `UPDATE competitors SET similarity_score = ? WHERE id = ?`
+  ).run(Math.max(0, Math.min(100, Math.round(score))), id);
+}
+
+/**
+ * Counts of (queued + syncing) for the active scope. The client polls
+ * /api/competitors and stops polling when this is 0.
+ */
+export function countCompetitorsInFlight(userChannelId: string | null): number {
+  const sql =
+    userChannelId === null
+      ? `SELECT COUNT(*) AS n FROM competitors WHERE sync_status IN ('queued','syncing')`
+      : `SELECT COUNT(*) AS n FROM competitors
+         WHERE sync_status IN ('queued','syncing') AND user_channel_id = ?`;
+  const stmt = db.prepare(sql);
+  const row = (userChannelId === null
+    ? stmt.get()
+    : stmt.get(userChannelId)) as { n: number };
+  return row.n;
 }
 
 /**
@@ -3098,6 +3221,11 @@ export type CompetitorMetrics = {
   medianViews30d: number | null;
   lastUploadAt: number | null;
   recentVideoViews: number[];
+  // Total views in each window, for the per-card 7/28/90 toggle. Computed
+  // server-side from one SQL pass — saves shipping per-video timestamps.
+  views7d: number;
+  views28d: number;
+  views90d: number;
 };
 
 export function competitorMetricsByCompetitor(
@@ -3143,18 +3271,31 @@ export function competitorMetricsByCompetitor(
          SELECT competitor_id, JSON_GROUP_ARRAY(views) AS recent_views_json
          FROM recent_videos WHERE rn <= 10
          GROUP BY competitor_id
+       ),
+       views_by_window AS (
+         SELECT
+           v.competitor_id,
+           SUM(CASE WHEN v.published_at > strftime('%s','now') -  7 * 86400 THEN v.views ELSE 0 END) AS views_7d,
+           SUM(CASE WHEN v.published_at > strftime('%s','now') - 28 * 86400 THEN v.views ELSE 0 END) AS views_28d,
+           SUM(CASE WHEN v.published_at > strftime('%s','now') - 90 * 86400 THEN v.views ELSE 0 END) AS views_90d
+         FROM competitor_videos v
+         GROUP BY v.competitor_id
        )
        SELECT
          c.id                                  AS competitor_id,
          COALESCE(o.n_outliers, 0)             AS outliers30d,
          CAST(m.median_views AS INTEGER)       AS medianViews30d,
          l.last_upload_at                      AS lastUploadAt,
-         COALESCE(r.recent_views_json, '[]')   AS recentVideoViewsJson
+         COALESCE(r.recent_views_json, '[]')   AS recentVideoViewsJson,
+         COALESCE(w.views_7d, 0)               AS views7d,
+         COALESCE(w.views_28d, 0)              AS views28d,
+         COALESCE(w.views_90d, 0)              AS views90d
        FROM competitors c
        LEFT JOIN qualified_medians         m ON m.competitor_id = c.id
        LEFT JOIN outlier_30d_count         o ON o.competitor_id = c.id
        LEFT JOIN last_upload_by_competitor l ON l.competitor_id = c.id
        LEFT JOIN recent_views_by_competitor r ON r.competitor_id = c.id
+       LEFT JOIN views_by_window           w ON w.competitor_id = c.id
        WHERE (? IS NULL OR c.user_channel_id = ?)`
     )
     .all(scope, scope, scope, scope) as {
@@ -3163,6 +3304,9 @@ export function competitorMetricsByCompetitor(
     medianViews30d: number | null;
     lastUploadAt: number | null;
     recentVideoViewsJson: string;
+    views7d: number;
+    views28d: number;
+    views90d: number;
   }[];
 
   const map = new Map<number, CompetitorMetrics>();
@@ -3179,6 +3323,9 @@ export function competitorMetricsByCompetitor(
       medianViews30d: row.medianViews30d,
       lastUploadAt: row.lastUploadAt,
       recentVideoViews: recent,
+      views7d: row.views7d,
+      views28d: row.views28d,
+      views90d: row.views90d,
     });
   }
   return map;
@@ -3223,19 +3370,38 @@ export function competitorMetricsForOne(
        last_upload AS (
          SELECT MAX(published_at) AS last_upload_at
          FROM competitor_videos WHERE competitor_id = ?
+       ),
+       views_windows AS (
+         SELECT
+           SUM(CASE WHEN published_at > strftime('%s','now') -  7 * 86400 THEN views ELSE 0 END) AS views_7d,
+           SUM(CASE WHEN published_at > strftime('%s','now') - 28 * 86400 THEN views ELSE 0 END) AS views_28d,
+           SUM(CASE WHEN published_at > strftime('%s','now') - 90 * 86400 THEN views ELSE 0 END) AS views_90d
+         FROM competitor_videos WHERE competitor_id = ?
        )
        SELECT
          COALESCE((SELECT n_outliers FROM outliers_count), 0)                AS outliers30d,
          (SELECT CAST(median_views AS INTEGER) FROM qualified_median)        AS medianViews30d,
          (SELECT last_upload_at FROM last_upload)                            AS lastUploadAt,
-         COALESCE((SELECT recent_views_json FROM recent_views), '[]')        AS recentVideoViewsJson`
+         COALESCE((SELECT recent_views_json FROM recent_views), '[]')        AS recentVideoViewsJson,
+         COALESCE((SELECT views_7d  FROM views_windows), 0)                  AS views7d,
+         COALESCE((SELECT views_28d FROM views_windows), 0)                  AS views28d,
+         COALESCE((SELECT views_90d FROM views_windows), 0)                  AS views90d`
     )
-    .get(competitorId, competitorId, competitorId, competitorId) as
+    .get(
+      competitorId,
+      competitorId,
+      competitorId,
+      competitorId,
+      competitorId
+    ) as
     | {
         outliers30d: number;
         medianViews30d: number | null;
         lastUploadAt: number | null;
         recentVideoViewsJson: string;
+        views7d: number;
+        views28d: number;
+        views90d: number;
       }
     | undefined;
   if (!row) {
@@ -3244,6 +3410,9 @@ export function competitorMetricsForOne(
       medianViews30d: null,
       lastUploadAt: null,
       recentVideoViews: [],
+      views7d: 0,
+      views28d: 0,
+      views90d: 0,
     };
   }
   let recent: number[] = [];
@@ -3258,6 +3427,9 @@ export function competitorMetricsForOne(
     medianViews30d: row.medianViews30d,
     lastUploadAt: row.lastUploadAt,
     recentVideoViews: recent,
+    views7d: row.views7d,
+    views28d: row.views28d,
+    views90d: row.views90d,
   };
 }
 
@@ -3976,6 +4148,7 @@ export function outliersForUserChannel(opts: {
   minMultiplier: number;         // >= 1
   tiers: readonly string[];      // subset of ["authority","breakthrough","adjacent","far"]
   limit?: number;
+  competitorId?: number | null;  // null/undefined = no filter; number = single-competitor scope (used by /competitors/[id])
 }): {
   outliers: OutlierRow[];
   totalScanned: number;
@@ -3990,6 +4163,7 @@ export function outliersForUserChannel(opts: {
   }
 
   const scope = opts.userChannelId; // null | string
+  const compScope = opts.competitorId ?? null; // null | number — extra single-competitor narrow.
 
   const outliers = db
     .prepare(
@@ -4010,6 +4184,7 @@ export function outliersForUserChannel(opts: {
          WHERE cv.published_at >= strftime('%s','now') - ? * 86400
            AND (? IS NULL OR c.user_channel_id = ?)
            AND c.tier IN (?, ?, ?, ?)
+           AND (? IS NULL OR c.id = ?)
        ),
        qualified_medians AS (
          SELECT competitor_id, AVG(views) AS median_views
@@ -4039,6 +4214,8 @@ export function outliersForUserChannel(opts: {
       tierSlots[1],
       tierSlots[2],
       tierSlots[3],
+      compScope,
+      compScope,
       opts.minMultiplier,
       limit
     ) as Array<{
@@ -4065,7 +4242,8 @@ export function outliersForUserChannel(opts: {
          JOIN competitors c ON c.id = cv.competitor_id
          WHERE cv.published_at >= strftime('%s','now') - ? * 86400
            AND (? IS NULL OR c.user_channel_id = ?)
-           AND c.tier IN (?, ?, ?, ?)`
+           AND c.tier IN (?, ?, ?, ?)
+           AND (? IS NULL OR c.id = ?)`
       )
       .get(
         opts.windowDays,
@@ -4074,7 +4252,9 @@ export function outliersForUserChannel(opts: {
         tierSlots[0],
         tierSlots[1],
         tierSlots[2],
-        tierSlots[3]
+        tierSlots[3],
+        compScope,
+        compScope
       ) as { n: number }
   ).n;
 
@@ -4084,11 +4264,19 @@ export function outliersForUserChannel(opts: {
         `SELECT COUNT(DISTINCT id) AS n
          FROM competitors
          WHERE (? IS NULL OR user_channel_id = ?)
-           AND tier IN (?, ?, ?, ?)`
+           AND tier IN (?, ?, ?, ?)
+           AND (? IS NULL OR id = ?)`
       )
-      .get(scope, scope, tierSlots[0], tierSlots[1], tierSlots[2], tierSlots[3]) as {
-      n: number;
-    }
+      .get(
+        scope,
+        scope,
+        tierSlots[0],
+        tierSlots[1],
+        tierSlots[2],
+        tierSlots[3],
+        compScope,
+        compScope
+      ) as { n: number }
   ).n;
 
   return {

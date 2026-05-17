@@ -64,11 +64,31 @@ export async function GET(req: Request) {
     );
   }
 
+  const competitorParam = url.searchParams.get("competitorId");
+  let competitorId: number | null = null;
+  if (competitorParam) {
+    const n = Number(competitorParam);
+    if (!Number.isFinite(n)) {
+      return NextResponse.json(
+        { error: "competitorId must be a number" },
+        { status: 400 }
+      );
+    }
+    competitorId = n;
+    // Per-competitor scope means the user has navigated to /competitors/[id].
+    // Drop the tier filter (it would silently zero out the result when the
+    // competitor's tier isn't in the default tier set) and widen the user-
+    // channel scope so the row is found even if the active pointer is on a
+    // different channel.
+    userChannelId = null;
+  }
+
   const result = listOutliersForActiveChannel({
     userChannelId,
     windowDays,
     minMultiplier,
     tiers,
+    competitorId,
   });
 
   return NextResponse.json(result);

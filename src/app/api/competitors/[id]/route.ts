@@ -48,10 +48,16 @@ export async function GET(
       userChannelId: competitor.user_channel_id,
       tier: competitor.tier,
       tierSetAt: competitor.tier_set_at,
+      syncStatus: competitor.sync_status,
+      syncError: competitor.sync_error,
+      similarityScore: competitor.similarity_score,
       outliers30d: metrics.outliers30d,
       medianViews30d: metrics.medianViews30d,
       lastUploadAt: metrics.lastUploadAt,
       recentVideoViews: metrics.recentVideoViews,
+      views7d: metrics.views7d,
+      views28d: metrics.views28d,
+      views90d: metrics.views90d,
     },
     videos,
   });
@@ -165,6 +171,9 @@ export async function PATCH(
       userChannelId: updated.user_channel_id,
       tier: updated.tier,
       tierSetAt: updated.tier_set_at,
+      syncStatus: updated.sync_status,
+      syncError: updated.sync_error,
+      similarityScore: updated.similarity_score,
     },
   });
 }

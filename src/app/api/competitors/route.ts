@@ -3,11 +3,11 @@ import {
   addCompetitor,
   COMPETITOR_TIERS,
   Competitor,
-  CompetitorListKpis,
   CompetitorMetrics,
   competitorListKpis,
   competitorMetricsByCompetitor,
   CompetitorTier,
+  countCompetitorsInFlight,
   countUnassignedCompetitors,
   getActiveChannelId,
   getCompetitorByUserChannelAndHandle,
@@ -17,16 +17,10 @@ import {
   listCompetitors,
   unreadCompetitorAlertCount,
 } from "@/lib/db";
-import {
-  CompetitorSyncError,
-  enrichCompetitorMetadataFromYouTube,
-  normaliseChannelUrl,
-  syncCompetitor,
-} from "@/lib/competitor-sync";
-import { log } from "@/lib/logger";
+import { normaliseChannelUrl } from "@/lib/competitor-sync";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+export const maxDuration = 60;
 
 /**
  * GET /api/competitors
@@ -34,11 +28,12 @@ export const maxDuration = 300;
  *   - ?userChannelId=X  → only competitors owned by user channel X
  *   - ?userChannelId=unassigned → only rows with user_channel_id IS NULL
  *
- * The response also carries:
+ * Response also carries:
  *   - unreadAlerts:    unread alert count scoped to the active user channel
- *                      (the sidebar badge polls this endpoint without args)
- *   - unassignedCount: total NULL-user_channel_id rows — drives the yellow
- *                      migration banner on the page.
+ *   - unassignedCount: total NULL-user_channel_id rows — drives the migration banner
+ *   - kpis:            top-strip aggregates (competitors, lastSync)
+ *   - inFlight:        number of (queued + syncing) rows in the active scope
+ *                      — the client uses this to decide whether to keep polling
  */
 export async function GET(req: Request) {
   const url = new URL(req.url);
@@ -48,42 +43,35 @@ export async function GET(req: Request) {
   else if (typeof param === "string" && param.length > 0) scope = param;
 
   const competitors = listCompetitors(scope);
-
-  // The sidebar badge polls this endpoint with no params — it expects
-  // `unreadAlerts` to mean "the active channel's unread count" rather
-  // than a global total (which would tick up for competitors that don't
-  // belong to whichever channel is currently focused).
   const activeId = getActiveChannelId();
-
-  // Per-row metrics + top-strip aggregates. Both helpers run a single SQL
-  // query each — no N+1. Metrics are scoped to whichever user channel
-  // we're rendering for (or "all" when no scope param was passed, used
-  // by the migration view to render every row).
   const metricsScope =
     scope === "unassigned" ? null : (scope ?? activeId ?? null);
   const metricsMap = competitorMetricsByCompetitor(metricsScope);
   const kpis = competitorListKpis(activeId);
+  const inFlight = countCompetitorsInFlight(metricsScope);
 
   return NextResponse.json({
-    competitors: competitors.map((c) =>
-      toWire(c, metricsMap.get(c.id))
-    ),
+    competitors: competitors.map((c) => toWire(c, metricsMap.get(c.id))),
     unreadAlerts: unreadCompetitorAlertCount(activeId),
     unassignedCount: countUnassignedCompetitors(),
     kpis,
+    inFlight,
   });
 }
 
 /**
  * POST /api/competitors
  *
- * Body: { identifier: string, userChannelId: string, tier: CompetitorTier }
+ * Body: { identifier, userChannelId, tier }
  *
- * Adds a competitor under a specific user channel. Both userChannelId and
- * tier are required. Dedup is per (userChannelId, channelId) and also per
- * (userChannelId, handle) so the post-sync UPDATE doesn't race the partial
- * unique index when only an @handle was supplied. Runs the first sync
- * inline so the UI sees populated data on the redirect that follows.
+ * Async flow:
+ *   1. Validate input + dedup (same as before).
+ *   2. INSERT the row with sync_status='queued' (addCompetitor default).
+ *   3. Fire-and-forget a POST to /api/competitors/sync-queued — the worker
+ *      picks up the queued row (sequentially, lock-guarded) and drains
+ *      the queue.
+ *   4. Return 202 immediately so the client can stop showing the spinner
+ *      and start polling GET /api/competitors instead.
  */
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as {
@@ -108,15 +96,10 @@ export async function POST(req: Request) {
   }
   if (!isCompetitorTier(tier)) {
     return NextResponse.json(
-      {
-        error: `tier must be one of: ${COMPETITOR_TIERS.join(", ")}`,
-      },
+      { error: `tier must be one of: ${COMPETITOR_TIERS.join(", ")}` },
       { status: 400 }
     );
   }
-  // Validate that the user channel actually exists. Hand-rolled because
-  // there's no `channelExists` helper; getChannel() requires the active
-  // pointer to be set so we use listAllChannels() instead.
   const allChannels = listAllChannels();
   if (!allChannels.some((c) => c.id === userChannelId)) {
     return NextResponse.json(
@@ -139,8 +122,7 @@ export async function POST(req: Request) {
   const handleMatch = normalised.match(/@([A-Za-z0-9_.-]+)/);
   const handle = handleMatch ? `@${handleMatch[1]}` : normalised;
 
-  // 409 guards before insert — pair-scoped on both UC-id and handle so
-  // we catch the duplicate before the partial unique index would.
+  // Pair-scoped dedup guards (same as before — must run before the INSERT).
   if (ucMatch) {
     const existing = getCompetitorByUserChannelAndYouTubeId(
       userChannelId,
@@ -160,7 +142,6 @@ export async function POST(req: Request) {
       { status: 409 }
     );
   }
-
   const id = addCompetitor({
     handle,
     channel_id: ucMatch ? ucMatch[1] : null,
@@ -168,28 +149,30 @@ export async function POST(req: Request) {
     tier: tier as CompetitorTier,
   });
 
-  let syncResult: { videosInserted?: number; newAlerts?: number } | null = null;
-  let syncError: string | undefined;
-  try {
-    syncResult = await syncCompetitor(id);
-  } catch (err) {
-    syncError =
-      err instanceof CompetitorSyncError || err instanceof Error
-        ? err.message
-        : "sync failed";
-    log.error("competitors", `Initial sync failed for ${id}: ${syncError}`, err);
-  }
+  // Fire-and-forget kick to the worker. We do NOT await — the response
+  // returns 202 immediately. The worker self-locks via settings flag, so
+  // duplicate kicks are safe; an offline worker just means the row sits
+  // queued until the next /sync-queued POST (which the client also issues
+  // when the page mounts with queued rows).
+  void kickWorker(req).catch((err) => {
+    // eslint-disable-next-line no-console
+    console.warn("[competitors] worker kick failed (non-fatal):", err);
+  });
 
-  // YT Data API enrichment (canonical title / subs / videoCount / avatar).
-  // Runs whether Apify succeeded or failed — when Apify failed and the row
-  // is still channel_id=null (handle entered without UC resolution), the
-  // helper short-circuits gracefully and we just keep the syncError state.
-  await enrichCompetitorMetadataFromYouTube(id);
+  return NextResponse.json(
+    { ok: true, id, queued: true },
+    { status: 202 }
+  );
+}
 
-  if (syncError) {
-    return NextResponse.json({ ok: true, id, syncError }, { status: 201 });
-  }
-  return NextResponse.json({ ok: true, id, ...(syncResult ?? {}) });
+async function kickWorker(req: Request): Promise<void> {
+  const origin = new URL(req.url).origin;
+  await fetch(`${origin}/api/competitors/sync-queued`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+    cache: "no-store",
+  });
 }
 
 function toWire(c: Competitor, metrics?: CompetitorMetrics) {
@@ -206,12 +189,16 @@ function toWire(c: Competitor, metrics?: CompetitorMetrics) {
     userChannelId: c.user_channel_id,
     tier: c.tier,
     tierSetAt: c.tier_set_at,
-    // New Phase B fields. Default to sane zero/null/empty when the metrics
-    // map has no row for this competitor (shouldn't normally happen — the
-    // SQL LEFT JOINs every competitor in scope — but defensive).
+    syncStatus: c.sync_status,
+    syncError: c.sync_error,
+    similarityScore: c.similarity_score,
     outliers30d: metrics?.outliers30d ?? 0,
     medianViews30d: metrics?.medianViews30d ?? null,
     lastUploadAt: metrics?.lastUploadAt ?? null,
     recentVideoViews: metrics?.recentVideoViews ?? [],
+    views7d: metrics?.views7d ?? 0,
+    views28d: metrics?.views28d ?? 0,
+    views90d: metrics?.views90d ?? 0,
   };
 }
+

@@ -27,6 +27,7 @@ export type ListOutliersOptions = {
   minMultiplier?: number;
   tiers?: readonly string[];
   limit?: number;
+  competitorId?: number | null; // narrow to a single competitor — used by /competitors/[id]
 };
 
 export function listOutliersForActiveChannel(
@@ -43,5 +44,6 @@ export function listOutliersForActiveChannel(
     minMultiplier: opts.minMultiplier ?? 3,
     tiers: opts.tiers ?? [...COMPETITOR_TIERS],
     limit: opts.limit ?? 50,
+    competitorId: opts.competitorId ?? null,
   });
 }

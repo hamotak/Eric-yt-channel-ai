@@ -1,32 +1,27 @@
 import { NextResponse } from "next/server";
-import { getActiveChannelId, listCompetitors } from "@/lib/db";
 import {
-  enrichCompetitorMetadataFromYouTube,
-  syncCompetitor,
-} from "@/lib/competitor-sync";
-import { log } from "@/lib/logger";
+  getActiveChannelId,
+  listCompetitors,
+  requeueCompetitor,
+} from "@/lib/db";
 
 export const runtime = "nodejs";
-// Up to 10 competitors × ~30s each. 600s ceiling on Railway, so we keep
-// some slack for Apify queueing if multiple sync requests stack up.
-export const maxDuration = 300;
+export const maxDuration = 30;
 
 /**
  * POST /api/competitors/sync-all
  * Body: { userChannelId?: string, allChannels?: boolean }
  *
- * Default behaviour: sync every competitor under the active user channel
- * (or the user channel named in `userChannelId`). The legacy global
- * "sync every competitor regardless of channel" path is preserved behind
- * an explicit `allChannels: true` opt-in for cases like a one-off refresh
- * after import.
+ * Re-queues every competitor in scope (sets sync_status='queued') and
+ * kicks the /sync-queued worker. Returns 202 immediately — the worker
+ * drains the queue serially and the page polls GET /api/competitors
+ * for progress.
  *
- * Serialised rather than parallelised because Apify rate-limits per actor.
+ * This used to do inline serial sync per competitor; the async model
+ * lets the user navigate away during a long bulk sync.
  */
 export async function POST(req: Request) {
-  const body = (await req
-    .json()
-    .catch(() => ({}))) as {
+  const body = (await req.json().catch(() => ({}))) as {
     userChannelId?: unknown;
     allChannels?: unknown;
   };
@@ -39,36 +34,20 @@ export async function POST(req: Request) {
           : (getActiveChannelId() ?? undefined)
       );
 
-  const results: Array<{
-    id: number;
-    ok: boolean;
-    videosInserted?: number;
-    newAlerts?: number;
-    error?: string;
-  }> = [];
-
   for (const c of competitors) {
-    // YT enrichment first (1 quota unit), serial across competitors so we
-    // don't burst the YT API. Non-fatal — the helper handles its own errors.
-    await enrichCompetitorMetadataFromYouTube(c.id);
-    try {
-      const r = await syncCompetitor(c.id);
-      results.push({
-        id: c.id,
-        ok: true,
-        videosInserted: r.videosInserted,
-        newAlerts: r.newAlerts,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "sync failed";
-      log.warn("competitors", `Bulk sync skipped ${c.id}: ${msg}`);
-      results.push({ id: c.id, ok: false, error: msg });
-    }
+    requeueCompetitor(c.id);
   }
 
-  return NextResponse.json({
-    total: competitors.length,
-    succeeded: results.filter((r) => r.ok).length,
-    results,
-  });
+  const origin = new URL(req.url).origin;
+  void fetch(`${origin}/api/competitors/sync-queued`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+    cache: "no-store",
+  }).catch(() => {});
+
+  return NextResponse.json(
+    { ok: true, queued: competitors.length },
+    { status: 202 }
+  );
 }

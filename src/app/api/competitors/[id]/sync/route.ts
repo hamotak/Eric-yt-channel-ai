@@ -1,15 +1,19 @@
 import { NextResponse } from "next/server";
-import {
-  CompetitorSyncError,
-  enrichCompetitorMetadataFromYouTube,
-  syncCompetitor,
-} from "@/lib/competitor-sync";
+import { getCompetitor, requeueCompetitor } from "@/lib/db";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+export const maxDuration = 10;
 
+/**
+ * POST /api/competitors/[id]/sync — re-queue ONE competitor and kick the
+ * worker. Replaces the legacy inline-sync behaviour; the queued model
+ * is now the single execution path so a manual "Retry" on a failed card
+ * runs through the same lock as the initial-add flow.
+ *
+ * Returns 202 immediately; the page polls GET /api/competitors for state.
+ */
 export async function POST(
-  _req: Request,
+  req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
@@ -17,21 +21,23 @@ export async function POST(
   if (!Number.isFinite(competitorId)) {
     return NextResponse.json({ error: "invalid id" }, { status: 400 });
   }
-  // YT enrichment FIRST (per the spec). Cheap (1 quota unit) and non-fatal —
-  // its result is returned alongside the Apify sync so the UI can show
-  // which subsystem worked / failed.
-  const enrich = await enrichCompetitorMetadataFromYouTube(competitorId);
-  try {
-    const result = await syncCompetitor(competitorId);
-    return NextResponse.json({ ok: true, enrich, ...result });
-  } catch (err) {
-    const status = err instanceof CompetitorSyncError ? 400 : 500;
-    return NextResponse.json(
-      {
-        error: err instanceof Error ? err.message : "sync failed",
-        enrich,
-      },
-      { status }
-    );
+  const competitor = getCompetitor(competitorId);
+  if (!competitor) {
+    return NextResponse.json({ error: "not found" }, { status: 404 });
   }
+
+  requeueCompetitor(competitorId);
+
+  const origin = new URL(req.url).origin;
+  void fetch(`${origin}/api/competitors/sync-queued`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+    cache: "no-store",
+  }).catch(() => {});
+
+  return NextResponse.json(
+    { ok: true, id: competitorId, queued: true },
+    { status: 202 }
+  );
 }
