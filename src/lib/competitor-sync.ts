@@ -13,9 +13,12 @@ import { log } from "./logger";
 import { resolveChannel, YouTubeApiError } from "./youtube";
 
 // Outlier threshold — when a video's views exceed median × this we flag it.
-// 2× is a reasonable starting point: it catches genuine breakout content
-// without firing on every slightly-above-average upload.
-const OUTLIER_MULTIPLIER = 2.0;
+// Generation floor is 1.5×; the methodology canon (MENTOR_METHOD §2) stays
+// at 2×. Why the gap: the Alerts tab UI lets the user filter by min
+// multiplier (1.5×, 2×, 3×, 5×, 10×). If generation also stopped at 2× the
+// 1.5× pill would always show 0 results. 1.5× generation + 2× default
+// filter = methodology preserved at the surface, with an opt-in wider bucket.
+const OUTLIER_MULTIPLIER = 1.5;
 
 // How many videos to pull per sync. Apify charges per request, so we cap
 // at 50 — covers most channels' recent activity without burning credits.

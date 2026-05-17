@@ -415,7 +415,7 @@ const STRATEGY_TOOLS: Tool[] = [
   {
     name: "list_competitor_alerts",
     description:
-      "List recent outlier alerts — videos from tracked competitors that hit ≥2× their channel's median views. Use to surface what's going viral in the user's niche right now.",
+      "List recent outlier alerts — videos from tracked competitors that hit ≥1.5× their channel's median views (generation floor; methodology canon stays at 2×). Use to surface what's going viral in the user's niche right now.",
     input_schema: {
       type: "object",
       properties: {

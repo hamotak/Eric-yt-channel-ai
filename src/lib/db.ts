@@ -2875,6 +2875,93 @@ try {
   }
 }
 
+// One-shot historical backfill: alert generation used to floor at 2× median;
+// it now floors at 1.5× (see OUTLIER_MULTIPLIER in competitor-sync.ts). Any
+// existing competitor_video at 1.5×–1.99× their channel's all-time median
+// was never promoted to an alert. Walk competitor_videos once, compute the
+// all-time median per competitor, and upsert qualifying rows into
+// competitor_alerts. Safe to re-run — UNIQUE(competitor_id, video_id) +
+// ON CONFLICT DO UPDATE on the table makes the upsert idempotent. Gated by
+// a settings flag so it only runs once per install. New competitors added
+// later flow through syncCompetitor which already uses 1.5×.
+{
+  const backfilled = getSetting("competitors.alerts_backfilled_1_5x") === "1";
+  if (!backfilled) {
+    try {
+      const rows = db
+        .prepare(
+          `WITH ordered AS (
+             SELECT competitor_id, video_id, views, title, thumbnail_url,
+                    ROW_NUMBER() OVER (PARTITION BY competitor_id ORDER BY views) AS rn,
+                    COUNT(*)     OVER (PARTITION BY competitor_id)                  AS cnt
+             FROM competitor_videos
+           ),
+           medians AS (
+             SELECT competitor_id, AVG(views) AS median_views
+             FROM ordered
+             WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2)
+             GROUP BY competitor_id
+             HAVING AVG(views) > 0
+           )
+           SELECT v.competitor_id, v.video_id, v.title, v.thumbnail_url, v.views,
+                  m.median_views,
+                  (v.views * 1.0 / m.median_views) AS multiplier
+           FROM competitor_videos v
+           JOIN medians m ON m.competitor_id = v.competitor_id
+           WHERE v.views >= 1.5 * m.median_views`
+        )
+        .all() as Array<{
+          competitor_id: number;
+          video_id: string;
+          title: string | null;
+          thumbnail_url: string | null;
+          views: number;
+          median_views: number;
+          multiplier: number;
+        }>;
+
+      const insert = db.prepare(
+        `INSERT INTO competitor_alerts
+           (competitor_id, video_id, title, thumbnail_url, views, channel_median_views, multiplier)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(competitor_id, video_id) DO UPDATE SET
+           views                = excluded.views,
+           multiplier           = excluded.multiplier,
+           channel_median_views = excluded.channel_median_views`
+      );
+
+      const runAll = db.transaction(
+        (batch: typeof rows) => {
+          for (const r of batch) {
+            insert.run(
+              r.competitor_id,
+              r.video_id,
+              r.title,
+              r.thumbnail_url,
+              r.views,
+              Math.round(r.median_views),
+              Math.round(r.multiplier * 10) / 10
+            );
+          }
+        }
+      );
+      runAll(rows);
+
+      setSetting("competitors.alerts_backfilled_1_5x", "1");
+      // eslint-disable-next-line no-console
+      console.log(
+        `[db] competitor alerts 1.5× backfill: upserted ${rows.length} rows`
+      );
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[db] competitor alerts 1.5× backfill failed (will retry on next boot):",
+        err
+      );
+    }
+  }
+}
+
 export type CompetitorSyncStatus = "queued" | "syncing" | "synced" | "failed";
 
 export type Competitor = {

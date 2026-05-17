@@ -88,7 +88,9 @@ type Alert = {
 type AlertSort = "outlier" | "newest" | "views";
 type AlertWindow = "all" | "7d" | "28d" | "90d";
 
-const ALERTS_MIN_MULT_STOPS = [1, 1.5, 2, 3, 5, 10] as const;
+// 1× was dropped: alert generation now floors at 1.5× (see OUTLIER_MULTIPLIER
+// in competitor-sync.ts), so the 1× pill always showed 0 results.
+const ALERTS_MIN_MULT_STOPS = [1.5, 2, 3, 5, 10] as const;
 const ALERTS_MIN_MULT_KEY = "alerts.min_multiplier";
 
 type TopicGap = {
@@ -161,7 +163,9 @@ export default function CompetitorsPage() {
     const raw = window.localStorage.getItem(ALERTS_MIN_MULT_KEY);
     if (!raw) return;
     const parsed = Number(raw);
-    if (Number.isFinite(parsed) && parsed >= 1) setAlertMinMult(parsed);
+    // Guard at 1.5 so a stale "1" from before the 1× pill was removed snaps
+    // back to the default of 2 instead of leaving no pill highlighted.
+    if (Number.isFinite(parsed) && parsed >= 1.5) setAlertMinMult(parsed);
   }, []);
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -965,7 +969,7 @@ function AlertsView({
                   : "border border-border text-muted-foreground hover:text-foreground"
               )}
             >
-              {v === 1 ? "1×" : `${v}×`}
+              {`${v}×`}
             </button>
           ))}
         </div>
@@ -974,7 +978,7 @@ function AlertsView({
       {sorted.length === 0 ? (
         <div className="py-12 text-center text-sm text-muted-foreground">
           {alerts.length === 0
-            ? "No viral alerts yet. They appear automatically when a tracked competitor's video crosses 2× their median views."
+            ? "Alerts surface competitor videos at ≥ 1.5× their channel's median views. Add competitors and sync to populate."
             : "No alerts match these filters. Try widening the window or lowering the min outlier."}
         </div>
       ) : (
