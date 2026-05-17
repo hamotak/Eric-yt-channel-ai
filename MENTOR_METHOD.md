@@ -30,7 +30,7 @@ The *"what made it work"* attribution matters more than the topic itself. Two vi
 
 **Definition.** An outlier is a video that performs significantly above **its own channel's average** — not above an absolute view threshold.
 
-The standard threshold is **≥ 3× the channel's median views** over the last 30 or 90 days.
+The standard threshold is **≥ 3× the channel's median views** over the last **60 days** (a wider window than the original 30-day rule — early tests showed too few outliers for channels with bursty upload cadence). The window stays at 60 days unless a feature explicitly overrides it.
 
 **Why relative not absolute:** a 100K-view video on a 10K-subscriber channel is a stronger signal than a 1M-view video on a 5M-subscriber channel. The relative outperformance reveals what the algorithm and audience just rewarded *for that creator's brand*.
 

@@ -2,7 +2,13 @@
 
 import { use, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, Loader2, ExternalLink, Trash2 } from "lucide-react";
+import {
+  ArrowLeft,
+  Loader2,
+  ExternalLink,
+  Trash2,
+  RefreshCw,
+} from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -29,8 +35,9 @@ type Competitor = {
   syncStatus: SyncStatus;
   syncError: string | null;
   similarityScore: number | null;
-  outliers30d: number;
-  medianViews30d: number | null;
+  outliers60d: number;
+  outliers60d2x: number;
+  medianViews60d: number | null;
   lastUploadAt: number | null;
   recentVideoViews: number[];
   views7d: number;
@@ -65,10 +72,19 @@ type OutlierRow = {
 type Period = "7d" | "28d" | "90d";
 
 function fmtCount(n: number | null | undefined): string {
+  if (n === -1) return "Hidden";
   if (n === null || n === undefined) return "—";
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
   if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, "") + "K";
   return String(n);
+}
+
+function fmtCountSyncAware(
+  n: number | null | undefined,
+  syncStatus: SyncStatus
+): string {
+  if (syncStatus === "queued" || syncStatus === "syncing") return "Fetching…";
+  return fmtCount(n);
 }
 
 function fmtRelative(ts: number | null | undefined): string {
@@ -93,6 +109,7 @@ export default function CompetitorDetailPage({
   const [outliers, setOutliers] = useState<OutlierRow[]>([]);
   const [outliersLoading, setOutliersLoading] = useState(false);
   const [patching, setPatching] = useState(false);
+  const [refreshingMeta, setRefreshingMeta] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [period, setPeriod] = useState<Period>("28d");
 
@@ -168,6 +185,31 @@ export default function CompetitorDetailPage({
     }
   };
 
+  const refreshMetadata = async () => {
+    if (refreshingMeta) return;
+    setRefreshingMeta(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/competitors/${id}/refresh-metadata`, {
+        method: "POST",
+      });
+      const d = (await r.json().catch(() => ({}))) as {
+        ok?: boolean;
+        competitor?: Competitor;
+        error?: string;
+      };
+      if (!r.ok || !d.ok || !d.competitor) {
+        setError(d.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      setComp(d.competitor);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "refresh failed");
+    } finally {
+      setRefreshingMeta(false);
+    }
+  };
+
   const deleteCompetitor = async () => {
     if (!comp) return;
     if (
@@ -235,6 +277,10 @@ export default function CompetitorDetailPage({
                 className="h-12 w-12 shrink-0 rounded-full object-cover"
                 referrerPolicy="no-referrer"
               />
+            ) : comp.syncStatus === "queued" || comp.syncStatus === "syncing" ? (
+              <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+              </div>
             ) : (
               <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-muted text-base font-semibold text-muted-foreground">
                 {initial}
@@ -244,7 +290,16 @@ export default function CompetitorDetailPage({
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <h1 className="break-words text-xl font-semibold tracking-tight">
-                    {comp.title ?? comp.handle ?? "(syncing…)"}
+                    {comp.title ??
+                      comp.handle ??
+                      (comp.syncStatus === "queued" ||
+                      comp.syncStatus === "syncing" ? (
+                        <span className="italic text-muted-foreground">
+                          Fetching channel info…
+                        </span>
+                      ) : (
+                        "(no title)"
+                      ))}
                   </h1>
                   <div className="mt-0.5 text-sm text-muted-foreground">
                     {comp.handle ?? comp.channelId ?? "—"}
@@ -260,7 +315,10 @@ export default function CompetitorDetailPage({
                   >
                     {TIER_LABEL[comp.tier]}
                   </span>
-                  <SimilarityScore score={comp.similarityScore} />
+                  <SimilarityScore
+                    score={comp.similarityScore}
+                    syncStatus={comp.syncStatus}
+                  />
                   <label className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
                     <span>Tier:</span>
                     <select
@@ -288,6 +346,21 @@ export default function CompetitorDetailPage({
                     <Trash2 className="h-3 w-3" />
                     Remove
                   </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={refreshMetadata}
+                    disabled={refreshingMeta}
+                    title="Re-run YouTube Data API enrichment for this competitor — useful if avatar or subs are missing."
+                    className="h-6 gap-1 px-2 text-[11px] text-muted-foreground hover:text-foreground"
+                  >
+                    {refreshingMeta ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3 w-3" />
+                    )}
+                    Refresh metadata
+                  </Button>
                 </div>
               </div>
               {error && (
@@ -302,13 +375,35 @@ export default function CompetitorDetailPage({
           </div>
 
           <div className="mt-5 grid grid-cols-4 gap-3 border-t border-border pt-4 text-center">
-            <Metric label="Subs" value={fmtCount(comp.subscriberCount)} />
+            <Metric
+              label="Subs"
+              value={fmtCountSyncAware(comp.subscriberCount, comp.syncStatus)}
+            />
             <ViewsMetric
               value={viewsForPeriod}
               period={period}
               onPeriodChange={setPeriod}
+              syncStatus={comp.syncStatus}
             />
-            <Metric label="Outliers 30d" value={String(comp.outliers30d)} />
+            <div>
+              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                Outliers 60d
+              </div>
+              <div className="mt-0.5 text-base font-semibold">
+                {comp.syncStatus === "queued" || comp.syncStatus === "syncing"
+                  ? "Fetching…"
+                  : String(comp.outliers60d)}
+              </div>
+              {comp.medianViews60d !== null &&
+                comp.outliers60d2x - comp.outliers60d >= 2 && (
+                  <div
+                    className="mt-0.5 text-[10px] leading-tight text-muted-foreground/70"
+                    title={`At a 2× threshold this competitor would surface ${comp.outliers60d2x} outliers (vs ${comp.outliers60d} at 3×). Its catalogue is unusually consistent.`}
+                  >
+                    3× may be too strict ({comp.outliers60d2x} at 2×)
+                  </div>
+                )}
+            </div>
             <Metric label="Last upload" value={fmtRelative(comp.lastUploadAt)} />
           </div>
         </CardContent>
@@ -329,8 +424,8 @@ export default function CompetitorDetailPage({
               {recentVideos.map((v) => {
                 const ytUrl = `https://www.youtube.com/watch?v=${v.video_id}`;
                 const multiplier =
-                  comp.medianViews30d && comp.medianViews30d > 0
-                    ? v.views / comp.medianViews30d
+                  comp.medianViews60d && comp.medianViews60d > 0
+                    ? v.views / comp.medianViews60d
                     : null;
                 return (
                   <li key={v.video_id} className="flex items-start gap-3">
@@ -399,7 +494,7 @@ export default function CompetitorDetailPage({
             </div>
           ) : outliers.length === 0 ? (
             <div className="py-10 text-center text-sm text-muted-foreground">
-              No outliers from this competitor in the last 30 days. Either no
+              No outliers from this competitor in the last 60 days. Either no
               video crossed 3× their own median, or there aren&apos;t enough
               videos in the window (the threshold needs at least 5).
             </div>
@@ -475,10 +570,11 @@ export default function CompetitorDetailPage({
             channel is a stronger signal than 1M views on a 5M-subscriber one.
           </p>
           <p>
-            The median is computed over the last 30 days of uploads. We need
-            at least 5 videos in that window before showing outliers for the
-            competitor — otherwise the sample is too small to be statistically
-            meaningful.
+            The median is computed over the last <strong>60 days</strong> of
+            uploads (wider than the original 30-day rule — early tests showed
+            too few outliers for channels with bursty cadence). We need at
+            least 5 videos in that window before showing outliers; otherwise
+            the sample is too small to be statistically meaningful.
           </p>
           <p>
             Click any outlier to open it on YouTube. Use the AI Chat to ask
@@ -519,11 +615,14 @@ function ViewsMetric({
   value,
   period,
   onPeriodChange,
+  syncStatus,
 }: {
   value: number;
   period: Period;
   onPeriodChange: (p: Period) => void;
+  syncStatus: SyncStatus;
 }) {
+  const working = syncStatus === "queued" || syncStatus === "syncing";
   return (
     <div>
       <div className="flex items-center justify-center gap-1 text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -546,12 +645,30 @@ function ViewsMetric({
           ))}
         </div>
       </div>
-      <div className="mt-0.5 text-base font-semibold">{fmtCount(value)}</div>
+      <div className="mt-0.5 text-base font-semibold">
+        {working ? "Fetching…" : fmtCount(value)}
+      </div>
     </div>
   );
 }
 
-function SimilarityScore({ score }: { score: number | null }) {
+function SimilarityScore({
+  score,
+  syncStatus,
+}: {
+  score: number | null;
+  syncStatus: SyncStatus;
+}) {
+  if (syncStatus === "queued" || syncStatus === "syncing") {
+    return (
+      <span
+        className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+        title="Will compute after the sync finishes."
+      >
+        — match (calculating)
+      </span>
+    );
+  }
   if (score === null) {
     return (
       <span

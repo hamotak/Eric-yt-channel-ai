@@ -246,6 +246,17 @@ export async function enrichCompetitorMetadataFromYouTube(
     // and goes straight to channels.list — exactly 1 quota unit.
     const resolved = await resolveChannel(comp.channel_id, apiKey);
 
+    // Log the raw shape we received so the next "subs not showing up"
+    // report is a `tail -f` away rather than an investigation. Includes
+    // the bits we actually consume; not the full payload (description
+    // strings would bloat logs).
+    log.info("competitors", `YT enrich ${comp.channel_id} resolved`, {
+      title: resolved.title,
+      subscribers: resolved.subscribers,
+      videoCount: resolved.videoCount,
+      hasThumbnail: !!resolved.thumbnail,
+    });
+
     const fields: EnrichResult["fields"] = {
       title: resolved.title,
       subscriber_count: resolved.subscribers,

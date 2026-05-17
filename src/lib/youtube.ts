@@ -153,7 +153,11 @@ export async function resolveChannel(
         title: string;
         description: string;
         customUrl?: string;
-        thumbnails?: { high?: { url: string }; default?: { url: string } };
+        thumbnails?: {
+          high?: { url: string };
+          medium?: { url: string };
+          default?: { url: string };
+        };
       };
       statistics?: {
         subscriberCount?: string;
@@ -178,15 +182,23 @@ export async function resolveChannel(
     title: item.snippet.title,
     handle: item.snippet.customUrl ?? (handle ? `@${handle}` : null),
     description: item.snippet.description,
+    // Hidden-subs sentinel: -1 (not null) so the UI can render "Hidden"
+    // rather than "—". Real null still means "couldn't fetch / no data".
     subscribers: st.hiddenSubscriberCount
-      ? null
+      ? -1
       : st.subscriberCount
         ? parseInt(st.subscriberCount, 10)
         : null,
     views: st.viewCount ? parseInt(st.viewCount, 10) : null,
     videoCount: st.videoCount ? parseInt(st.videoCount, 10) : null,
     uploadsPlaylistId: item.contentDetails.relatedPlaylists.uploads,
-    thumbnail: item.snippet.thumbnails?.high?.url ?? item.snippet.thumbnails?.default?.url ?? null,
+    // Hi-to-lo thumbnail fallback. .medium was missing from the chain,
+    // which is the most common available size when .high is absent.
+    thumbnail:
+      item.snippet.thumbnails?.high?.url ??
+      item.snippet.thumbnails?.medium?.url ??
+      item.snippet.thumbnails?.default?.url ??
+      null,
   };
 }
 

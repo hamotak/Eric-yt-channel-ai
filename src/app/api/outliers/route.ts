@@ -39,11 +39,14 @@ export async function GET(req: Request) {
     userChannelId = rawUserChannelId;
   }
 
-  const windowParam = Number(url.searchParams.get("window") ?? 30);
+  const windowParam = Number(url.searchParams.get("window") ?? 60);
   const windowDays =
-    windowParam === 7 || windowParam === 30 || windowParam === 90
+    windowParam === 7 ||
+    windowParam === 30 ||
+    windowParam === 60 ||
+    windowParam === 90
       ? windowParam
-      : 30;
+      : 60;
 
   const multiplierParam = Number(url.searchParams.get("minMultiplier") ?? 3);
   const minMultiplier =

@@ -45,8 +45,9 @@ type Competitor = {
   syncStatus: SyncStatus;
   syncError: string | null;
   similarityScore: number | null;
-  outliers30d: number;
-  medianViews30d: number | null;
+  outliers60d: number;
+  outliers60d2x: number;
+  medianViews60d: number | null;
   lastUploadAt: number | null;
   recentVideoViews: number[];
   views7d: number;
@@ -80,7 +81,14 @@ type Alert = {
   read_at: number | null;
   competitor_title: string | null;
   competitor_handle: string | null;
+  // Joined from competitor_videos in the API route. Falls back to
+  // detected_at on the UI side if the JOIN missed (e.g. video row got
+  // deleted but the alert remains).
+  published_at: number | null;
 };
+
+type AlertSort = "outlier" | "newest" | "views";
+type AlertWindow = "all" | "7d" | "28d" | "90d";
 
 type TopicGap = {
   topic: string;
@@ -110,11 +118,15 @@ const TIER_RANK: Record<Tier, number> = {
 };
 
 function fmtCount(n: number | null | undefined): string {
+  // -1 is our hidden-subs sentinel from youtube.ts's resolveChannel.
+  // Channels that opt to hide their sub count return Hidden, not "—".
+  if (n === -1) return "Hidden";
   if (!n && n !== 0) return "—";
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
   if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, "") + "K";
   return String(n);
 }
+
 
 function fmtRelative(ts: number | null): string {
   if (!ts) return "never";
@@ -138,6 +150,8 @@ export default function CompetitorsPage() {
   });
   const [unassignedCount, setUnassignedCount] = useState(0);
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [alertSort, setAlertSort] = useState<AlertSort>("outlier");
+  const [alertWindow, setAlertWindow] = useState<AlertWindow>("all");
   const [unread, setUnread] = useState(0);
   const [inFlight, setInFlight] = useState(0);
   const [tab, setTab] = useState<Tab>("overview");
@@ -447,10 +461,6 @@ export default function CompetitorsPage() {
             <Search className="h-6 w-6" />
             Competitor Tracking
           </h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Per-channel competitor lists. Tag each as Authority, Breakthrough,
-            Adjacent, or Far.
-          </p>
         </div>
         <div className="flex items-center gap-2">
           {!migrationView && (
@@ -471,18 +481,6 @@ export default function CompetitorsPage() {
           )}
         </div>
       </header>
-
-      {!migrationView && (
-        <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-border bg-background px-3 py-1 text-xs text-muted-foreground">
-          <span className="text-foreground/70">Active channel:</span>
-          <span className="font-medium text-foreground">
-            {activeChannel?.title ?? "(none)"}
-          </span>
-          {activeChannel?.handle && (
-            <span className="font-mono">{activeChannel.handle}</span>
-          )}
-        </div>
-      )}
 
       {!migrationView && unassignedCount > 0 && (
         <button
@@ -651,7 +649,6 @@ export default function CompetitorsPage() {
                   competitor={c}
                   retrying={retryingIds.has(c.id)}
                   onRetry={() => retryOne(c.id)}
-                  onTierChange={(t) => patchCompetitor(c.id, { tier: t })}
                 />
               ))}
             </div>
@@ -767,78 +764,14 @@ export default function CompetitorsPage() {
       {!migrationView && tab === "alerts" && (
         <Card>
           <CardContent className="p-4">
-            {alerts.length === 0 ? (
-              <div className="py-12 text-center text-sm text-muted-foreground">
-                No viral alerts yet. They appear automatically when a tracked
-                competitor&apos;s video crosses 2× their median views.
-              </div>
-            ) : (
-              <ul className="space-y-2">
-                {alerts.map((a) => {
-                  const ytUrl = `https://www.youtube.com/watch?v=${a.video_id}`;
-                  return (
-                    <li
-                      key={a.id}
-                      className={cn(
-                        "flex flex-wrap items-start gap-3 rounded-md border p-3",
-                        a.read_at
-                          ? "border-border bg-background"
-                          : "border-amber-500/40 bg-amber-500/5"
-                      )}
-                    >
-                      {a.thumbnail_url && (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img
-                          src={a.thumbnail_url}
-                          alt=""
-                          className="h-16 w-28 shrink-0 rounded object-cover"
-                          referrerPolicy="no-referrer"
-                        />
-                      )}
-                      <div className="min-w-0 flex-1">
-                        <a
-                          href={ytUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-center gap-1 text-sm font-medium hover:underline"
-                        >
-                          {a.title ?? "(untitled)"}
-                          <ExternalLink className="h-3 w-3 opacity-60" />
-                        </a>
-                        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-                          <span>
-                            <strong className="text-foreground">
-                              {a.competitor_title ?? a.competitor_handle ?? "?"}
-                            </strong>
-                          </span>
-                          <span className="inline-flex items-center gap-1">
-                            <Eye className="h-3 w-3" />
-                            {fmtCount(a.views)} views
-                          </span>
-                          {a.multiplier && (
-                            <span className="rounded bg-amber-500/15 px-1.5 py-0.5 font-mono font-medium text-amber-700 dark:text-amber-400">
-                              {a.multiplier.toFixed(1)}× median
-                            </span>
-                          )}
-                          <span>· {fmtRelative(a.detected_at)}</span>
-                        </div>
-                      </div>
-                      {!a.read_at && (
-                        <button
-                          type="button"
-                          onClick={() => markAlertRead(a.id)}
-                          className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                          aria-label="Mark read"
-                          title="Mark read"
-                        >
-                          <Check className="h-3.5 w-3.5" />
-                        </button>
-                      )}
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
+            <AlertsView
+              alerts={alerts}
+              sort={alertSort}
+              window={alertWindow}
+              onSortChange={setAlertSort}
+              onWindowChange={setAlertWindow}
+              onMarkRead={markAlertRead}
+            />
           </CardContent>
         </Card>
       )}
@@ -908,7 +841,185 @@ function Kpi({
   );
 }
 
-function SimilarityBadge({ score }: { score: number | null }) {
+function AlertsView({
+  alerts,
+  sort,
+  window,
+  onSortChange,
+  onWindowChange,
+  onMarkRead,
+}: {
+  alerts: Alert[];
+  sort: AlertSort;
+  window: AlertWindow;
+  onSortChange: (s: AlertSort) => void;
+  onWindowChange: (w: AlertWindow) => void;
+  onMarkRead: (id: number) => void;
+}) {
+  // Filter by upload-date window (falls back to detected_at when the
+  // competitor_videos row was wiped) → then sort by the chosen key.
+  const now = Math.floor(Date.now() / 1000);
+  const windowSec =
+    window === "7d" ? 7 * 86400 : window === "28d" ? 28 * 86400 : window === "90d" ? 90 * 86400 : null;
+  const filtered = alerts.filter((a) => {
+    if (windowSec === null) return true;
+    const t = a.published_at ?? a.detected_at;
+    return now - t <= windowSec;
+  });
+  const sorted = [...filtered].sort((a, b) => {
+    if (sort === "newest") {
+      return (b.published_at ?? b.detected_at) - (a.published_at ?? a.detected_at);
+    }
+    if (sort === "views") {
+      return (b.views ?? 0) - (a.views ?? 0);
+    }
+    // outlier (default)
+    return (b.multiplier ?? 0) - (a.multiplier ?? 0);
+  });
+
+  return (
+    <>
+      {/* Filter row */}
+      <div className="mb-3 flex flex-wrap items-center gap-3 border-b border-border/60 pb-3 text-xs">
+        <label className="inline-flex items-center gap-1.5 text-muted-foreground">
+          <span>Sort:</span>
+          <select
+            value={sort}
+            onChange={(e) => onSortChange(e.target.value as AlertSort)}
+            className="rounded-md border border-input bg-background px-2 py-1 text-xs"
+          >
+            <option value="outlier">Highest outlier score</option>
+            <option value="newest">Newest upload</option>
+            <option value="views">Most views</option>
+          </select>
+        </label>
+        <div className="inline-flex items-center gap-1.5">
+          <span className="text-muted-foreground">Window:</span>
+          {(["all", "7d", "28d", "90d"] as const).map((w) => (
+            <button
+              key={w}
+              type="button"
+              onClick={() => onWindowChange(w)}
+              className={cn(
+                "rounded-full px-2 py-0.5 text-[11px] font-medium transition-colors",
+                window === w
+                  ? "bg-primary/15 text-primary"
+                  : "border border-border text-muted-foreground hover:text-foreground"
+              )}
+            >
+              {w === "all" ? "All" : w}
+            </button>
+          ))}
+        </div>
+        <span className="ml-auto text-[11px] text-muted-foreground">
+          {sorted.length} alert{sorted.length === 1 ? "" : "s"} shown
+          {sorted.length !== alerts.length && (
+            <span className="text-muted-foreground/60"> (of {alerts.length})</span>
+          )}
+        </span>
+      </div>
+
+      {sorted.length === 0 ? (
+        <div className="py-12 text-center text-sm text-muted-foreground">
+          {alerts.length === 0
+            ? "No viral alerts yet. They appear automatically when a tracked competitor's video crosses 2× their median views."
+            : "No alerts match this window. Try widening to All."}
+        </div>
+      ) : (
+        <ul className="space-y-2">
+          {sorted.map((a) => {
+            const ytUrl = `https://www.youtube.com/watch?v=${a.video_id}`;
+            // Render upload date if we have it; fall back to detection
+            // time for the rare orphaned-alert case (cv row deleted).
+            const uploadTs = a.published_at ?? a.detected_at;
+            const uploadLabel =
+              a.published_at !== null ? "uploaded" : "detected";
+            return (
+              <li
+                key={a.id}
+                className={cn(
+                  "flex flex-wrap items-start gap-3 rounded-md border p-3",
+                  a.read_at
+                    ? "border-border bg-background"
+                    : "border-amber-500/40 bg-amber-500/5"
+                )}
+              >
+                {a.thumbnail_url && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={a.thumbnail_url}
+                    alt=""
+                    className="h-16 w-28 shrink-0 rounded object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                )}
+                <div className="min-w-0 flex-1">
+                  <a
+                    href={ytUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-sm font-medium hover:underline"
+                  >
+                    {a.title ?? "(untitled)"}
+                    <ExternalLink className="h-3 w-3 opacity-60" />
+                  </a>
+                  <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                    <span>
+                      <strong className="text-foreground">
+                        {a.competitor_title ?? a.competitor_handle ?? "?"}
+                      </strong>
+                    </span>
+                    <span className="inline-flex items-center gap-1">
+                      <Eye className="h-3 w-3" />
+                      {fmtCount(a.views)} views
+                    </span>
+                    {a.multiplier && (
+                      <span className="rounded bg-amber-500/15 px-1.5 py-0.5 font-mono font-medium text-amber-700 dark:text-amber-400">
+                        {a.multiplier.toFixed(1)}× median
+                      </span>
+                    )}
+                    <span title={`Alert detected ${fmtRelative(a.detected_at)}`}>
+                      · {uploadLabel} {fmtRelative(uploadTs)}
+                    </span>
+                  </div>
+                </div>
+                {!a.read_at && (
+                  <button
+                    type="button"
+                    onClick={() => onMarkRead(a.id)}
+                    className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                    aria-label="Mark read"
+                    title="Mark read"
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </>
+  );
+}
+
+function SimilarityBadge({
+  score,
+  syncStatus,
+}: {
+  score: number | null;
+  syncStatus: SyncStatus;
+}) {
+  if (syncStatus === "queued" || syncStatus === "syncing") {
+    return (
+      <span
+        className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+        title="Will compute after the sync finishes."
+      >
+        — match (calculating)
+      </span>
+    );
+  }
   if (score === null) {
     return (
       <span
@@ -939,12 +1050,10 @@ function CompetitorCard({
   competitor,
   retrying,
   onRetry,
-  onTierChange,
 }: {
   competitor: Competitor;
   retrying: boolean;
   onRetry: () => void;
-  onTierChange: (t: Tier) => void;
 }) {
   const [period, setPeriod] = useState<Period>("28d");
   const initial = (competitor.title ?? competitor.handle ?? "?")
@@ -967,6 +1076,19 @@ function CompetitorCard({
   const isFailed = competitor.syncStatus === "failed";
   const isWorking = isQueued || isSyncing;
 
+  // Surface a "threshold may be too strict" hint when the 2× variant
+  // would add at least 2 more outliers. Tight-cluster channels (e.g.
+  // very consistent uploaders) get penalised by the strict 3× rule —
+  // HAmo can read this hint and decide manually whether to relax it.
+  // Only show when the row has enough data for a meaningful comparison
+  // (≥ 1 outlier at 3× and at least 5 videos in the window — the SQL
+  // already drops sub-5-video competitors from medianViews60d).
+  const tooStrict =
+    !isWorking &&
+    !isFailed &&
+    competitor.medianViews60d !== null &&
+    competitor.outliers60d2x - competitor.outliers60d >= 2;
+
   return (
     <Link
       href={`/competitors/${competitor.id}`}
@@ -983,6 +1105,10 @@ function CompetitorCard({
                 className="h-8 w-8 shrink-0 rounded-full object-cover"
                 referrerPolicy="no-referrer"
               />
+            ) : isWorking ? (
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              </div>
             ) : (
               <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-semibold text-muted-foreground">
                 {initial}
@@ -990,7 +1116,15 @@ function CompetitorCard({
             )}
             <div className="min-w-0 flex-1">
               <div className="break-words text-sm font-semibold leading-snug">
-                {competitor.title ?? competitor.handle ?? "(syncing…)"}
+                {competitor.title ??
+                  competitor.handle ??
+                  (isWorking ? (
+                    <span className="italic text-muted-foreground">
+                      Fetching channel info…
+                    </span>
+                  ) : (
+                    "(no title)"
+                  ))}
               </div>
               <div className="mt-0.5 break-all text-xs text-muted-foreground">
                 {competitor.handle ?? competitor.channelId ?? "—"}
@@ -1006,7 +1140,10 @@ function CompetitorCard({
               >
                 {TIER_LABEL[competitor.tier]}
               </span>
-              <SimilarityBadge score={competitor.similarityScore} />
+              <SimilarityBadge
+                score={competitor.similarityScore}
+                syncStatus={competitor.syncStatus}
+              />
             </div>
           </div>
 
@@ -1054,40 +1191,35 @@ function CompetitorCard({
                 onPeriodChange={setPeriod}
                 onClickStop={stop}
               />
-              <CardMetric
-                label="Outliers 30d"
-                value={String(competitor.outliers30d)}
-                highlight={competitor.outliers30d > 0}
-              />
+              <div>
+                <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Outliers 60d
+                </div>
+                <div
+                  className={cn(
+                    "mt-0.5 font-semibold",
+                    competitor.outliers60d > 0 &&
+                      "text-emerald-600 dark:text-emerald-400"
+                  )}
+                >
+                  {competitor.outliers60d}
+                </div>
+                {tooStrict && (
+                  <div
+                    className="mt-0.5 text-[9px] leading-tight text-muted-foreground/70"
+                    title={`At a 2× threshold this competitor would surface ${competitor.outliers60d2x} outliers (vs ${competitor.outliers60d} at 3×). Its catalogue is unusually consistent — the strict rule may be hiding real signals.`}
+                  >
+                    3× may be too strict
+                    <br />({competitor.outliers60d2x} at 2×)
+                  </div>
+                )}
+              </div>
               <CardMetric
                 label="Last upload"
                 value={fmtRelative(competitor.lastUploadAt)}
               />
             </div>
           )}
-
-          {/* Tier dropdown — bottom row, stays clickable during all states. */}
-          <div className="mt-3 flex items-center gap-2 border-t border-border/60 pt-3 text-[11px]">
-            <label
-              className="inline-flex items-center gap-1.5 text-muted-foreground"
-              onClick={stop}
-            >
-              <span>Tier:</span>
-              <select
-                value={competitor.tier}
-                onChange={(e) => onTierChange(e.target.value as Tier)}
-                onClick={stop}
-                title={TIER_TOOLTIP[competitor.tier]}
-                className="rounded-md border border-input bg-background px-1.5 py-0.5 text-[11px]"
-              >
-                {TIERS.map((t) => (
-                  <option key={t} value={t} title={TIER_TOOLTIP[t]}>
-                    {TIER_LABEL[t]}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
         </CardContent>
       </Card>
     </Link>
