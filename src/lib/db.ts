@@ -2722,6 +2722,27 @@ db.exec(`
     FOREIGN KEY (competitor_id) REFERENCES competitors(id) ON DELETE CASCADE
   );
   CREATE INDEX IF NOT EXISTS idx_comp_alerts_unread ON competitor_alerts(read_at, detected_at DESC);
+
+  -- Per-user-channel hide list for outliers the user wants to suppress.
+  -- A single row hides one (user_channel, video) pair across every surface
+  -- that consumes outliers — Recent, Patterns extraction source, Topics
+  -- Gap source, /competitors/[id] outlier list, chat list_outliers. The
+  -- exclude is an overlay: the underlying competitor_video / competitor_alert
+  -- row is preserved, so a future Settings → Hidden outliers page can
+  -- restore by deleting the exclude row.
+  -- ON DELETE CASCADE through competitor_id cleans up if the user removes
+  -- a tracked competitor. reason is reserved for the future Restore UI.
+  CREATE TABLE IF NOT EXISTS competitor_video_excludes (
+    user_channel_id TEXT NOT NULL,
+    competitor_id   INTEGER NOT NULL,
+    video_id        TEXT NOT NULL,
+    excluded_at     INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    reason          TEXT,
+    PRIMARY KEY (user_channel_id, video_id),
+    FOREIGN KEY (competitor_id) REFERENCES competitors(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_cv_excludes_lookup
+    ON competitor_video_excludes(user_channel_id, video_id);
 `);
 
 // One-shot rebuild for existing installs whose `competitors` table still
@@ -3592,7 +3613,6 @@ export function recordCompetitorAlert(a: {
 export function listCompetitorAlerts(
   opts: {
     unreadOnly?: boolean;
-    limit?: number;
     userChannelId?: string | null;
   } = {}
 ): (CompetitorAlert & {
@@ -3601,20 +3621,24 @@ export function listCompetitorAlerts(
   competitor_tier: CompetitorTier;
   published_at: number | null;
 })[] {
-  const whereParts: string[] = [];
+  const whereParts: string[] = ["e.video_id IS NULL"];
   const args: (string | number | null)[] = [];
   if (opts.unreadOnly) whereParts.push("a.read_at IS NULL");
   if (opts.userChannelId) {
     whereParts.push("c.user_channel_id = ?");
     args.push(opts.userChannelId);
   }
-  const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
-  args.push(opts.limit ?? 100);
+  const where = `WHERE ${whereParts.join(" AND ")}`;
   // LEFT JOIN competitor_videos so the upload date travels with each alert.
   // detected_at stays (still useful internally — sorting + alert age tracking)
   // but the UI labels it as upload date by reading published_at.
   // competitor_tier travels with the row so the Recent tab can show the
   // same B&S tier pill that Library does.
+  //
+  // LEFT JOIN competitor_video_excludes + IS NULL filter suppresses any
+  // alert the user has hidden under THIS competitor's owning user_channel.
+  // No LIMIT clause — RecentTab + chat tool both want the full set; a real
+  // pagination story is deferred to a future PR.
   return db
     .prepare(
       `SELECT a.*,
@@ -3627,9 +3651,11 @@ export function listCompetitorAlerts(
        LEFT JOIN competitor_videos cv
          ON cv.competitor_id = a.competitor_id
         AND cv.video_id      = a.video_id
+       LEFT JOIN competitor_video_excludes e
+         ON e.user_channel_id = c.user_channel_id
+        AND e.video_id        = a.video_id
        ${where}
-       ORDER BY a.detected_at DESC
-       LIMIT ?`
+       ORDER BY a.detected_at DESC`
     )
     .all(...args) as (CompetitorAlert & {
     competitor_title: string | null;
@@ -3648,21 +3674,79 @@ export function markCompetitorAlertRead(id: number): void {
 export function unreadCompetitorAlertCount(
   userChannelId?: string | null
 ): number {
+  // LEFT JOIN competitor_video_excludes + IS NULL keeps the sidebar
+  // badge consistent with what Recent actually renders — hidden rows
+  // never contribute to the unread count, even if their read_at is
+  // null.
   if (userChannelId) {
     const row = db
       .prepare(
         `SELECT COUNT(*) AS n
          FROM competitor_alerts a
          JOIN competitors c ON c.id = a.competitor_id
-         WHERE a.read_at IS NULL AND c.user_channel_id = ?`
+         LEFT JOIN competitor_video_excludes e
+           ON e.user_channel_id = c.user_channel_id
+          AND e.video_id        = a.video_id
+         WHERE a.read_at IS NULL
+           AND c.user_channel_id = ?
+           AND e.video_id IS NULL`
       )
       .get(userChannelId) as { n: number };
     return row.n;
   }
   const row = db
-    .prepare(`SELECT COUNT(*) AS n FROM competitor_alerts WHERE read_at IS NULL`)
+    .prepare(
+      `SELECT COUNT(*) AS n
+       FROM competitor_alerts a
+       JOIN competitors c ON c.id = a.competitor_id
+       LEFT JOIN competitor_video_excludes e
+         ON e.user_channel_id = c.user_channel_id
+        AND e.video_id        = a.video_id
+       WHERE a.read_at IS NULL
+         AND e.video_id IS NULL`
+    )
     .get() as { n: number };
   return row.n;
+}
+
+/**
+ * Hide a single competitor video from every outlier surface for the
+ * given user_channel. Idempotent — re-hiding the same pair is a no-op
+ * apart from refreshing excluded_at + reason. The competitor_alert /
+ * competitor_video rows themselves are preserved, so a future Settings
+ * → Hidden outliers page can restore by deleting the exclude row.
+ */
+export function hideCompetitorOutlier(opts: {
+  userChannelId: string;
+  competitorId: number;
+  videoId: string;
+  reason?: string | null;
+}): void {
+  db.prepare(
+    `INSERT INTO competitor_video_excludes
+       (user_channel_id, competitor_id, video_id, reason)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_channel_id, video_id) DO UPDATE SET
+       excluded_at = strftime('%s','now'),
+       reason      = excluded.reason`
+  ).run(
+    opts.userChannelId,
+    opts.competitorId,
+    opts.videoId,
+    opts.reason ?? null
+  );
+}
+
+/**
+ * Wipe every Topics Gap cache row for the given user_channel across
+ * all windows (the cache key is `competitor_topics_gap.cache.<uc>.<wN>`).
+ * Called after a hide so the next Generate click rebuilds without the
+ * hidden video in the source set.
+ */
+export function invalidateTopicsGapCache(userChannelId: string): void {
+  db.prepare(
+    `DELETE FROM settings WHERE key LIKE ? ESCAPE '\\'`
+  ).run(`competitor_topics_gap.cache.${userChannelId}.%`);
 }
 
 /**
@@ -4222,6 +4306,13 @@ export function outliersForUserChannel(opts: {
   const scope = opts.userChannelId; // null | string
   const compScope = opts.competitorId ?? null; // null | number — extra single-competitor narrow.
 
+  // LEFT JOIN competitor_video_excludes + IS NULL inside scoped_videos
+  // strips any (user_channel, video) pair the user has hidden. The
+  // exclude is matched against c.user_channel_id (the competitor's
+  // owning channel), which is correct for every caller — chat tool,
+  // Topics Gap source, Patterns extraction, /competitors/[id], and
+  // the per-channel /api/outliers fetch — because they all view
+  // outliers through the lens of a specific user_channel.
   const outliers = db
     .prepare(
       `WITH scoped_videos AS (
@@ -4238,10 +4329,14 @@ export function outliersForUserChannel(opts: {
            COUNT(*)     OVER (PARTITION BY cv.competitor_id)                  AS n_in_window
          FROM competitor_videos cv
          JOIN competitors c ON c.id = cv.competitor_id
+         LEFT JOIN competitor_video_excludes e
+           ON e.user_channel_id = c.user_channel_id
+          AND e.video_id        = cv.video_id
          WHERE cv.published_at >= strftime('%s','now') - ? * 86400
            AND (? IS NULL OR c.user_channel_id = ?)
            AND c.tier IN (?, ?, ?, ?)
            AND (? IS NULL OR c.id = ?)
+           AND e.video_id IS NULL
        ),
        qualified_medians AS (
          SELECT competitor_id, AVG(views) AS median_views

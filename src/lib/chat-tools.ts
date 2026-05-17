@@ -917,11 +917,13 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
         const recentOnly = !!input.recent_only;
         if (recentOnly) {
           const unreadOnly = !!input.unreadOnly;
+          // listCompetitorAlerts no longer takes a limit — the UI surface
+          // (RecentTab) wants the full set. The chat tool caps client-side
+          // to keep the LLM context bounded.
           const alerts = listCompetitorAlerts({
             unreadOnly,
-            limit,
             userChannelId: getActiveChannelId(),
-          });
+          }).slice(0, limit);
           return {
             ok: true,
             data: {

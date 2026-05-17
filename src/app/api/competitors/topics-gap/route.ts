@@ -15,13 +15,23 @@ export const maxDuration = 60;
  * POST /api/competitors/topics-gap
  *
  * Body:
- *   { userChannelId?: string, refresh?: boolean, windowDays?: 14|30|90|null }
+ *   {
+ *     userChannelId?: string,
+ *     refresh?: boolean,
+ *     windowDays?: 14|30|90|null,
+ *     cacheOnly?: boolean,
+ *   }
  *
  * Calls Claude with §4 inlined to surface topic-level gaps (subject
  * areas working for competitors that the user hasn't covered). Cached
  * 4 hours per (userChannelId, windowDays); pass {refresh:true} to bust
  * the cache for the chosen window. windowDays defaults to 14 — the
  * page-level Topics Gap pill row aligns with this.
+ *
+ * cacheOnly:true short-circuits before any Claude call — returns the
+ * fresh cache if one exists, otherwise `{ ok:true, cacheMiss:true,
+ * gaps:[] }`. The Gaps tab uses this on tab/window open so nothing
+ * fires until the user clicks Generate.
  *
  * Response embeds example-video thumbnail/title data alongside each
  * gap so the UI can render thumbnails without a second round-trip.
@@ -31,6 +41,7 @@ export async function POST(req: Request) {
     userChannelId?: unknown;
     refresh?: unknown;
     windowDays?: unknown;
+    cacheOnly?: unknown;
   };
   const userChannelId =
     typeof body.userChannelId === "string" && body.userChannelId.trim()
@@ -43,6 +54,7 @@ export async function POST(req: Request) {
     );
   }
   const refresh = body.refresh === true;
+  const cacheOnly = body.cacheOnly === true;
 
   // Validate windowDays. Accept 14/30/90 (numeric), null (explicit
   // "all time"), or undefined (lib defaults to 14). Reject anything
@@ -72,6 +84,7 @@ export async function POST(req: Request) {
     userChannelId,
     refresh,
     windowDays,
+    cacheOnly,
   });
   if (!result.ok) {
     return NextResponse.json(
@@ -91,6 +104,7 @@ export async function POST(req: Request) {
   return NextResponse.json({
     ok: true,
     cached: result.cached,
+    cacheMiss: result.cacheMiss ?? false,
     generatedAt: result.generatedAt,
     gaps: result.gaps.map((g) => ({
       ...g,

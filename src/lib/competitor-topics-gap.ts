@@ -50,6 +50,12 @@ export type TopicsGapResult =
       gaps: TopicGap[];
       cached: boolean;
       generatedAt: number;
+      /**
+       * Set when caller passed cacheOnly:true and no fresh cache existed.
+       * The client uses this to distinguish "click Generate" (no cache)
+       * from "we generated and there were zero qualifying topics".
+       */
+      cacheMiss?: boolean;
     }
   | {
       ok: false;
@@ -118,12 +124,21 @@ export async function competitorTopicsGap(opts: {
   userChannelId: string;
   refresh?: boolean;
   windowDays?: GapsWindowDays;
+  /**
+   * When true: return the fresh cache if one exists; otherwise return a
+   * cacheMiss result WITHOUT calling Claude. The TopicsGap tab uses this
+   * mode on tab/window mount so opening the tab never auto-generates.
+   * Mutually exclusive with refresh — refresh wins if both are set
+   * (refresh is the explicit Generate-button path).
+   */
+  cacheOnly?: boolean;
 }): Promise<TopicsGapResult> {
   const { userChannelId } = opts;
   if (!userChannelId) {
     return { ok: false, status: 400, error: "userChannelId required" };
   }
   const windowDays: GapsWindowDays = opts.windowDays ?? 14;
+  const cacheOnly = opts.cacheOnly === true && opts.refresh !== true;
 
   if (!opts.refresh) {
     const cached = readCache(userChannelId, windowDays);
@@ -136,6 +151,19 @@ export async function competitorTopicsGap(opts: {
         generatedAt: cached.generatedAt,
       };
     }
+  }
+
+  // Cache-only mode: never calls Claude. Returns an empty result tagged
+  // cacheMiss:true so the client can render the "Click Generate" state.
+  if (cacheOnly) {
+    return {
+      ok: true,
+      userChannelId,
+      gaps: [],
+      cached: false,
+      generatedAt: 0,
+      cacheMiss: true,
+    };
   }
 
   const channel = getChannel(userChannelId);

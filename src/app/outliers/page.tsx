@@ -15,6 +15,7 @@ import {
   Search,
   Sparkles,
   X,
+  XCircle,
 } from "lucide-react";
 import {
   Card,
@@ -362,7 +363,7 @@ function RecentTab({ scope }: { scope: string | "all" | null }) {
     const channelParam = scope === "all" ? "all" : scope;
     try {
       const r = await fetch(
-        `/api/competitors/alerts?limit=100&userChannelId=${encodeURIComponent(
+        `/api/competitors/alerts?userChannelId=${encodeURIComponent(
           channelParam
         )}`,
         { cache: "no-store" }
@@ -386,6 +387,28 @@ function RecentTab({ scope }: { scope: string | "all" | null }) {
   const markRead = async (id: number) => {
     await fetch(`/api/competitors/alerts/${id}/read`, { method: "POST" });
     await refresh();
+  };
+
+  const hideOutlier = async (videoId: string, competitorId: number) => {
+    const ok = window.confirm(
+      "Hide this outlier? It'll disappear from /outliers, Patterns extraction, Topics Gap, and chat results. Restore from Settings → Hidden outliers (coming soon)."
+    );
+    if (!ok) return;
+    try {
+      const r = await fetch("/api/outliers/hide", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoId, competitorId }),
+      });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        setError(d.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to hide.");
+    }
   };
 
   const filtered = useMemo(() => {
@@ -529,6 +552,7 @@ function RecentTab({ scope }: { scope: string | "all" | null }) {
               isUnread={!a.read_at}
               onMarkRead={() => markRead(a.id)}
               onExplain={() => setOpenOutlier(alertToOutlier(a))}
+              onHide={() => hideOutlier(a.video_id, a.competitor_id)}
             />
           ))}
         </ul>
@@ -570,16 +594,19 @@ function alertToOutlier(a: Alert): Outlier {
   };
 }
 
-/* ---------------- Topics Gap tab (ported from /competitors) ---------------- */
+/* ---------------- Topics Gap tab ---------------- */
 /**
  * AI grouping of competitor outliers into topics the user hasn't covered.
- * Lazy-loads on first tab open so we don't burn a Claude call on every
- * page visit. Cached server-side per (active channel, window) for 4 hours.
+ * Cached server-side per (active channel, window) for 4 hours.
  *
- * Default window is 14d — surfaces what's currently working over the
- * stale-but-still-cached 60d view. Each window keeps its own 4h cache
- * server-side; switching windows triggers a fresh fetch (cache-served
- * on the second visit within 4 hours).
+ * Default window is 14d — surfaces what's CURRENTLY working over the
+ * stale-but-still-cached 60d view. Each window keeps its own 4h cache.
+ *
+ * Auto-generation is OFF. Tab/window open fires a cache-only fetch:
+ * if a fresh cache exists for that (channel, window), it renders;
+ * otherwise the page stays on the "Click Generate" empty state and no
+ * Claude call happens until the user clicks. This is intentional — a
+ * Claude call costs real money and the user wants explicit control.
  */
 type GapsWindow = 14 | 30 | 90 | "all";
 const GAPS_WINDOW_STOPS: readonly GapsWindow[] = [14, 30, 90, "all"] as const;
@@ -601,14 +628,22 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
   // route falls back to the active channel when no userChannelId is given.
   // windowDays is sent as `null` for "all" so the server can drop the
   // time filter; numeric values constrain the outlier + user-video pull.
+  //
+  // cacheOnly:
+  //   - false (Generate button) → POSTs refresh:true, always generates.
+  //   - true  (tab/window mount) → returns cache if fresh, otherwise
+  //                                returns cacheMiss:true and the client
+  //                                stays on the empty Generate state.
   const fetchGaps = useCallback(
-    async (refresh: boolean, win: GapsWindow) => {
+    async (mode: "generate" | "cacheOnly", win: GapsWindow) => {
       if (scope === null) return;
       setLoading(true);
       setError(null);
       try {
         const windowDays: number | null = win === "all" ? null : win;
-        const body: Record<string, unknown> = { refresh, windowDays };
+        const body: Record<string, unknown> = { windowDays };
+        if (mode === "generate") body.refresh = true;
+        else body.cacheOnly = true;
         if (scope !== "all") body.userChannelId = scope;
         const r = await fetch("/api/competitors/topics-gap", {
           method: "POST",
@@ -620,12 +655,23 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
           ok?: boolean;
           gaps?: TopicGap[];
           cached?: boolean;
+          cacheMiss?: boolean;
           generatedAt?: number;
           error?: string;
         };
         if (!r.ok || !d.ok || !Array.isArray(d.gaps)) {
           setGaps(null);
           setError(d.error ?? `HTTP ${r.status}`);
+          return;
+        }
+        // Cache miss on a cacheOnly probe: leave gaps as null so the
+        // existing "Click Generate" empty state renders. Don't surface
+        // it as an error — this is the default healthy state for a
+        // cold (channel, window) pair.
+        if (d.cacheMiss) {
+          setGaps(null);
+          setCached(false);
+          setGeneratedAt(null);
           return;
         }
         setGaps(d.gaps);
@@ -640,11 +686,11 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
     [scope]
   );
 
-  // Re-fetch whenever scope or window changes (lazy load on first render
-  // also lands here via the scope-resolution effect).
+  // Cache-only probe on scope/window change. NEVER calls Claude — only
+  // renders cached results if a fresh cache exists for this pair.
   useEffect(() => {
     if (scope === null) return;
-    void fetchGaps(false, windowKey);
+    void fetchGaps("cacheOnly", windowKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope, windowKey]);
 
@@ -682,7 +728,7 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
           <Button
             size="sm"
             variant="outline"
-            onClick={() => fetchGaps(true, windowKey)}
+            onClick={() => fetchGaps("generate", windowKey)}
             disabled={loading}
             className="gap-1.5"
           >
@@ -795,6 +841,8 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
  *   - onExplain         → click anywhere on the row opens the ExplainModal;
  *                          also renders a Sparkles affordance on the right
  *   - onMarkRead        → renders a Check button when isUnread
+ *   - onHide            → renders an XCircle button; click suppresses the
+ *                          row from every outlier surface for this channel
  *   - durationSeconds   → small overlay on the thumbnail
  *   - detectedAt        → "detected Xh ago" tooltip on the upload date
  */
@@ -813,6 +861,7 @@ type OutlierRowProps = {
   isUnread?: boolean;
   onExplain?: () => void;
   onMarkRead?: () => void;
+  onHide?: () => void;
 };
 
 function OutlierRow(props: OutlierRowProps) {
@@ -922,6 +971,20 @@ function OutlierRow(props: OutlierRowProps) {
           title="Mark read"
         >
           <Check className="h-3.5 w-3.5" />
+        </button>
+      )}
+      {props.onHide && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onHide?.();
+          }}
+          className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-destructive"
+          aria-label="Hide this outlier"
+          title="Hide this outlier"
+        >
+          <XCircle className="h-3.5 w-3.5" />
         </button>
       )}
     </li>
