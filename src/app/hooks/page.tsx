@@ -13,7 +13,21 @@ import {
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { HookAnalysisBanner } from "@/components/hook-analysis-banner";
 import { cn } from "@/lib/utils";
+
+type HookAnalysisJob = {
+  id: number;
+  started_at: number;
+  completed_at: number | null;
+  channel_id: string | null;
+  total: number;
+  done: number;
+  failed: number;
+  current_video_id: string | null;
+  status: "running" | "completed" | "failed" | "cancelled";
+  last_error: string | null;
+};
 
 type Formula =
   | "direct_question"
@@ -144,25 +158,53 @@ export default function HooksPage() {
     refresh();
   }, [refresh]);
 
+  // Kick off a background batch and let HookAnalysisBanner take over
+  // the progress UI. We don't `await` the work itself — the endpoint
+  // returns immediately after enqueueing — because for 40+ videos at
+  // ~10s/Claude-call the request would take minutes and the UI would
+  // just spin "Analyzing…" with no feedback (and no way to cancel).
+  // The previous implementation did exactly that, which is why
+  // pressing the button felt like it did nothing.
   const analyzeAllPending = async () => {
-    setAnalyzing(true);
     setError(null);
     try {
       const r = await fetch("/api/hooks/analyze-pending", { method: "POST" });
       const d = (await r.json()) as {
-        queued?: number;
-        succeeded?: number;
-        failed?: number;
+        ok?: boolean;
+        jobId?: number;
+        total?: number;
         error?: string;
       };
       if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+      // Banner will pick the new job up on its next poll. Refresh
+      // dashboard so the "Pending" count is fresh too.
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed");
-    } finally {
-      setAnalyzing(false);
     }
   };
+
+  // Banner pushes the running-job state up so the header button can
+  // disable itself + show "Analysing…" while a batch is in flight,
+  // even if the user navigates away and back (we re-read the job from
+  // the server on mount).
+  const handleJobChange = useCallback(
+    (job: HookAnalysisJob | null) => {
+      const running = job?.status === "running";
+      setAnalyzing(running);
+      // If a new job is running, clear any stale "batch already running"
+      // toast from a previous double-click — otherwise both the toast
+      // and the progress banner stack on top of each other and look
+      // like contradictory state.
+      if (running) setError(null);
+      // When a job finishes, refresh dashboard counts so the user sees
+      // "0 pending" / updated avg score without a manual reload.
+      if (job && job.status !== "running") {
+        refresh();
+      }
+    },
+    [refresh]
+  );
 
   const reanalyzeOne = async (videoId: string) => {
     setAnalyzingIds((prev) => new Set(prev).add(videoId));
@@ -246,6 +288,11 @@ export default function HooksPage() {
               : `Analyze ${dashboard.pending} pending`}
         </Button>
       </header>
+
+      {/* Background-job banner: shows progress + cancel while a batch
+          is in flight, completion summary afterwards. Pushes the
+          running-job state up so the header button stays disabled. */}
+      <HookAnalysisBanner onJobChange={handleJobChange} />
 
       {/* Tabs */}
       <div className="mb-4 flex gap-4 border-b border-border">

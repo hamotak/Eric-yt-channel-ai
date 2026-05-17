@@ -264,6 +264,14 @@ if (!isBuildPhase) {
             'Server restarted before this batch finished — auto-cancelled.'
       WHERE status = 'running';
 
+      UPDATE hook_analysis_jobs
+      SET status = 'failed',
+          completed_at = strftime('%s','now'),
+          last_error = COALESCE(last_error, '') ||
+            CASE WHEN COALESCE(last_error,'') = '' THEN '' ELSE ' | ' END ||
+            'Server restarted before this batch finished — auto-cancelled.'
+      WHERE status = 'running';
+
       -- Same logic for the channel-sync flag. If the previous process
       -- was killed mid-sync the flag stays at "1" and silently blocks
       -- every future sync + transcribe-batch attempt.
@@ -1312,6 +1320,26 @@ db.exec(`
     last_error TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_cs_jobs_status ON comment_sync_jobs(status);
+
+  -- Hook-analysis batch progress tracking. Same shape as comment_sync_jobs
+  -- (videos in / done / failed / status) plus channel_id so the banner
+  -- can show "Analyzing hooks on <channel>" and the boot-cleanup logic
+  -- doesn't need a separate code path. No cost column: Claude usage is
+  -- already tracked centrally in claude_usage, and per-hook spend is
+  -- a fraction of a cent — not worth a dedicated ledger here.
+  CREATE TABLE IF NOT EXISTS hook_analysis_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    completed_at INTEGER,
+    channel_id TEXT,                         -- which channel this batch was queued for
+    total INTEGER NOT NULL,                  -- videos to analyse
+    done INTEGER NOT NULL DEFAULT 0,         -- videos with hooks now stored
+    failed INTEGER NOT NULL DEFAULT 0,       -- videos that errored (Claude error, parse fail, short transcript)
+    current_video_id TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    last_error TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_ha_jobs_status ON hook_analysis_jobs(status);
 
   -- Per-turn Claude spend ledger. One row = one chat turn (user message →
   -- final assistant response). Tracks tokens separately for executor and
@@ -2896,6 +2924,75 @@ export function updateCommentSyncJob(
   );
 }
 
+/* ---------- Hook-analysis batch jobs ---------- */
+
+export type HookAnalysisJob = {
+  id: number;
+  started_at: number;
+  completed_at: number | null;
+  channel_id: string | null;
+  total: number;
+  done: number;
+  failed: number;
+  current_video_id: string | null;
+  status: "running" | "completed" | "failed" | "cancelled";
+  last_error: string | null;
+};
+
+export function getActiveHookAnalysisJob(): HookAnalysisJob | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM hook_analysis_jobs WHERE status = 'running' ORDER BY id DESC LIMIT 1`
+    )
+    .get() as HookAnalysisJob | undefined;
+}
+
+export function getLatestHookAnalysisJob(): HookAnalysisJob | undefined {
+  return db
+    .prepare(`SELECT * FROM hook_analysis_jobs ORDER BY id DESC LIMIT 1`)
+    .get() as HookAnalysisJob | undefined;
+}
+
+export function createHookAnalysisJob(
+  total: number,
+  channelId: string | null
+): number {
+  const info = db
+    .prepare(
+      `INSERT INTO hook_analysis_jobs (total, channel_id, status) VALUES (?, ?, 'running')`
+    )
+    .run(total, channelId);
+  return info.lastInsertRowid as number;
+}
+
+export function updateHookAnalysisJob(
+  id: number,
+  patch: Partial<Omit<HookAnalysisJob, "id" | "started_at">>
+): void {
+  const keys = Object.keys(patch) as (keyof typeof patch)[];
+  if (keys.length === 0) return;
+  const setClause = keys.map((k) => `${k} = ?`).join(", ");
+  const values = keys.map((k) => patch[k] as unknown);
+  db.prepare(`UPDATE hook_analysis_jobs SET ${setClause} WHERE id = ?`).run(
+    ...values,
+    id
+  );
+}
+
+/**
+ * Re-read a job to check whether the user cancelled it.
+ *
+ * The background worker calls this between every video so a Cancel
+ * button press takes effect within one Claude call's worth of latency
+ * (≈5-15s) rather than letting the whole batch run to completion.
+ */
+export function getHookAnalysisJobStatus(id: number): HookAnalysisJob["status"] | undefined {
+  const row = db
+    .prepare(`SELECT status FROM hook_analysis_jobs WHERE id = ?`)
+    .get(id) as { status: HookAnalysisJob["status"] } | undefined;
+  return row?.status;
+}
+
 /**
  * Active-channel-scoped list of videos with their current comment-sync
  * status (cached count + last-synced timestamp). Used by the bulk-
@@ -3742,22 +3839,37 @@ export function hookOverallStats(): {
   };
 }
 
-/** Videos that still need analysis — used by the batch analyzer. */
+/**
+ * Videos that still need hook analysis — used by both the batch analyzer
+ * and the Hook Lab dashboard's "pending" counter.
+ *
+ * Channel-scoped: only returns videos on the currently active channel.
+ * Without this scope the dashboard would count videos from every
+ * connected channel (so the user sees "40 pending" while the active
+ * channel really has 5), and the batch analyzer would happily burn
+ * Claude credits analysing another channel's videos that won't move
+ * the active dashboard at all. Same multi-channel data-leak pattern
+ * fixed in hookOverallStats / hookFormulaStats.
+ */
 export function listVideosPendingHookAnalysis(limit = 200): Array<{
   id: string;
   title: string;
 }> {
+  const activeId = getActiveChannelId();
+  if (!activeId) return [];
   return db
     .prepare(
       `SELECT v.id, v.title
        FROM videos v
        LEFT JOIN video_hooks h ON h.video_id = v.id
        LEFT JOIN transcripts t ON t.video_id = v.id
-       WHERE h.video_id IS NULL AND t.video_id IS NOT NULL
+       WHERE v.channel_id = ?
+         AND h.video_id IS NULL
+         AND t.video_id IS NOT NULL
        ORDER BY v.views DESC
        LIMIT ?`
     )
-    .all(limit) as Array<{ id: string; title: string }>;
+    .all(activeId, limit) as Array<{ id: string; title: string }>;
 }
 
 /* ============================================================
