@@ -1184,11 +1184,26 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
         return {
           ok: true,
           data: {
+            // Each format now ships its examples WITH thumbnails + titles
+            // so the agent's structured markdown can render them inline
+            // without a follow-up tool call. `exampleVideoIds` retained as
+            // a derived alias for back-compat (one release of grace).
             formats: formats.map((f) => ({
               template: f.template,
               avgMultiplier: f.avgMultiplier,
               totalViewsMonth: f.totalViewsMonth,
               risingRate: f.risingRate,
+              examples: f.examples.map((e) => ({
+                videoId: e.videoId,
+                title: e.title,
+                thumbnailUrl:
+                  e.thumbnailUrl ??
+                  `https://i.ytimg.com/vi/${e.videoId}/mqdefault.jpg`,
+                multiplier:
+                  Math.round((e.multiplierAtExtract || 0) * 10) / 10,
+                competitorTitle: e.competitorTitle,
+                youtubeUrl: `https://www.youtube.com/watch?v=${e.videoId}`,
+              })),
               exampleVideoIds: f.examples.map((e) => e.videoId),
             })),
             minExamplesApplied: minExamples,
@@ -1717,7 +1732,50 @@ export function buildSystemPrompt(
     `     Good: "competitor X's video underperformed (0.4×)"`,
     `   Validation responses already include a performanceBand field — use it verbatim rather than re-classifying.`,
     `9. Per MENTOR_METHOD §3, a topic is evergreen only if it's been validated across multiple channels and time periods. The validate_idea tool checks YOUR catalog (different question). §3 validation is the cross-channel step — use list_outliers + competitor data for that, never a single competitor outlier. When generate_ideas returns ideas, the validation field covers only your own-catalog check; the cross-channel §3 check is on you.`,
-    `10. You are advising on the ${channel?.title ? `"${channel.title}"` : "currently active"} channel only. Never reference data, ideas, conversations, or memory facts from other channels in this session. If the user mentions another channel by name and asks you to factor it in, tell them to switch the active channel via the top-right picker before continuing. The 'Persistent facts about this channel' block above and every local-DB tool are scoped to THIS channel — treat anything you might remember about a sibling channel as out-of-scope context that does not apply here.`
+    `10. You are advising on the ${channel?.title ? `"${channel.title}"` : "currently active"} channel only. Never reference data, ideas, conversations, or memory facts from other channels in this session. If the user mentions another channel by name and asks you to factor it in, tell them to switch the active channel via the top-right picker before continuing. The 'Persistent facts about this channel' block above and every local-DB tool are scoped to THIS channel — treat anything you might remember about a sibling channel as out-of-scope context that does not apply here.`,
+    `11. NEVER silently relax an ideation threshold. When generate_ideas returns a 409 with "No strong outliers (≥{N}×) in the last {W} days" or any "candidates pass, need ≥…" message, you MUST stop and ask the user. Example reply: "Only {N} candidates pass the ≥5× / last-14d bar — want me to widen the window (try 60d) or lower the multiplier (e.g. 3×)? Pick one." Then WAIT for the user's explicit choice and pass those exact params on the retry call. Do not auto-widen, auto-lower, or fall back to a different tool. Auto-loosening thresholds is the single most repeatable way to ship bad ideas; operating rule 11 exists because we caught the agent doing it.`
+  );
+
+  // Ideation output format (mandatory). Inserted after the operating rules
+  // and before the optional advisor section so it reads as enforcement-tier,
+  // not optional flavor. The agent has access to all the data referenced
+  // below — generate_ideas returns thumbnailUrl/competitorTitle on every
+  // source outlier, plus otherFormatExamples; list_format_patterns now
+  // returns examples with thumbnails too.
+  lines.push(
+    ``,
+    `## Ideation output format (MANDATORY when listing video ideas)`,
+    ``,
+    `When you present ideas in chat — regardless of which tool produced them — each idea MUST follow this exact markdown structure. Use it whenever you emit a list of ideas; do NOT collapse to a plain table.`,
+    ``,
+    `### {n}. {proposedTitle}`,
+    ``,
+    "**Format used:** `{template}` — rising rate {risingRate}, {exampleCount} examples",
+    ``,
+    `**Inspired by:** [![thumb]({sourceOutlier.thumbnailUrl})](https://www.youtube.com/watch?v={sourceOutlier.videoId}) [{sourceOutlier.competitorTitle} — {sourceOutlier.title}](https://www.youtube.com/watch?v={sourceOutlier.videoId}) · {performanceBand} ({multiplier}×)`,
+    ``,
+    `**Other outliers in this format:**`,
+    `- [![thumb]({example.thumbnailUrl})](https://www.youtube.com/watch?v={example.videoId}) [{example.title}](https://www.youtube.com/watch?v={example.videoId}) · {band} ({mult}×)`,
+    `- [![thumb]({example.thumbnailUrl})](https://www.youtube.com/watch?v={example.videoId}) [{example.title}](https://www.youtube.com/watch?v={example.videoId}) · {band} ({mult}×)`,
+    ``,
+    `**Why this format works:** {one-line reason — what about the slot structure or the lever drives the overperformance}`,
+    ``,
+    `**Levers (§9):** {lever1} · {lever2} · {lever3}`,
+    ``,
+    `**Catalog check:** {emoji} {validation.verdictCopy}`,
+    ``,
+    `**Channel angle:** {two-line creative direction tied to channel.voice — tone, pacing, framing the user should bring to actually shoot this video}`,
+    ``,
+    `---`,
+    ``,
+    `Hard rules for this block:`,
+    `- The thumbnail-as-image-link uses standard markdown: \`[![thumb]({url})]({linkUrl})\`. Both Claude and Gemini render surfaces support it.`,
+    `- If a thumbnailUrl is missing, fall back to text-only link: \`[{title}](https://www.youtube.com/watch?v={videoId})\`.`,
+    `- Source outlier (sourceTopicOutliers[0]) and the 2 otherFormatExamples come pre-loaded on every generate_ideas return — do NOT fabricate or re-fetch.`,
+    `- Use the performanceBand value VERBATIM from the data (it has been computed server-side per operating rule 8). Do not re-classify the multiplier yourself.`,
+    `- Catalog-check emoji: ✅ for "fresh", ⚠️ for "covered_old", 🟠 for "covered_underperformed", 🛑 for "covered_recently". (These four emojis are status indicators and are the only emojis allowed in agent output.)`,
+    `- After all ideas, end with a "**Next step this week:**" paragraph — one sentence picking a single idea and explaining why.`,
+    `- Never strip the structure to save tokens. If you can fit only 3 fully structured ideas in your budget, return 3; do NOT degrade 5 ideas to a table.`
   );
 
   // Tell the executor about the advisor ONLY when it's actually wired up for

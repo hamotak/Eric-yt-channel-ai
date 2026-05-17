@@ -3,6 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import {
   competitorMedianViews,
   getCompetitorVideosByIds,
+  getExampleVideosForFormat,
   getIntegration,
   listAllChannels,
 } from "./db";
@@ -37,23 +38,47 @@ const FORMAT_MIN_EXAMPLES = 3;
 const FORMAT_LIMIT = 6;
 const MIN_FORMAT_CANDIDATES = 2;
 
-// Originality guard. Token-overlap > MAX_OVERLAP triggers a regenerate
-// for that title slot. Tuned at 0.6 — 60% shared significant tokens is
-// usually the line between "applied the format" and "copied the source".
-// Watching for retry rate in production; bump to 0.7 if too tight.
-const MAX_OVERLAP = 0.6;
-const MAX_RETRY_PASSES = 2;
+// Originality guard. Thresholds live in idea-originality.ts (token-overlap
+// ratio, shared-noun count, longest consecutive-word run — three independent
+// gates). Up to MAX_RETRY_PASSES focused regenerate calls per flagged slot;
+// surviving flagged slots are DROPPED rather than shipped. Dropping is the
+// right tradeoff: better to return 3 strong ideas than 5 echoes.
+const MAX_RETRY_PASSES = 3;
+
+import {
+  performanceBandFor,
+  type PerformanceBand,
+} from "./validate-idea";
 
 export type ProposedIdea = {
   // Compatibility hedge: keep the singular sourceOutlierVideoId field
   // populated to the first entry of sourceTopicOutliers. Anything still
   // reading the old shape keeps working until we clean up.
   sourceOutlierVideoId: string;
-  sourceFormat: { id: number; template: string };
+  sourceFormat: {
+    id: number;
+    template: string;
+    risingRate: number | null;
+    exampleCount: number;
+  };
   sourceTopicOutliers: Array<{
     videoId: string;
     title: string;
     multiplier: number;
+    thumbnailUrl: string | null;
+    competitorTitle: string | null;
+    competitorHandle: string | null;
+    performanceBand: PerformanceBand;
+  }>;
+  // Up to 2 OTHER outliers exemplifying the same format (excluding any id
+  // in sourceTopicOutliers). Drives the "Other outliers in this format"
+  // block in the agent's structured markdown output.
+  otherFormatExamples: Array<{
+    videoId: string;
+    title: string;
+    thumbnailUrl: string | null;
+    multiplier: number;
+    performanceBand: PerformanceBand;
   }>;
   topicLabel: string;
   proposedTitle: string;
@@ -101,7 +126,9 @@ type OutlierLite = {
   title: string;
   views: number;
   multiplier: number;
+  thumbnailUrl: string | null;
   competitorTitle: string | null;
+  competitorHandle: string | null;
   tier: string;
   publishedAt: number | null;
 };
@@ -202,7 +229,9 @@ export async function generateIdeasForChannel(opts: {
         title: r.title,
         views: r.views,
         multiplier: med > 0 ? r.views / med : 0,
+        thumbnailUrl: ytThumbnail(r.videoId),
         competitorTitle: r.competitorTitle,
+        competitorHandle: r.competitorHandle ?? null,
         tier: r.tier,
         publishedAt: r.publishedAt,
       };
@@ -219,7 +248,9 @@ export async function generateIdeasForChannel(opts: {
       title: o.title,
       views: o.views,
       multiplier: o.multiplier,
+      thumbnailUrl: o.thumbnailUrl ?? ytThumbnail(o.videoId),
       competitorTitle: o.competitorTitle,
+      competitorHandle: o.competitorHandle ?? null,
       tier: o.tier,
       publishedAt: o.publishedAt,
     }));
@@ -307,21 +338,34 @@ export async function generateIdeasForChannel(opts: {
   type Annotated = RawComposedIdea & {
     sources: OutlierLite[];
     originalityScore: number;
+    maxOverlap: number;
+    sharedNouns: number;
+    longestSharedRun: number;
+    worstSourceTitle: string | null;
     flagged: boolean;
+    flagReason: string | null;
   };
   const score = (idea: RawComposedIdea): Annotated => {
     const sources = idea.sourceTopicOutlierIds
       .map((id) => outlierByVideoId.get(id))
       .filter((x): x is OutlierLite => x !== undefined);
-    const { maxOverlap, originalityScore } = scoreOriginality(
+    const verdict = scoreOriginality(
       idea.proposedTitle,
       sources.map((s) => s.title)
     );
     return {
       ...idea,
       sources,
-      originalityScore,
-      flagged: maxOverlap > MAX_OVERLAP,
+      originalityScore: verdict.originalityScore,
+      maxOverlap: verdict.maxOverlap,
+      sharedNouns: verdict.sharedNouns,
+      longestSharedRun: verdict.longestSharedRun,
+      worstSourceTitle:
+        verdict.worstSourceIndex >= 0
+          ? sources[verdict.worstSourceIndex]?.title ?? null
+          : null,
+      flagged: verdict.flagged,
+      flagReason: verdict.reason,
     };
   };
 
@@ -332,9 +376,23 @@ export async function generateIdeasForChannel(opts: {
     if (flagged.length === 0) break;
     log.debug(
       "claude",
-      `Outlier-ideas ${userChannelId}: regenerate pass ${pass + 1} — ${flagged.length} flagged`
+      `Outlier-ideas ${userChannelId}: regenerate pass ${pass + 1} — ${flagged.length} flagged (${flagged.map((f) => f.flagReason).join(",")})`
     );
-    const regenBody = buildRegenerateBody(flagged, formats);
+    const regenBody = buildRegenerateBody(
+      flagged.map((f) => ({
+        topicLabel: f.topicLabel,
+        sourceTopicOutlierIds: f.sourceTopicOutlierIds,
+        sourceFormatId: f.sourceFormatId,
+        proposedTitle: f.proposedTitle,
+        originalityScore: f.originalityScore,
+        maxOverlap: f.maxOverlap,
+        sharedNouns: f.sharedNouns,
+        longestSharedRun: f.longestSharedRun,
+        worstSourceTitle: f.worstSourceTitle,
+        flagReason: f.flagReason,
+      })),
+      formats
+    );
     try {
       const client = new Anthropic({ apiKey });
       const resp = await client.messages.create({
@@ -383,24 +441,51 @@ export async function generateIdeasForChannel(opts: {
   // Drop slots that still overlap too much after retries.
   const surviving = annotated.filter((a) => !a.flagged);
 
-  // --- 5. Validate each surviving idea against own catalog ----------------
+  // --- 5. Validate each surviving idea against own catalog + hydrate
+  //        secondary citation block (otherFormatExamples) ----------------
   const ideas: ProposedIdea[] = surviving.map((a) => {
     const fmt = formatById.get(a.sourceFormatId);
     const validation = validateIdeaAgainstOwnCatalog({
       topic: a.topicLabel,
       userChannelId,
     });
+    // Other outliers exemplifying THIS format, excluding any video that
+    // already appears in the idea's sources (avoid duplicate citations).
+    const sourceIds = new Set(a.sources.map((s) => s.videoId));
+    const otherFormatExamples = getExampleVideosForFormat(a.sourceFormatId, 5)
+      .filter((e) => !sourceIds.has(e.videoId))
+      .slice(0, 2)
+      .map((e) => {
+        const m = Math.round((e.multiplierAtExtract || 0) * 10) / 10;
+        return {
+          videoId: e.videoId,
+          title: e.title,
+          thumbnailUrl: e.thumbnailUrl ?? ytThumbnail(e.videoId),
+          multiplier: m,
+          performanceBand: performanceBandFor(m),
+        };
+      });
     return {
       sourceOutlierVideoId: a.sources[0]?.videoId ?? "",
       sourceFormat: {
         id: a.sourceFormatId,
         template: fmt?.template ?? "(unknown)",
+        risingRate: fmt?.risingRate ?? null,
+        exampleCount: fmt?.examples ?? 0,
       },
-      sourceTopicOutliers: a.sources.map((s) => ({
-        videoId: s.videoId,
-        title: s.title,
-        multiplier: Math.round(s.multiplier * 10) / 10,
-      })),
+      sourceTopicOutliers: a.sources.map((s) => {
+        const m = Math.round(s.multiplier * 10) / 10;
+        return {
+          videoId: s.videoId,
+          title: s.title,
+          multiplier: m,
+          thumbnailUrl: s.thumbnailUrl,
+          competitorTitle: s.competitorTitle,
+          competitorHandle: s.competitorHandle,
+          performanceBand: performanceBandFor(m),
+        };
+      }),
+      otherFormatExamples,
       topicLabel: a.topicLabel,
       proposedTitle: a.proposedTitle,
       angle: a.angle,
@@ -514,15 +599,30 @@ function buildRegenerateBody(
     sourceFormatId: number;
     proposedTitle: string;
     originalityScore: number;
+    maxOverlap: number;
+    sharedNouns: number;
+    longestSharedRun: number;
+    worstSourceTitle: string | null;
+    flagReason: string | null;
   }>,
   formats: FormatLite[]
 ): string {
   const fmtById = new Map(formats.map((f) => [f.id, f]));
   return [
-    "# REGENERATE ONLY THESE TITLES",
-    "Your previous proposed titles overlapped too much with source outlier titles. Compose a fresher title for each, more strongly driven by the format structure and less by source phrasing. Keep the same topicLabel and sourceFormatId.",
+    "# FORCED RETRY — your previous titles echoed sources too closely",
     "",
-    "Return JSON ONLY:",
+    "These are forced retries. Your previous attempts mirrored source outlier phrasing instead of applying the format anew. Be AGGRESSIVE on novelty: the format is the skeleton, the topic is the subject, but the surface phrasing must NOT mirror any source title. For each entry below, generate a TRULY DIFFERENT title that applies the SAME format to the SAME topic but with:",
+    "  - different subject phrasing,",
+    "  - different verb choice,",
+    "  - swap at least 2 content nouns for synonyms, related concepts, or oblique references.",
+    "",
+    "Examples of how to remix (illustrative — invent your own; do NOT reuse these literally):",
+    "  • instead of \"CERN Just Detected Two Timelines\" → \"A CERN Detector Quietly Logged Something Impossible\"",
+    "  • or → \"Two Timelines Appeared at CERN — and No One Will Discuss It\"",
+    "  • instead of \"James Webb Found Galaxies That Shouldn't Exist\" → \"Webb's Deep Field Holds a Geometry That Breaks the Models\"",
+    "  • or → \"There Are Galaxies in Webb's Data That Pre-Date the Universe\"",
+    "",
+    "Keep the same topicLabel and sourceFormatId. Return JSON ONLY:",
     "{",
     '  "regenerated": [',
     '    { "topicLabel": string, "proposedTitle": string, "angle": string, "confidence": number }',
@@ -531,11 +631,20 @@ function buildRegenerateBody(
     "",
     ...flagged.map((f) => {
       const fmt = fmtById.get(f.sourceFormatId);
+      const reasonLabel =
+        f.flagReason === "shared-run"
+          ? `shared a ${f.longestSharedRun}-word run with a source`
+          : f.flagReason === "shared-nouns"
+            ? `shared ${f.sharedNouns} content nouns with a source`
+            : `overlapped ${(f.maxOverlap * 100).toFixed(0)}% of tokens with a source`;
       return [
         `## ${f.topicLabel}`,
         `- Format [F-${f.sourceFormatId}]: "${fmt?.template ?? "(unknown)"}"`,
-        `- Previous (too overlap-y, originalityScore=${f.originalityScore.toFixed(2)}): "${f.proposedTitle}"`,
-        `- Source ids: ${f.sourceTopicOutlierIds.join(", ")}`,
+        `- BLOCKED previous attempt: "${f.proposedTitle}"`,
+        `- Reason: ${reasonLabel} (originalityScore=${f.originalityScore.toFixed(2)}, maxOverlap=${f.maxOverlap.toFixed(2)}, sharedNouns=${f.sharedNouns}, longestSharedRun=${f.longestSharedRun})`,
+        f.worstSourceTitle
+          ? `- Closest source: "${f.worstSourceTitle}"`
+          : `- Source ids: ${f.sourceTopicOutlierIds.join(", ")}`,
       ].join("\n");
     }),
   ].join("\n");
@@ -560,6 +669,12 @@ function fmtAge(ts: number): string {
   if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d ago`;
   if (diff < 86400 * 365) return `${Math.floor(diff / (86400 * 30))}mo ago`;
   return `${Math.floor(diff / (86400 * 365))}y ago`;
+}
+
+// YouTube's static thumbnail convention. Used when a row didn't carry an
+// explicit thumbnail_url — every published video has /vi/<id>/mqdefault.jpg.
+function ytThumbnail(videoId: string): string {
+  return `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
 }
 
 function parseJsonObject(raw: string): unknown {
