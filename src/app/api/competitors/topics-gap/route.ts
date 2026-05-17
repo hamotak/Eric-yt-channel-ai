@@ -3,7 +3,10 @@ import {
   getActiveChannelId,
   getCompetitorVideosByIds,
 } from "@/lib/db";
-import { competitorTopicsGap } from "@/lib/competitor-topics-gap";
+import {
+  competitorTopicsGap,
+  type GapsWindowDays,
+} from "@/lib/competitor-topics-gap";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -11,11 +14,14 @@ export const maxDuration = 60;
 /**
  * POST /api/competitors/topics-gap
  *
- * Body: { userChannelId?: string, refresh?: boolean }
+ * Body:
+ *   { userChannelId?: string, refresh?: boolean, windowDays?: 14|30|90|null }
  *
  * Calls Claude with §4 inlined to surface topic-level gaps (subject
  * areas working for competitors that the user hasn't covered). Cached
- * 4 hours per user channel; pass {refresh:true} to bust the cache.
+ * 4 hours per (userChannelId, windowDays); pass {refresh:true} to bust
+ * the cache for the chosen window. windowDays defaults to 14 — the
+ * page-level Topics Gap pill row aligns with this.
  *
  * Response embeds example-video thumbnail/title data alongside each
  * gap so the UI can render thumbnails without a second round-trip.
@@ -24,6 +30,7 @@ export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as {
     userChannelId?: unknown;
     refresh?: unknown;
+    windowDays?: unknown;
   };
   const userChannelId =
     typeof body.userChannelId === "string" && body.userChannelId.trim()
@@ -37,7 +44,35 @@ export async function POST(req: Request) {
   }
   const refresh = body.refresh === true;
 
-  const result = await competitorTopicsGap({ userChannelId, refresh });
+  // Validate windowDays. Accept 14/30/90 (numeric), null (explicit
+  // "all time"), or undefined (lib defaults to 14). Reject anything
+  // else so the cache key namespace stays bounded.
+  let windowDays: GapsWindowDays | undefined;
+  if (body.windowDays === null) {
+    windowDays = null;
+  } else if (body.windowDays === undefined) {
+    windowDays = undefined;
+  } else if (
+    body.windowDays === 14 ||
+    body.windowDays === 30 ||
+    body.windowDays === 90
+  ) {
+    windowDays = body.windowDays;
+  } else {
+    return NextResponse.json(
+      {
+        error:
+          "windowDays must be one of: 14, 30, 90, null (for all time), or omitted.",
+      },
+      { status: 400 }
+    );
+  }
+
+  const result = await competitorTopicsGap({
+    userChannelId,
+    refresh,
+    windowDays,
+  });
   if (!result.ok) {
     return NextResponse.json(
       { error: result.error },

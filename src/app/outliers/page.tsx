@@ -94,7 +94,7 @@ type FormatRow = {
 };
 
 const VIEW_MODE_KEY = "dashboard.viewMode";
-type TabName = "recent" | "library" | "patterns" | "gaps";
+type TabName = "recent" | "patterns" | "gaps";
 
 /* ---------------- Recent + Topics Gap types (shared) ---------------- */
 
@@ -183,12 +183,23 @@ function OutliersInner() {
   const searchParams = useSearchParams();
   // Default landing tab is Recent — the sidebar badge expects unread
   // discoveries to be one click away, and most session entries come via
-  // that badge. Library / Patterns / Gaps remain reachable via ?tab=.
+  // that badge. Patterns / Gaps remain reachable via ?tab=.
   const tabParam = searchParams.get("tab");
   const activeTab: TabName =
-    tabParam === "library" || tabParam === "patterns" || tabParam === "gaps"
-      ? tabParam
-      : "recent";
+    tabParam === "patterns" || tabParam === "gaps" ? tabParam : "recent";
+
+  // ?tab=library is a legacy deep-link from before Recent and Library
+  // were merged. Soft-redirect to Recent so old bookmarks land on the
+  // canonical surface without a 404 or stale tab name.
+  useEffect(() => {
+    if (tabParam === "library") {
+      const qs = new URLSearchParams(searchParams.toString());
+      qs.delete("tab");
+      router.replace(
+        `${pathname}${qs.toString() ? `?${qs.toString()}` : ""}`
+      );
+    }
+  }, [tabParam, pathname, router, searchParams]);
 
   const [scope, setScope] = useState<string | "all" | null>(null);
 
@@ -234,13 +245,12 @@ function OutliersInner() {
           Outliers
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Competitor videos that beat their own channel&apos;s median. Recent
-          shows fresh discoveries (≥1.5× generation floor); Library is the
-          methodology view (≥2× per{" "}
+          Competitor videos that beat their own channel&apos;s median (≥1.5×
+          generation floor; ≥2× is the methodology canon per{" "}
           <code className="rounded bg-muted px-1 py-0.5 text-xs">
             MENTOR_METHOD.md §2
           </code>
-          ).
+          ). Filter to taste.
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
           Want ideas from these outliers?{" "}
@@ -263,12 +273,6 @@ function OutliersInner() {
           Recent
         </TabLink>
         <TabLink
-          active={activeTab === "library"}
-          onClick={() => goTab("library")}
-        >
-          Library
-        </TabLink>
-        <TabLink
           active={activeTab === "patterns"}
           onClick={() => goTab("patterns")}
         >
@@ -285,8 +289,6 @@ function OutliersInner() {
 
       {activeTab === "recent" ? (
         <RecentTab scope={scope} />
-      ) : activeTab === "library" ? (
-        <LibraryTab scope={scope} />
       ) : activeTab === "patterns" ? (
         <PatternsTab scope={scope} />
       ) : (
@@ -321,148 +323,12 @@ function TabLink({
   );
 }
 
-/* ---------------- Library tab ---------------- */
-
-const MIN_MULT_KEY = "outliers.min_multiplier";
-const MIN_MULT_STOPS = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 10.0] as const;
-
-function readPersistedMultiplier(): number {
-  if (typeof window === "undefined") return 2;
-  const raw = window.localStorage.getItem(MIN_MULT_KEY);
-  if (!raw) return 2;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 1) return 2;
-  return parsed;
-}
-
-function LibraryTab({ scope }: { scope: string | "all" | null }) {
-  const [outliers, setOutliers] = useState<Outlier[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [openOutlier, setOpenOutlier] = useState<Outlier | null>(null);
-  // Initialise from localStorage on first render so we don't double-fetch.
-  // SSR safety: readPersistedMultiplier guards `typeof window`.
-  const [minMult, setMinMult] = useState<number>(() => readPersistedMultiplier());
-
-  useEffect(() => {
-    window.localStorage.setItem(MIN_MULT_KEY, String(minMult));
-  }, [minMult]);
-
-  useEffect(() => {
-    if (scope === null) return;
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    const params = new URLSearchParams();
-    params.set("userChannelId", scope === "all" ? "all" : scope);
-    params.set("minMultiplier", String(minMult));
-    fetch(`/api/outliers?${params.toString()}`, { cache: "no-store" })
-      .then((r) => r.json())
-      .then((d: { outliers?: Outlier[]; error?: string }) => {
-        if (cancelled) return;
-        if (d.error) {
-          setError(d.error);
-          setOutliers([]);
-          return;
-        }
-        setOutliers(d.outliers ?? []);
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : "Failed to load outliers.");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [scope, minMult]);
-
-  return (
-    <>
-      {/* Min outlier multiplier — single per-user display filter, persisted
-          to localStorage. The server-side default (the count rendered on
-          /competitors cards) stays at 2×; this slider only narrows what's
-          shown HERE on the Library tab. */}
-      <div className="mb-4 flex flex-wrap items-center gap-2 text-xs">
-        <span className="text-muted-foreground">Min outlier multiplier:</span>
-        <div className="inline-flex flex-wrap items-center gap-1">
-          {MIN_MULT_STOPS.map((v) => (
-            <button
-              key={v}
-              type="button"
-              onClick={() => setMinMult(v)}
-              className={cn(
-                "rounded-full px-2.5 py-0.5 font-medium transition-colors",
-                minMult === v
-                  ? "bg-primary/15 text-primary"
-                  : "border border-border text-muted-foreground hover:text-foreground"
-              )}
-            >
-              {v.toFixed(1)}×
-            </button>
-          ))}
-        </div>
-        <span className="ml-2 text-muted-foreground">
-          Showing outliers ≥ {minMult.toFixed(1)}×
-        </span>
-      </div>
-
-      {error && (
-        <div className="mb-4 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-          {error}
-        </div>
-      )}
-      {loading ? (
-        <div className="flex items-center justify-center gap-2 py-20 text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          Loading outliers…
-        </div>
-      ) : outliers.length === 0 ? (
-        <Card>
-          <CardContent className="py-12 text-center text-sm text-muted-foreground">
-            No outliers at ≥ {minMult.toFixed(1)}×. Try lowering the threshold,
-            sync more competitors, or wait for their recent videos to accumulate
-            views.
-          </CardContent>
-        </Card>
-      ) : (
-        <ul className="space-y-2">
-          {outliers.map((o) => (
-            <OutlierRow
-              key={o.videoId}
-              videoId={o.videoId}
-              title={o.title}
-              thumbnailUrl={o.thumbnailUrl}
-              views={o.views}
-              multiplier={o.multiplier}
-              publishedAt={o.publishedAt}
-              competitorTitle={o.competitorTitle}
-              competitorHandle={o.competitorHandle}
-              tier={o.tier}
-              durationSeconds={o.durationSeconds}
-              onExplain={() => setOpenOutlier(o)}
-            />
-          ))}
-        </ul>
-      )}
-      {openOutlier && (
-        <ExplainModal
-          outlier={openOutlier}
-          onClose={() => setOpenOutlier(null)}
-        />
-      )}
-    </>
-  );
-}
-
 /* ---------------- Recent tab (the discovery log) ---------------- */
 /**
  * Reads from competitor_alerts — discovered competitor videos at the
  * 1.5× generation floor. Sorted newest first. Per-row mark-read clears
- * the sidebar badge. Read-state and the filter/sort knobs live here;
- * Library is the strictly-2× methodology view with no read state.
+ * the sidebar badge. The canonical browse surface for the page —
+ * Library was merged in (Recent strictly wins on filters).
  */
 function RecentTab({ scope }: { scope: string | "all" | null }) {
   const [alerts, setAlerts] = useState<Alert[] | null>(null);
@@ -470,6 +336,7 @@ function RecentTab({ scope }: { scope: string | "all" | null }) {
   const [sort, setSort] = useState<AlertSort>("outlier");
   const [windowKey, setWindowKey] = useState<AlertWindow>("all");
   const [minMult, setMinMult] = useState<number>(2);
+  const [openOutlier, setOpenOutlier] = useState<Outlier | null>(null);
 
   // Preserve the per-browser filter the old /competitors Alerts tab used.
   // Guard at 1.5 so a stale "1" from before the 1× pill was dropped snaps
@@ -609,7 +476,7 @@ function RecentTab({ scope }: { scope: string | "all" | null }) {
             ))}
           </div>
           <span className="ml-auto text-[11px] text-muted-foreground">
-            {filtered.length} alert{filtered.length === 1 ? "" : "s"} shown
+            {filtered.length} outlier{filtered.length === 1 ? "" : "s"} shown
             {filtered.length !== alerts.length && (
               <span className="text-muted-foreground/60">
                 {" "}
@@ -641,8 +508,8 @@ function RecentTab({ scope }: { scope: string | "all" | null }) {
       {filtered.length === 0 ? (
         <div className="py-12 text-center text-sm text-muted-foreground">
           {alerts.length === 0
-            ? "Alerts surface competitor videos at ≥ 1.5× their channel's median views. Add competitors and sync to populate."
-            : "No alerts match these filters. Try widening the window or lowering the min outlier."}
+            ? "Outliers surface competitor videos at ≥ 1.5× their channel's median views. Add competitors and sync to populate."
+            : "No outliers match these filters. Try widening the window or lowering the min outlier."}
         </div>
       ) : (
         <ul className="space-y-2">
@@ -661,42 +528,92 @@ function RecentTab({ scope }: { scope: string | "all" | null }) {
               tier={a.competitor_tier}
               isUnread={!a.read_at}
               onMarkRead={() => markRead(a.id)}
+              onExplain={() => setOpenOutlier(alertToOutlier(a))}
             />
           ))}
         </ul>
       )}
+      {openOutlier && (
+        <ExplainModal
+          outlier={openOutlier}
+          onClose={() => setOpenOutlier(null)}
+        />
+      )}
     </>
   );
+}
+
+/**
+ * Adapt a Recent-tab Alert row to the shape ExplainModal expects. The
+ * modal only reads videoId/title/thumb/views/multiplier/publishedAt/
+ * tier/competitorTitle/competitorHandle/competitorId; the remaining
+ * Outlier fields (competitorAvatar, channelMedian, durationSeconds) are
+ * either unused or fall back to safe defaults. Nullable fields on the
+ * alert collapse to 0 / "(untitled)" so the modal's display helpers
+ * don't have to special-case them.
+ */
+function alertToOutlier(a: Alert): Outlier {
+  return {
+    videoId: a.video_id,
+    title: a.title ?? "(untitled)",
+    thumbnailUrl: a.thumbnail_url,
+    views: a.views ?? 0,
+    publishedAt: a.published_at,
+    durationSeconds: null,
+    competitorId: a.competitor_id,
+    competitorTitle: a.competitor_title,
+    competitorHandle: a.competitor_handle,
+    competitorAvatar: null,
+    tier: a.competitor_tier,
+    multiplier: a.multiplier ?? 0,
+    channelMedian: a.channel_median_views ?? 0,
+  };
 }
 
 /* ---------------- Topics Gap tab (ported from /competitors) ---------------- */
 /**
  * AI grouping of competitor outliers into topics the user hasn't covered.
  * Lazy-loads on first tab open so we don't burn a Claude call on every
- * page visit. Cached server-side per active channel for 4 hours.
+ * page visit. Cached server-side per (active channel, window) for 4 hours.
+ *
+ * Default window is 14d — surfaces what's currently working over the
+ * stale-but-still-cached 60d view. Each window keeps its own 4h cache
+ * server-side; switching windows triggers a fresh fetch (cache-served
+ * on the second visit within 4 hours).
  */
+type GapsWindow = 14 | 30 | 90 | "all";
+const GAPS_WINDOW_STOPS: readonly GapsWindow[] = [14, 30, 90, "all"] as const;
+
+function gapsWindowLabel(w: GapsWindow): string {
+  return w === "all" ? "All" : `${w}d`;
+}
+
 function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
   const [gaps, setGaps] = useState<TopicGap[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [generatedAt, setGeneratedAt] = useState<number | null>(null);
   const [cached, setCached] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [windowKey, setWindowKey] = useState<GapsWindow>(14);
 
-  // Topics Gap is per-channel; "all" mode doesn't make sense because the
+  // Topics Gap is per-channel; "all" scope doesn't make sense because the
   // server keys the cache by user_channel_id. Pass scope through; the
   // route falls back to the active channel when no userChannelId is given.
+  // windowDays is sent as `null` for "all" so the server can drop the
+  // time filter; numeric values constrain the outlier + user-video pull.
   const fetchGaps = useCallback(
-    async (refresh: boolean) => {
+    async (refresh: boolean, win: GapsWindow) => {
       if (scope === null) return;
       setLoading(true);
       setError(null);
       try {
+        const windowDays: number | null = win === "all" ? null : win;
+        const body: Record<string, unknown> = { refresh, windowDays };
+        if (scope !== "all") body.userChannelId = scope;
         const r = await fetch("/api/competitors/topics-gap", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(
-            scope === "all" ? { refresh } : { userChannelId: scope, refresh }
-          ),
+          body: JSON.stringify(body),
           cache: "no-store",
         });
         const d = (await r.json()) as {
@@ -723,13 +640,24 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
     [scope]
   );
 
-  // Lazy load on first render — only when we have a real scope.
+  // Re-fetch whenever scope or window changes (lazy load on first render
+  // also lands here via the scope-resolution effect).
   useEffect(() => {
-    if (scope !== null && gaps === null && !loading) {
-      void fetchGaps(false);
-    }
+    if (scope === null) return;
+    void fetchGaps(false, windowKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope]);
+  }, [scope, windowKey]);
+
+  // Empty-state guidance points to wider windows; on All, only the
+  // "not enough data" framing makes sense.
+  const widerSuggestion =
+    windowKey === 14
+      ? "Try 30d or 90d."
+      : windowKey === 30
+        ? "Try 90d or All."
+        : windowKey === 90
+          ? "Try All."
+          : "Sync more competitors or wait for new uploads.";
 
   return (
     <Card>
@@ -747,14 +675,14 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
                   refresh after 4 hours
                 </>
               ) : (
-                "Click the button to generate. Cached 4 hours per channel."
+                "Click the button to generate. Cached 4 hours per channel + window."
               )}
             </p>
           </div>
           <Button
             size="sm"
             variant="outline"
-            onClick={() => fetchGaps(true)}
+            onClick={() => fetchGaps(true, windowKey)}
             disabled={loading}
             className="gap-1.5"
           >
@@ -765,6 +693,27 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
             )}
             {gaps ? "Re-generate" : "Generate"}
           </Button>
+        </div>
+
+        {/* Window pill row — 14d default. Each window keeps its own
+            server-side cache, so swapping is cheap on revisit. */}
+        <div className="flex flex-wrap items-center gap-1.5 text-xs">
+          <span className="text-muted-foreground">Window:</span>
+          {GAPS_WINDOW_STOPS.map((w) => (
+            <button
+              key={String(w)}
+              type="button"
+              onClick={() => setWindowKey(w)}
+              className={cn(
+                "rounded-full px-2 py-0.5 text-[11px] font-medium transition-colors",
+                windowKey === w
+                  ? "bg-primary/15 text-primary"
+                  : "border border-border text-muted-foreground hover:text-foreground"
+              )}
+            >
+              {gapsWindowLabel(w)}
+            </button>
+          ))}
         </div>
 
         {error && (
@@ -784,9 +733,9 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
           </div>
         ) : gaps && gaps.length === 0 ? (
           <div className="py-10 text-center text-sm text-muted-foreground">
-            No topic gaps found — either you&apos;ve covered every angle your
-            competitors are winning on, or there aren&apos;t enough outliers
-            yet.
+            No topic gaps in the last {gapsWindowLabel(windowKey).toLowerCase()}.
+            {" "}
+            {widerSuggestion}
           </div>
         ) : gaps ? (
           <ul className="grid grid-cols-1 gap-3 md:grid-cols-2">
@@ -835,21 +784,19 @@ function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
   );
 }
 
-/* ---------------- Shared row card (used by Recent + Library) ---------------- */
+/* ---------------- Shared row card ---------------- */
 /**
- * Single row visual used by both Recent and Library. The two tabs feed
- * different data shapes (alert row vs live outlier row) but they show
- * the same fields in the same arrangement — keeps the visual contract
- * consistent and means a card-styling change only happens in one place.
+ * Single row visual used by Recent. Kept as a separate component so a
+ * card-styling change happens in one place — and so any future surface
+ * (per-competitor detail, /chat result cards) can reuse the same shape.
  *
  * Optional knobs:
- *   - isUnread          → amber unread accent (Recent only)
- *   - onExplain         → click anywhere on the row opens the ExplainModal
- *                          (Library only; renders a Sparkles affordance)
- *   - onMarkRead        → renders a Check button when isUnread (Recent only)
- *   - durationSeconds   → small overlay on the thumbnail (Library only)
+ *   - isUnread          → amber unread accent
+ *   - onExplain         → click anywhere on the row opens the ExplainModal;
+ *                          also renders a Sparkles affordance on the right
+ *   - onMarkRead        → renders a Check button when isUnread
+ *   - durationSeconds   → small overlay on the thumbnail
  *   - detectedAt        → "detected Xh ago" tooltip on the upload date
- *                          (Recent only)
  */
 type OutlierRowProps = {
   videoId: string;

@@ -13,7 +13,27 @@ import { providerModelId } from "./ai-provider-types";
 import { extractSection, loadMentorMethod } from "./mentor-method";
 import { log } from "./logger";
 
-const CACHE_TTL_SEC = 4 * 60 * 60; // 4 hours per active channel
+const CACHE_TTL_SEC = 4 * 60 * 60; // 4 hours per (channel, window)
+
+// Allowed windows for the Gaps pill row on /outliers. null = no time filter.
+export type GapsWindowDays = 14 | 30 | 90 | null;
+export const GAPS_WINDOWS: readonly GapsWindowDays[] = [14, 30, 90, null];
+
+function windowSlug(w: GapsWindowDays): string {
+  return w === null ? "all" : `w${w}`;
+}
+
+function windowLabel(w: GapsWindowDays): string {
+  return w === null ? "all time" : `${w} days`;
+}
+
+// outliersForUserChannel requires a numeric windowDays. For "all" we
+// pass a value generous enough to cover everything we'd realistically
+// hold in competitor_videos (Apify pulls cap at 50 per channel, so
+// 365 days easily contains the entire catalogue).
+function effectiveWindowDays(w: GapsWindowDays): number {
+  return w === null ? 365 : w;
+}
 
 export type TopicGap = {
   topic: string;
@@ -42,12 +62,19 @@ type CachePayload = {
   gaps: TopicGap[];
 };
 
-function cacheKey(userChannelId: string): string {
-  return `competitor_topics_gap.cache.${userChannelId}`;
+// Cache key includes the window so each (channel, window) pair keeps
+// its own 4h-fresh cache. Pre-windowed keys from earlier builds
+// (`competitor_topics_gap.cache.${userChannelId}` with no suffix) become
+// orphans — harmless; they expire on TTL and no logic walks the key space.
+function cacheKey(userChannelId: string, windowDays: GapsWindowDays): string {
+  return `competitor_topics_gap.cache.${userChannelId}.${windowSlug(windowDays)}`;
 }
 
-function readCache(userChannelId: string): CachePayload | null {
-  const raw = getSetting(cacheKey(userChannelId));
+function readCache(
+  userChannelId: string,
+  windowDays: GapsWindowDays
+): CachePayload | null {
+  const raw = getSetting(cacheKey(userChannelId, windowDays));
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as CachePayload;
@@ -63,35 +90,43 @@ function readCache(userChannelId: string): CachePayload | null {
   }
 }
 
-function writeCache(userChannelId: string, payload: CachePayload): void {
-  setSetting(cacheKey(userChannelId), JSON.stringify(payload));
+function writeCache(
+  userChannelId: string,
+  windowDays: GapsWindowDays,
+  payload: CachePayload
+): void {
+  setSetting(cacheKey(userChannelId, windowDays), JSON.stringify(payload));
 }
 
 /**
  * AI Topics Gap analysis grounded in MENTOR_METHOD §4 (title formats are
  * structural, NOT topics — this endpoint is about TOPICS specifically).
- * Cached for 4h per user channel. Replaces the legacy word-frequency
- * /api/competitors/gaps endpoint at the page level. The chat tool still
- * uses competitorGapAnalysis() in db.ts for keyword-level reasoning —
+ * Cached for 4h per (user channel, window). The chat tool still uses
+ * competitorGapAnalysis() in db.ts for keyword-level reasoning —
  * different lens, different surface.
  *
  * Inputs:
- *   - competitor outliers (≥2× their channel median, last 60d)
- *   - the user's own video catalogue titles (last 60d)
+ *   - competitor outliers (≥2× their channel median, within `windowDays`)
+ *   - the user's own video catalogue titles (within `windowDays`)
+ *
+ * `windowDays` defaults to 14 — surfaces what's CURRENTLY working,
+ * not what worked a quarter ago. Pass null for "all time".
  *
  * Output: 5-15 topic gaps with example competitor video ids + reasoning.
  */
 export async function competitorTopicsGap(opts: {
   userChannelId: string;
   refresh?: boolean;
+  windowDays?: GapsWindowDays;
 }): Promise<TopicsGapResult> {
   const { userChannelId } = opts;
   if (!userChannelId) {
     return { ok: false, status: 400, error: "userChannelId required" };
   }
+  const windowDays: GapsWindowDays = opts.windowDays ?? 14;
 
   if (!opts.refresh) {
-    const cached = readCache(userChannelId);
+    const cached = readCache(userChannelId, windowDays);
     if (cached && Date.now() / 1000 - cached.generatedAt < CACHE_TTL_SEC) {
       return {
         ok: true,
@@ -117,11 +152,12 @@ export async function competitorTopicsGap(opts: {
     };
   }
 
-  // Competitor outliers — last 60 days, ≥2× their median, all tiers
-  // (per MENTOR_METHOD §2).
+  // Competitor outliers — within the chosen window, ≥2× their median,
+  // all tiers (per MENTOR_METHOD §2). Null window uses a generous numeric
+  // bound that effectively covers the whole catalogue.
   const { outliers } = outliersForUserChannel({
     userChannelId,
-    windowDays: 60,
+    windowDays: effectiveWindowDays(windowDays),
     minMultiplier: 2,
     tiers: [...COMPETITOR_TIERS],
     limit: 60,
@@ -130,24 +166,39 @@ export async function competitorTopicsGap(opts: {
     return {
       ok: false,
       status: 409,
-      error:
-        "No competitor outliers in the last 60 days. Add competitors and sync first.",
+      error: `No competitor outliers in the last ${windowLabel(windowDays)}. Add competitors and sync first, or widen the window.`,
     };
   }
 
-  // User's own videos (last 60d, titles only). Direct SQL against the
-  // shared db connection — no dedicated helper because every other reader
-  // of this table wants the full Video record.
-  const userVideos = db
-    .prepare(
-      `SELECT title, views FROM videos
-       WHERE channel_id = ?
-         AND published_at IS NOT NULL
-         AND published_at >= strftime('%s','now') - 60 * 86400
-       ORDER BY views DESC
-       LIMIT 100`
-    )
-    .all(userChannelId) as Array<{ title: string; views: number | null }>;
+  // User's own videos (titles only) within the same window. Direct SQL
+  // against the shared db connection — no dedicated helper because every
+  // other reader of this table wants the full Video record.
+  // null window drops the time filter so the comparison sees the user's
+  // whole catalogue.
+  const userVideos =
+    windowDays === null
+      ? (db
+          .prepare(
+            `SELECT title, views FROM videos
+             WHERE channel_id = ?
+               AND published_at IS NOT NULL
+             ORDER BY views DESC
+             LIMIT 100`
+          )
+          .all(userChannelId) as Array<{ title: string; views: number | null }>)
+      : (db
+          .prepare(
+            `SELECT title, views FROM videos
+             WHERE channel_id = ?
+               AND published_at IS NOT NULL
+               AND published_at >= strftime('%s','now') - ? * 86400
+             ORDER BY views DESC
+             LIMIT 100`
+          )
+          .all(userChannelId, windowDays) as Array<{
+          title: string;
+          views: number | null;
+        }>);
 
   const md = loadMentorMethod();
   const sec4 = extractSection(md, 4);
@@ -181,17 +232,18 @@ export async function competitorTopicsGap(opts: {
     "}",
   ].join("\n");
 
+  const windowHeader = `(last ${windowLabel(windowDays)})`;
   const userBody = [
-    "# COMPETITOR OUTLIERS (last 60 days)",
+    `# COMPETITOR OUTLIERS ${windowHeader}`,
     ...outliers.map(
       (o) =>
         `- [${o.videoId}] "${o.title}" — ${o.competitorTitle ?? o.competitorHandle ?? "?"} (${o.tier}) — ${o.multiplier.toFixed(1)}× median (median ${o.channelMedian.toLocaleString("en-US")} views, total ${o.views.toLocaleString("en-US")})`
     ),
     "",
-    "# USER VIDEOS (last 60 days)",
+    `# USER VIDEOS ${windowHeader}`,
     userVideos.length > 0
       ? userVideos.map((v) => `- "${v.title}" — ${v.views?.toLocaleString("en-US") ?? "?"}`).join("\n")
-      : "(no user videos in the last 60 days)",
+      : `(no user videos in the last ${windowLabel(windowDays)})`,
   ].join("\n");
 
   const model = providerModelId("claude");
@@ -230,10 +282,10 @@ export async function competitorTopicsGap(opts: {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  writeCache(userChannelId, { generatedAt: now, gaps });
+  writeCache(userChannelId, windowDays, { generatedAt: now, gaps });
   log.info(
     "claude",
-    `Topics-gap ${userChannelId}: ${gaps.length} gaps cached for 4h`
+    `Topics-gap ${userChannelId} ${windowSlug(windowDays)}: ${gaps.length} gaps cached for 4h`
   );
 
   return {
