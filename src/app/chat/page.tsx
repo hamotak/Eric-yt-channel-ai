@@ -72,6 +72,17 @@ type IntegrationsStatus = Record<
 
 const PROVIDER_PREF_KEY = "yt-channel-ai:chat-provider";
 
+// Starter prompts shown above the input when a session is empty. Click
+// fills the input; the user can edit before sending. These map directly
+// to the central-ideation-agent tool catalogue (list_outliers,
+// explain_outlier, competitor_gap_analysis, list_competitors).
+const STARTER_PROMPTS = [
+  "Generate 5 video ideas from my current outliers",
+  "Why did the top outlier in my niche perform so well?",
+  "Find topic gaps in my niche that competitors haven't covered",
+  "Which competitor is breaking out the fastest?",
+] as const;
+
 const TOOL_DEFS: {
   key: ToolGroup;
   label: string;
@@ -766,6 +777,27 @@ function ChatPageInner() {
 
         <div className="border-t border-border bg-background p-3">
           <div className="relative mx-auto max-w-3xl">
+            {/* Starter prompt chips — visible only when the current
+                conversation is empty AND the user has a working setup.
+                Clicking a chip places its text into the input but does
+                NOT auto-send, so the user can edit before firing. */}
+            {messages.length === 0 && activeId && hasKey && !sending && (
+              <div className="mb-3 flex flex-wrap gap-2">
+                {STARTER_PROMPTS.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => {
+                      setInput(p);
+                      textareaRef.current?.focus();
+                    }}
+                    className="rounded-full border border-border bg-background px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+            )}
             {showToolMenu && (
               <div
                 ref={toolMenuRef}

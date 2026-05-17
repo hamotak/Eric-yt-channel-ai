@@ -123,8 +123,11 @@ export default function TutorialPage() {
           </PageDescription>
 
           <PageDescription name="AI Chat" href="/chat" status="active">
-            Conversational interface to Claude about your channel. Attach a
-            video to focus the conversation.
+            Your central ideation agent. Talk to it about your channel, ask
+            for video ideas, ask why a competitor&apos;s video blew up, find
+            topic gaps. It reads your channel context, competitors, outliers,
+            format patterns, your videos, transcripts, comment analysis.
+            Follows the methodology in <code className="rounded bg-muted px-1 py-0.5 text-[10px]">MENTOR_METHOD.md</code>.
           </PageDescription>
 
           <PageDescription
@@ -166,13 +169,15 @@ export default function TutorialPage() {
           </PageDescription>
 
           <PageDescription name="Outliers" href="/outliers" status="active">
-            Live feed of competitor videos that overperformed their own
-            channel&apos;s median by 3× or more. Click any outlier and Claude
-            tags it with &ldquo;what made it work&rdquo; levers (curiosity,
-            nostalgia, counterintuitive, etc.) plus a 2-3 sentence reasoning.
-            The &ldquo;Generate ideas&rdquo; button reads your channel context
-            and the visible outliers, then proposes 5–10 video ideas grounded
-            in the methodology.
+            Two tabs. <strong>Library</strong> shows competitor videos that
+            beat their own channel&apos;s median by 3×+. Click any card →
+            Claude tags it with &ldquo;what made it work&rdquo; levers
+            (curiosity, nostalgia, counterintuitive, etc.) plus 2-3 sentences
+            of reasoning. <strong>Patterns</strong> extracts title format
+            templates from those outliers (like &ldquo;[Place]&apos;s most
+            [Adjective] [Thing]&rdquo;) so you see WHAT is structurally
+            working in the niche right now. To turn outliers into ideas, ask
+            the AI Chat.
           </PageDescription>
 
           <PageDescription name="Styles Library" status="coming-soon">
@@ -196,9 +201,8 @@ export default function TutorialPage() {
           <PageDescription name="Topic Ideation" status="coming-soon">
             The synthesizer. Pick a channel → Claude generates 10 video ideas
             using your channel context + recent outliers + saved title /
-            thumbnail formats. Approve, edit, or trash each one. v0 available
-            now via the &ldquo;Generate ideas&rdquo; button on the Outliers
-            page. Full standalone page lands in a later step.
+            thumbnail formats. Approve, edit, or trash each one. Available now
+            in AI Chat — full standalone page comes later.
           </PageDescription>
         </div>
       </Section>

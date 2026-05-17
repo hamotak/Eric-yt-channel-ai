@@ -3696,6 +3696,253 @@ export function upsertOutlierExplanation(input: {
   );
 }
 
+/* ============================================================
+ * OUTLIER FORMAT LIBRARY (Phase E — /outliers Patterns tab)
+ *
+ * Claude-extracted structural title-format templates from a channel's
+ * current outliers (per MENTOR_METHOD §4: title formats are patterns,
+ * not literal titles). One row per (user_channel_id, template); the
+ * link table maps each format to its example videos with a snapshot of
+ * the multiplier at extraction time (snapshot avoids recomputing the
+ * per-competitor median for the weekly charts every render).
+ * ============================================================ */
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS outlier_formats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    template TEXT NOT NULL,
+    avg_multiplier REAL,
+    total_views_month INTEGER,
+    rising_rate REAL,
+    extracted_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    model TEXT,
+    UNIQUE(user_channel_id, template)
+  );
+  CREATE INDEX IF NOT EXISTS idx_outlier_formats_user
+    ON outlier_formats(user_channel_id, rising_rate DESC, avg_multiplier DESC);
+
+  CREATE TABLE IF NOT EXISTS outlier_format_videos (
+    format_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL,
+    multiplier_at_extract REAL,
+    PRIMARY KEY (format_id, video_id),
+    FOREIGN KEY (format_id) REFERENCES outlier_formats(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_outlier_format_videos_video
+    ON outlier_format_videos(video_id);
+`);
+
+export type OutlierFormat = {
+  id: number;
+  userChannelId: string;
+  template: string;
+  avgMultiplier: number | null;
+  totalViewsMonth: number | null;
+  risingRate: number | null;
+  extractedAt: number;
+  model: string | null;
+};
+
+/**
+ * Upsert a format row by (user_channel_id, template). Used by the
+ * format-extraction flow when Claude returns the format batch — each
+ * format's metrics are computed in JS first, then written here.
+ * Returns the row id whether inserted or updated.
+ */
+export function upsertOutlierFormat(input: {
+  userChannelId: string;
+  template: string;
+  avgMultiplier: number | null;
+  totalViewsMonth: number | null;
+  risingRate: number | null;
+  model: string | null;
+}): number {
+  db.prepare(
+    `INSERT INTO outlier_formats
+       (user_channel_id, template, avg_multiplier, total_views_month,
+        rising_rate, extracted_at, model)
+     VALUES (?, ?, ?, ?, ?, strftime('%s','now'), ?)
+     ON CONFLICT(user_channel_id, template) DO UPDATE SET
+       avg_multiplier = excluded.avg_multiplier,
+       total_views_month = excluded.total_views_month,
+       rising_rate = excluded.rising_rate,
+       extracted_at = strftime('%s','now'),
+       model = excluded.model`
+  ).run(
+    input.userChannelId,
+    input.template,
+    input.avgMultiplier,
+    input.totalViewsMonth,
+    input.risingRate,
+    input.model
+  );
+  const row = db
+    .prepare(
+      `SELECT id FROM outlier_formats WHERE user_channel_id = ? AND template = ?`
+    )
+    .get(input.userChannelId, input.template) as { id: number } | undefined;
+  return row?.id ?? -1;
+}
+
+/**
+ * Replace this format's video links with a fresh set. Idempotent —
+ * deletes existing rows for this format_id then inserts the new ones.
+ * Called once per format on each re-extract.
+ */
+export function rebuildFormatVideoLinks(
+  formatId: number,
+  links: Array<{ videoId: string; multiplierAtExtract: number }>
+): void {
+  const tx = db.transaction(() => {
+    db.prepare(`DELETE FROM outlier_format_videos WHERE format_id = ?`).run(
+      formatId
+    );
+    const ins = db.prepare(
+      `INSERT INTO outlier_format_videos
+         (format_id, video_id, multiplier_at_extract)
+       VALUES (?, ?, ?)`
+    );
+    for (const l of links) {
+      ins.run(formatId, l.videoId, l.multiplierAtExtract);
+    }
+  });
+  tx();
+}
+
+/**
+ * List formats for a user channel sorted by rising rate DESC, then by
+ * avg multiplier DESC. Used by the Patterns tab + the list_format_patterns
+ * chat tool. The example videos (top 5 by multiplier_at_extract) come
+ * from getExampleVideosForFormat in a per-row call — at the format
+ * scale we expect (≤ 20), N+1 is fine.
+ */
+export function listFormatsForChannel(
+  userChannelId: string,
+  limit = 50
+): OutlierFormat[] {
+  const rows = db
+    .prepare(
+      `SELECT id, user_channel_id, template, avg_multiplier,
+              total_views_month, rising_rate, extracted_at, model
+       FROM outlier_formats
+       WHERE user_channel_id = ?
+       ORDER BY COALESCE(rising_rate, 0) DESC, COALESCE(avg_multiplier, 0) DESC
+       LIMIT ?`
+    )
+    .all(userChannelId, limit) as Array<{
+    id: number;
+    user_channel_id: string;
+    template: string;
+    avg_multiplier: number | null;
+    total_views_month: number | null;
+    rising_rate: number | null;
+    extracted_at: number;
+    model: string | null;
+  }>;
+  return rows.map((r) => ({
+    id: r.id,
+    userChannelId: r.user_channel_id,
+    template: r.template,
+    avgMultiplier: r.avg_multiplier,
+    totalViewsMonth: r.total_views_month,
+    risingRate: r.rising_rate,
+    extractedAt: r.extracted_at,
+    model: r.model,
+  }));
+}
+
+/**
+ * Top example videos for a format, joined to the competitor_videos row
+ * so the UI can show thumbnails + titles + competitor metadata. Sorted
+ * by the snapshot multiplier descending.
+ */
+export function getExampleVideosForFormat(
+  formatId: number,
+  limit = 5
+): Array<{
+  videoId: string;
+  title: string;
+  thumbnailUrl: string | null;
+  views: number;
+  publishedAt: number | null;
+  competitorId: number;
+  competitorTitle: string | null;
+  competitorHandle: string | null;
+  competitorSubs: number | null;
+  tier: string;
+  multiplierAtExtract: number;
+}> {
+  const rows = db
+    .prepare(
+      `SELECT ofv.video_id, ofv.multiplier_at_extract,
+              cv.title, cv.thumbnail_url, cv.views, cv.published_at,
+              cv.competitor_id,
+              c.title  AS competitor_title,
+              c.handle AS competitor_handle,
+              c.subscriber_count AS competitor_subs,
+              c.tier
+       FROM outlier_format_videos ofv
+       JOIN competitor_videos cv ON cv.video_id = ofv.video_id
+       JOIN competitors c        ON c.id        = cv.competitor_id
+       WHERE ofv.format_id = ?
+       ORDER BY ofv.multiplier_at_extract DESC
+       LIMIT ?`
+    )
+    .all(formatId, limit) as Array<{
+    video_id: string;
+    multiplier_at_extract: number;
+    title: string;
+    thumbnail_url: string | null;
+    views: number;
+    published_at: number | null;
+    competitor_id: number;
+    competitor_title: string | null;
+    competitor_handle: string | null;
+    competitor_subs: number | null;
+    tier: string;
+  }>;
+  return rows.map((r) => ({
+    videoId: r.video_id,
+    title: r.title,
+    thumbnailUrl: r.thumbnail_url,
+    views: r.views,
+    publishedAt: r.published_at,
+    competitorId: r.competitor_id,
+    competitorTitle: r.competitor_title,
+    competitorHandle: r.competitor_handle,
+    competitorSubs: r.competitor_subs,
+    tier: r.tier,
+    multiplierAtExtract: r.multiplier_at_extract,
+  }));
+}
+
+/**
+ * Per-format weekly histogram for the tiny charts on each card. Returns
+ * up to 10 weeks of (week_index, n, avg_mult) where week_index = 0 is
+ * "this week" and 9 is "9 weeks ago". Used by getFormatChartData in
+ * src/lib/outlier-formats.ts to assemble the SVG inputs.
+ */
+export function getFormatWeeklyHistogram(
+  formatId: number
+): Array<{ weekIndex: number; n: number; avgMult: number }> {
+  return db
+    .prepare(
+      `SELECT
+         CAST((strftime('%s','now') - cv.published_at) / (7 * 86400) AS INTEGER) AS week_index,
+         COUNT(*) AS n,
+         AVG(ofv.multiplier_at_extract) AS avg_mult
+       FROM outlier_format_videos ofv
+       JOIN competitor_videos cv ON cv.video_id = ofv.video_id
+       WHERE ofv.format_id = ?
+         AND cv.published_at IS NOT NULL
+         AND cv.published_at >= strftime('%s','now') - 10 * 7 * 86400
+       GROUP BY week_index
+       ORDER BY week_index ASC`
+    )
+    .all(formatId) as Array<{ week_index: number; n: number; avg_mult: number }>;
+}
+
 /**
  * Outliers query for the /outliers page. Returns competitor videos
  * whose views exceed `minMultiplier × the competitor's own median over

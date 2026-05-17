@@ -3,66 +3,53 @@ import {
   COMPETITOR_TIERS,
   isCompetitorTier,
   listAllChannels,
-  outliersForUserChannel,
 } from "@/lib/db";
+import { listOutliersForActiveChannel } from "@/lib/outliers";
 
 export const runtime = "nodejs";
 
 /**
  * GET /api/outliers
  *
- * Query params:
- *   userChannelId: required. Either a known channel id, or the literal
- *                  "all" to scan across every user channel's competitors.
- *   window:        7 | 30 | 90 (days). Default 30.
- *   minMultiplier: number ≥ 1. Default 3.
- *   tiers:         comma-separated subset of authority|breakthrough|adjacent|far.
- *                  Default all four.
+ * Thin wrapper over the shared `listOutliersForActiveChannel` helper —
+ * the same function the list_outliers chat tool calls. Filter pills on
+ * the /outliers page were removed in this refactor; the Library tab
+ * passes only `?userChannelId=` (or omits for the active channel) and
+ * gets the unfiltered top 50.
  *
- * Returns at most 50 outlier rows sorted by multiplier DESC then views DESC,
- * plus totals for the filter header (totalScanned + competitorsCovered).
- *
- * Per MENTOR_METHOD §2: an outlier is a video whose views exceed
- * `minMultiplier × that competitor's own median over the same window`.
- * Competitors with < 5 videos in the window are skipped (the median
- * collapses on tiny samples).
+ * Optional overrides preserved for legacy callers (chat tools that want
+ * a tighter window/multiplier) — pass `?window=` / `?minMultiplier=` /
+ * `?tiers=` to opt in. Default behaviour: 30d window, 3× multiplier,
+ * all tiers (per MENTOR_METHOD §2 baseline).
  */
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const rawUserChannelId = url.searchParams.get("userChannelId");
-  if (!rawUserChannelId) {
-    return NextResponse.json(
-      { error: "userChannelId required (a channel id or the literal 'all')" },
-      { status: 400 }
-    );
-  }
-  const userChannelId =
-    rawUserChannelId === "all"
-      ? null
-      : (() => {
-          const all = listAllChannels();
-          return all.some((c) => c.id === rawUserChannelId)
-            ? rawUserChannelId
-            : undefined;
-        })();
-  if (userChannelId === undefined) {
-    return NextResponse.json(
-      { error: `Unknown userChannelId: ${rawUserChannelId}` },
-      { status: 400 }
-    );
+  let userChannelId: string | null | undefined;
+  if (!rawUserChannelId || rawUserChannelId === "all") {
+    userChannelId = null;
+  } else {
+    const all = listAllChannels();
+    if (!all.some((c) => c.id === rawUserChannelId)) {
+      return NextResponse.json(
+        { error: `Unknown userChannelId: ${rawUserChannelId}` },
+        { status: 400 }
+      );
+    }
+    userChannelId = rawUserChannelId;
   }
 
-  const windowDays = (() => {
-    const raw = Number(url.searchParams.get("window") ?? 30);
-    if (raw === 7 || raw === 30 || raw === 90) return raw;
-    return 30;
-  })();
+  const windowParam = Number(url.searchParams.get("window") ?? 30);
+  const windowDays =
+    windowParam === 7 || windowParam === 30 || windowParam === 90
+      ? windowParam
+      : 30;
 
-  const minMultiplier = (() => {
-    const raw = Number(url.searchParams.get("minMultiplier") ?? 3);
-    if (!Number.isFinite(raw) || raw < 1) return 3;
-    return raw;
-  })();
+  const multiplierParam = Number(url.searchParams.get("minMultiplier") ?? 3);
+  const minMultiplier =
+    Number.isFinite(multiplierParam) && multiplierParam >= 1
+      ? multiplierParam
+      : 3;
 
   const tiersParam = url.searchParams.get("tiers");
   const tiers = tiersParam
@@ -70,12 +57,14 @@ export async function GET(req: Request) {
     : [...COMPETITOR_TIERS];
   if (tiers.length === 0) {
     return NextResponse.json(
-      { error: `tiers must include at least one of: ${COMPETITOR_TIERS.join(", ")}` },
+      {
+        error: `tiers must include at least one of: ${COMPETITOR_TIERS.join(", ")}`,
+      },
       { status: 400 }
     );
   }
 
-  const result = outliersForUserChannel({
+  const result = listOutliersForActiveChannel({
     userChannelId,
     windowDays,
     minMultiplier,

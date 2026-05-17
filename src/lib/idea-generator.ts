@@ -1,31 +1,26 @@
-import { NextResponse } from "next/server";
+import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import {
+  competitorMedianViews,
   getCompetitorVideosByIds,
   getIntegration,
   getSetting,
   listAllChannels,
   setSetting,
-} from "@/lib/db";
-import { providerModelId } from "@/lib/ai-provider-types";
+} from "./db";
+import { providerModelId } from "./ai-provider-types";
 import {
   extractSection,
   isLever,
   LEVERS,
   loadMentorMethod,
-} from "@/lib/mentor-method";
-import { log } from "@/lib/logger";
+} from "./mentor-method";
+import { listOutliersForActiveChannel } from "./outliers";
+import { log } from "./logger";
 
-export const runtime = "nodejs";
-export const maxDuration = 60;
-
-// Ideation is more expensive than the explain endpoint — both in tokens
-// (5–10 ideas × ~150 tokens each + the methodology context) and in user
-// expectation (they want a fresh batch each time, not a cached one). So
-// no result-cache, but rate-limited 1/5min per channel.
 const RATE_LIMIT_WINDOW_SEC = 5 * 60;
 
-type IdeasProposal = {
+export type Idea = {
   topic: string;
   suggestedTitle: string;
   angle: string;
@@ -33,95 +28,112 @@ type IdeasProposal = {
   sourceOutlierVideoId: string;
 };
 
-function fmtRelative(ts: number | null | undefined): string {
-  if (!ts) return "unknown";
-  const diff = Math.floor(Date.now() / 1000 - ts);
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d ago`;
-  if (diff < 86400 * 365) return `${Math.floor(diff / (86400 * 30))}mo ago`;
-  return `${Math.floor(diff / (86400 * 365))}y ago`;
-}
+export type GenerateIdeasResult =
+  | {
+      ok: true;
+      ideas: Idea[];
+      generatedAt: number;
+      model: string;
+    }
+  | {
+      ok: false;
+      status: number;
+      error: string;
+      retryAfterSec?: number;
+    };
 
-export async function POST(req: Request) {
-  const body = (await req.json().catch(() => ({}))) as {
-    userChannelId?: unknown;
-    outlierVideoIds?: unknown;
-  };
-  const userChannelId =
-    typeof body.userChannelId === "string" ? body.userChannelId.trim() : "";
+/**
+ * Synthesise 5–10 new video ideas for a user channel from real outlier
+ * videos. Each idea references a specific source outlier and applies
+ * one lever from §9. System prompt quotes §1 + §7 + §9 verbatim.
+ *
+ * If `outlierVideoIds` is omitted, auto-picks the top 10 outliers by
+ * multiplier in the channel's scope. Rate-limited 1 per channel per 5
+ * min. Never throws — every error mode returns a structured `ok: false`.
+ *
+ * Used by:
+ *   - generate_ideas chat tool (the central ideation agent in /chat)
+ *   - (previously, the deleted /api/outliers/generate-ideas endpoint)
+ */
+export async function generateIdeasForChannel(opts: {
+  userChannelId: string;
+  outlierVideoIds?: string[];
+}): Promise<GenerateIdeasResult> {
+  const userChannelId = opts.userChannelId?.trim();
   if (!userChannelId) {
-    return NextResponse.json(
-      { error: "userChannelId required" },
-      { status: 400 }
-    );
+    return { ok: false, status: 400, error: "userChannelId required" };
   }
   const all = listAllChannels();
   const channel = all.find((c) => c.id === userChannelId);
   if (!channel) {
-    return NextResponse.json(
-      { error: `Unknown userChannelId: ${userChannelId}` },
-      { status: 404 }
-    );
-  }
-  const rawIds = Array.isArray(body.outlierVideoIds) ? body.outlierVideoIds : [];
-  const outlierVideoIds = rawIds
-    .filter((v): v is string => typeof v === "string" && v.length > 0)
-    .slice(0, 20);
-  if (outlierVideoIds.length === 0) {
-    return NextResponse.json(
-      { error: "outlierVideoIds required (1–20)" },
-      { status: 400 }
-    );
+    return {
+      ok: false,
+      status: 404,
+      error: `Unknown userChannelId: ${userChannelId}`,
+    };
   }
 
-  // Rate limit.
+  // Rate limit (per channel, not per video sample — fresh batches cost
+  // the same and shouldn't be gated by trivial sample-set differences).
   const rateKey = `analyze_ai.ideas.last_run.${userChannelId}`;
   const last = Number(getSetting(rateKey) ?? "0");
   const now = Math.floor(Date.now() / 1000);
   if (last > 0 && now - last < RATE_LIMIT_WINDOW_SEC) {
-    const retryAfterSec = RATE_LIMIT_WINDOW_SEC - (now - last);
-    return NextResponse.json(
-      {
-        error: "Idea generation is rate-limited per channel (1 per 5min)",
-        retryAfterSec,
-      },
-      { status: 429 }
-    );
+    return {
+      ok: false,
+      status: 429,
+      error: "Idea generation is rate-limited per channel (1 per 5min)",
+      retryAfterSec: RATE_LIMIT_WINDOW_SEC - (now - last),
+    };
   }
 
   const apiKey = getIntegration("claude")?.api_key;
   if (!apiKey) {
-    return NextResponse.json(
-      {
-        error: "Claude API key not configured. Add it on the Integrations page.",
-      },
-      { status: 400 }
-    );
+    return {
+      ok: false,
+      status: 400,
+      error: "Claude API key not configured. Add it on the Integrations page.",
+    };
   }
 
-  const outlierRows = getCompetitorVideosByIds(outlierVideoIds);
-  if (outlierRows.length === 0) {
-    return NextResponse.json(
-      { error: "None of the supplied outlier video ids exist in the DB." },
-      { status: 400 }
-    );
-  }
-  // Each row carries its competitor's median view count via the
-  // outliers endpoint earlier in the round-trip — but the bulk lookup
-  // here only has the per-row data. We re-fetch the channel medians for
-  // the unique competitor set below, then merge into the rendered line.
-  // (Simpler than asking the client to round-trip the medians too.)
-  const uniqueCompetitorIds = Array.from(
-    new Set(outlierRows.map((r) => r.competitorId))
+  // Pick the outlier sample. Caller-supplied IDs win; otherwise auto-pick
+  // the channel's current top 10 outliers by multiplier.
+  let outlierIds = opts.outlierVideoIds?.filter(
+    (v): v is string => typeof v === "string" && v.length > 0
   );
+  if (!outlierIds || outlierIds.length === 0) {
+    const auto = listOutliersForActiveChannel({
+      userChannelId,
+      limit: 10,
+    });
+    outlierIds = auto.outliers.map((o) => o.videoId);
+  } else {
+    outlierIds = outlierIds.slice(0, 20);
+  }
+  if (outlierIds.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      error:
+        "No outliers available for this channel. Add competitors and sync first.",
+    };
+  }
+
+  const outlierRows = getCompetitorVideosByIds(outlierIds);
+  if (outlierRows.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      error: "None of the supplied outlier video ids exist in the DB.",
+    };
+  }
+
+  // Each row needs its competitor's median for the prompt context. We
+  // compute medians per unique competitor (small set in practice).
   const medians = new Map<number, number>();
-  if (uniqueCompetitorIds.length > 0) {
-    // The competitorMedianViews helper exists for this; reuse it.
-    // Imported lazily to keep the import block tight.
-    const { competitorMedianViews } = await import("@/lib/db");
-    for (const cid of uniqueCompetitorIds) {
-      medians.set(cid, competitorMedianViews(cid));
-    }
+  const uniqueCompIds = Array.from(new Set(outlierRows.map((r) => r.competitorId)));
+  for (const cid of uniqueCompIds) {
+    medians.set(cid, competitorMedianViews(cid));
   }
 
   const md = loadMentorMethod();
@@ -167,7 +179,6 @@ export async function POST(req: Request) {
     "}",
   ].join("\n");
 
-  // Channel context.
   type ChannelCtx = {
     niche?: string;
     positioning?: string;
@@ -185,16 +196,17 @@ export async function POST(req: Request) {
     `- Voice: ${ctx.voice || "(empty)"}`,
     `- External sources: ${ctx.external_sources || "(empty)"}`,
     "",
-    `# OUTLIER SAMPLE (${outlierRows.length} videos currently visible on the user's Outliers page)`,
+    `# OUTLIER SAMPLE (${outlierRows.length} videos)`,
     ...outlierRows.map((r) => {
       const median = medians.get(r.competitorId) ?? 0;
       const mult = median > 0 ? (r.views / median).toFixed(1) : "?";
-      return `- [${r.videoId}] "${r.title}" — ${r.competitorTitle ?? "(unknown)"} (${r.tier}) — ${mult}× median (${median.toLocaleString("en-US")} median, ${r.views.toLocaleString("en-US")} views) — ${fmtRelative(r.publishedAt)}`;
+      const age = r.publishedAt ? fmtAge(r.publishedAt) : "unknown";
+      return `- [${r.videoId}] "${r.title}" — ${r.competitorTitle ?? "(unknown)"} (${r.tier}) — ${mult}× median (${median.toLocaleString("en-US")} median, ${r.views.toLocaleString("en-US")} views) — ${age}`;
     }),
   ].join("\n");
 
   const model = providerModelId("claude");
-  let ideas: IdeasProposal[] = [];
+  let ideas: Idea[] = [];
   try {
     const client = new Anthropic({ apiKey });
     const resp = await client.messages.create({
@@ -215,34 +227,37 @@ export async function POST(req: Request) {
         "claude",
         `Outlier-ideas ${userChannelId}: could not parse ideas. Raw: ${text.slice(0, 200)}`
       );
-      return NextResponse.json(
-        { error: "AI returned malformed JSON. Try again." },
-        { status: 502 }
-      );
+      return {
+        ok: false,
+        status: 502,
+        error: "AI returned malformed JSON. Try again.",
+      };
     }
     ideas = parsed;
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Claude call failed";
     log.error("claude", `Outlier-ideas ${userChannelId}: ${msg}`, err);
-    return NextResponse.json({ error: msg }, { status: 502 });
+    return { ok: false, status: 502, error: msg };
   }
 
   setSetting(rateKey, String(now));
   log.info(
     "claude",
-    `Outlier-ideas ${userChannelId}: returned ${ideas.length} ideas (${outlierRows.length} outliers in sample)`
+    `Outlier-ideas ${userChannelId}: ${ideas.length} ideas (${outlierRows.length} outlier sample)`
   );
 
-  return NextResponse.json({ ideas, generatedAt: now, model });
+  return { ok: true, ideas, generatedAt: now, model };
 }
 
-/**
- * Parse + validate Claude's JSON. Rejects ideas whose sourceOutlierVideoId
- * isn't in the supplied outlier sample (Claude sometimes hallucinates ids
- * even when told to pick from the list). Clamps confidence to [0, 1] and
- * drops ideas with unknown angle values.
- */
-function parseIdeas(raw: string, knownIds: Set<string>): IdeasProposal[] | null {
+function fmtAge(ts: number): string {
+  const diff = Math.floor(Date.now() / 1000 - ts);
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d ago`;
+  if (diff < 86400 * 365) return `${Math.floor(diff / (86400 * 30))}mo ago`;
+  return `${Math.floor(diff / (86400 * 365))}y ago`;
+}
+
+function parseIdeas(raw: string, knownIds: Set<string>): Idea[] | null {
   let text = raw.trim();
   if (text.startsWith("```")) {
     text = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
@@ -259,7 +274,7 @@ function parseIdeas(raw: string, knownIds: Set<string>): IdeasProposal[] | null 
   if (!parsed || typeof parsed !== "object") return null;
   const rawIdeas = (parsed as { ideas?: unknown }).ideas;
   if (!Array.isArray(rawIdeas)) return null;
-  const ideas: IdeasProposal[] = [];
+  const ideas: Idea[] = [];
   for (const raw of rawIdeas) {
     if (!raw || typeof raw !== "object") continue;
     const r = raw as Record<string, unknown>;
@@ -268,7 +283,9 @@ function parseIdeas(raw: string, knownIds: Set<string>): IdeasProposal[] | null 
       typeof r.suggestedTitle === "string" ? r.suggestedTitle.trim() : "";
     const angle = typeof r.angle === "string" ? r.angle.trim() : "";
     const confidence =
-      typeof r.confidence === "number" ? Math.max(0, Math.min(1, r.confidence)) : 0;
+      typeof r.confidence === "number"
+        ? Math.max(0, Math.min(1, r.confidence))
+        : 0;
     const sourceOutlierVideoId =
       typeof r.sourceOutlierVideoId === "string"
         ? r.sourceOutlierVideoId.trim()
@@ -282,13 +299,7 @@ function parseIdeas(raw: string, knownIds: Set<string>): IdeasProposal[] | null 
     ) {
       continue;
     }
-    ideas.push({
-      topic,
-      suggestedTitle,
-      angle,
-      confidence,
-      sourceOutlierVideoId,
-    });
+    ideas.push({ topic, suggestedTitle, angle, confidence, sourceOutlierVideoId });
   }
   return ideas;
 }

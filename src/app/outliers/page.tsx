@@ -1,14 +1,16 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Check,
-  Copy,
+  ArrowUp,
   Flame,
   Loader2,
+  MessageSquare,
+  RefreshCw,
+  Search,
   Sparkles,
-  TrendingUp,
   X,
 } from "lucide-react";
 import {
@@ -19,12 +21,12 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
-/* ---------------- Types + constants (page-local, mirror server shapes) ---------------- */
+/* ---------------- Types ---------------- */
 
-const TIERS = ["authority", "breakthrough", "adjacent", "far"] as const;
-type Tier = (typeof TIERS)[number];
+type Tier = "authority" | "breakthrough" | "adjacent" | "far";
 
 const TIER_LABEL: Record<Tier, string> = {
   authority: "Authority",
@@ -42,12 +44,6 @@ const TIER_PILL: Record<Tier, string> = {
   far: "bg-muted text-muted-foreground border border-border",
 };
 
-const WINDOW_PILLS = [7, 30, 90] as const;
-type WindowDays = (typeof WINDOW_PILLS)[number];
-
-const MULTIPLIER_PILLS = [2, 3, 5, 10] as const;
-type Multiplier = (typeof MULTIPLIER_PILLS)[number];
-
 type Outlier = {
   videoId: string;
   title: string;
@@ -64,27 +60,38 @@ type Outlier = {
   channelMedian: number;
 };
 
-type OutliersResponse = {
-  outliers: Outlier[];
-  totalScanned: number;
-  competitorsCovered: number;
-};
-
 type Explanation = {
   levers: string[];
   explanation: string;
   cached?: boolean;
 };
 
-type Idea = {
-  topic: string;
-  suggestedTitle: string;
-  angle: string;
-  confidence: number;
-  sourceOutlierVideoId: string;
+type FormatExample = {
+  videoId: string;
+  title: string;
+  thumbnailUrl: string | null;
+  views: number;
+  publishedAt: number | null;
+  competitorTitle: string | null;
+  competitorHandle: string | null;
+  competitorSubs: number | null;
+  tier: Tier;
+  multiplierAtExtract: number;
+};
+
+type FormatRow = {
+  id: number;
+  template: string;
+  avgMultiplier: number | null;
+  totalViewsMonth: number | null;
+  risingRate: number | null;
+  extractedAt: number;
+  examples: FormatExample[];
+  weekly: { weekIndex: number; n: number; avgMult: number }[];
 };
 
 const VIEW_MODE_KEY = "dashboard.viewMode";
+type TabName = "library" | "patterns";
 
 /* ---------------- Formatters ---------------- */
 
@@ -114,23 +121,26 @@ function fmtDuration(sec: number | null | undefined): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-/* ---------------- Page ---------------- */
+/* ---------------- Page wrapper (Suspense for useSearchParams) ---------------- */
 
 export default function OutliersPage() {
+  return (
+    <Suspense fallback={null}>
+      <OutliersInner />
+    </Suspense>
+  );
+}
+
+function OutliersInner() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const activeTab: TabName =
+    searchParams.get("tab") === "patterns" ? "patterns" : "library";
+
   const [scope, setScope] = useState<string | "all" | null>(null);
-  const [windowDays, setWindowDays] = useState<WindowDays>(30);
-  const [minMultiplier, setMinMultiplier] = useState<Multiplier>(3);
-  const [tierFilters, setTierFilters] = useState<Set<Tier>>(new Set(TIERS));
-  const [data, setData] = useState<OutliersResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
 
-  const [openOutlier, setOpenOutlier] = useState<Outlier | null>(null);
-  const [ideasOpen, setIdeasOpen] = useState(false);
-
-  // Resolve scope from localStorage viewMode + the active-channel
-  // pointer. viewMode === "all" → null (scan everywhere); otherwise
-  // use the active channel id.
+  // Resolve scope from localStorage viewMode + active channel pointer.
   useEffect(() => {
     let cancelled = false;
     const viewMode = (typeof window !== "undefined"
@@ -155,219 +165,66 @@ export default function OutliersPage() {
     };
   }, []);
 
-  const load = useCallback(async () => {
-    if (scope === null) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const params = new URLSearchParams({
-        userChannelId: scope,
-        window: String(windowDays),
-        minMultiplier: String(minMultiplier),
-        tiers: [...tierFilters].join(","),
-      });
-      const r = await fetch(`/api/outliers?${params.toString()}`, {
-        cache: "no-store",
-      });
-      const d = (await r.json().catch(() => ({}))) as
-        | OutliersResponse
-        | { error?: string };
-      if (!r.ok || !("outliers" in d)) {
-        setError(("error" in d && d.error) || `HTTP ${r.status}`);
-        setData({ outliers: [], totalScanned: 0, competitorsCovered: 0 });
-        return;
-      }
-      setData(d);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load outliers.");
-    } finally {
-      setLoading(false);
-    }
-  }, [scope, windowDays, minMultiplier, tierFilters]);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  const visibleVideoIds = useMemo(
-    () => (data?.outliers ?? []).slice(0, 20).map((o) => o.videoId),
-    [data]
-  );
-
-  const toggleTier = (t: Tier) => {
-    setTierFilters((prev) => {
-      const next = new Set(prev);
-      if (next.has(t)) next.delete(t);
-      else next.add(t);
-      return next;
-    });
+  const goTab = (t: TabName) => {
+    const qs = new URLSearchParams(searchParams.toString());
+    if (t === "library") qs.delete("tab");
+    else qs.set("tab", t);
+    router.push(`${pathname}${qs.toString() ? `?${qs.toString()}` : ""}`);
   };
-
-  const scopeLabel =
-    scope === "all"
-      ? "all channels"
-      : scope
-        ? "active channel"
-        : "loading…";
 
   return (
     <div className="mx-auto max-w-6xl">
-      <header className="mb-6 flex items-start justify-between gap-3">
-        <div>
-          <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
-            <Flame className="h-6 w-6 text-amber-500" />
-            Outliers
-          </h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Competitor videos that beat their own channel&apos;s median by{" "}
-            {minMultiplier}× or more. Methodology in{" "}
-            <code className="rounded bg-muted px-1 py-0.5 text-xs">
-              MENTOR_METHOD.md §2
-            </code>
-            . Scoped to <span className="font-medium">{scopeLabel}</span>.
-          </p>
-        </div>
-        <Button
-          onClick={() => setIdeasOpen(true)}
-          disabled={visibleVideoIds.length === 0 || scope === null}
-          className="shrink-0 gap-1.5"
-        >
-          <Sparkles className="h-3.5 w-3.5" />
-          Generate ideas
-        </Button>
+      <header className="mb-4">
+        <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
+          <Flame className="h-6 w-6 text-amber-500" />
+          Outliers
+        </h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Competitor videos that beat their own channel&apos;s median by 3× or
+          more. Methodology in{" "}
+          <code className="rounded bg-muted px-1 py-0.5 text-xs">
+            MENTOR_METHOD.md §2
+          </code>
+          .
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Want ideas from these outliers?{" "}
+          <Link
+            href="/chat"
+            className="inline-flex items-center gap-1 text-primary hover:underline"
+          >
+            <MessageSquare className="h-3 w-3" />
+            Ask the AI Chat →
+          </Link>
+        </p>
       </header>
 
-      {/* Filters */}
-      <div className="mb-4 flex flex-wrap items-center gap-4 rounded-md border border-border/60 bg-muted/20 p-3">
-        <PillGroup label="Window">
-          {WINDOW_PILLS.map((d) => (
-            <Pill
-              key={d}
-              active={windowDays === d}
-              onClick={() => setWindowDays(d)}
-            >
-              {d}d
-            </Pill>
-          ))}
-        </PillGroup>
-        <PillGroup label="Min multiplier">
-          {MULTIPLIER_PILLS.map((m) => (
-            <Pill
-              key={m}
-              active={minMultiplier === m}
-              onClick={() => setMinMultiplier(m)}
-            >
-              {m}×
-            </Pill>
-          ))}
-        </PillGroup>
-        <PillGroup label="Tier">
-          {TIERS.map((t) => {
-            const on = tierFilters.has(t);
-            return (
-              <button
-                key={t}
-                type="button"
-                onClick={() => toggleTier(t)}
-                className={cn(
-                  "rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors",
-                  on
-                    ? TIER_PILL[t]
-                    : "border border-border text-muted-foreground hover:text-foreground"
-                )}
-              >
-                {TIER_LABEL[t]}
-              </button>
-            );
-          })}
-        </PillGroup>
-      </div>
+      {/* Tab bar */}
+      <nav className="mb-6 flex gap-4 border-b border-border">
+        <TabLink
+          active={activeTab === "library"}
+          onClick={() => goTab("library")}
+        >
+          Library
+        </TabLink>
+        <TabLink
+          active={activeTab === "patterns"}
+          onClick={() => goTab("patterns")}
+        >
+          Patterns
+        </TabLink>
+      </nav>
 
-      {/* Stats line */}
-      {data && (
-        <p className="mb-4 text-xs text-muted-foreground">
-          <span className="font-semibold text-foreground">
-            {data.outliers.length}
-          </span>{" "}
-          outlier{data.outliers.length === 1 ? "" : "s"} across{" "}
-          {data.competitorsCovered} competitor
-          {data.competitorsCovered === 1 ? "" : "s"} · scanned{" "}
-          {data.totalScanned.toLocaleString("en-US")} videos in the last{" "}
-          {windowDays} days.
-        </p>
-      )}
-
-      {error && (
-        <div className="mb-4 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-          {error}
-        </div>
-      )}
-
-      {loading ? (
-        <div className="flex items-center justify-center gap-2 py-20 text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          Loading outliers…
-        </div>
-      ) : data && data.outliers.length === 0 ? (
-        <Card>
-          <CardContent className="py-12 text-center text-sm text-muted-foreground">
-            No outliers in this window. Try widening to 90 days or lowering the
-            multiplier.
-          </CardContent>
-        </Card>
+      {activeTab === "library" ? (
+        <LibraryTab scope={scope} />
       ) : (
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          {(data?.outliers ?? []).map((o) => (
-            <OutlierCard
-              key={o.videoId}
-              outlier={o}
-              onOpen={() => setOpenOutlier(o)}
-            />
-          ))}
-        </div>
-      )}
-
-      {openOutlier && (
-        <ExplainModal
-          outlier={openOutlier}
-          onClose={() => setOpenOutlier(null)}
-        />
-      )}
-
-      {ideasOpen && scope && (
-        <GenerateIdeasModal
-          userChannelId={scope}
-          outlierVideoIds={visibleVideoIds}
-          onClose={() => setIdeasOpen(false)}
-          outliersById={Object.fromEntries(
-            (data?.outliers ?? []).map((o) => [o.videoId, o])
-          )}
-        />
+        <PatternsTab scope={scope} />
       )}
     </div>
   );
 }
 
-/* ---------------- Filter primitives ---------------- */
-
-function PillGroup({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-center gap-2">
-      <span className="text-[11px] uppercase tracking-wide text-muted-foreground">
-        {label}
-      </span>
-      <div className="flex gap-1.5">{children}</div>
-    </div>
-  );
-}
-
-function Pill({
+function TabLink({
   active,
   onClick,
   children,
@@ -381,10 +238,10 @@ function Pill({
       type="button"
       onClick={onClick}
       className={cn(
-        "rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors",
+        "-mb-px inline-flex items-center gap-1.5 border-b-2 px-1 pb-2 text-sm transition-colors",
         active
-          ? "bg-primary text-primary-foreground"
-          : "border border-border text-muted-foreground hover:text-foreground"
+          ? "border-primary text-foreground"
+          : "border-transparent text-muted-foreground hover:text-foreground"
       )}
     >
       {children}
@@ -392,7 +249,84 @@ function Pill({
   );
 }
 
-/* ---------------- Outlier card ---------------- */
+/* ---------------- Library tab ---------------- */
+
+function LibraryTab({ scope }: { scope: string | "all" | null }) {
+  const [outliers, setOutliers] = useState<Outlier[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [openOutlier, setOpenOutlier] = useState<Outlier | null>(null);
+
+  useEffect(() => {
+    if (scope === null) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    const qs = scope === "all" ? "?userChannelId=all" : `?userChannelId=${encodeURIComponent(scope)}`;
+    fetch(`/api/outliers${qs}`, { cache: "no-store" })
+      .then((r) => r.json())
+      .then((d: { outliers?: Outlier[]; error?: string }) => {
+        if (cancelled) return;
+        if (d.error) {
+          setError(d.error);
+          setOutliers([]);
+          return;
+        }
+        setOutliers(d.outliers ?? []);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : "Failed to load outliers.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [scope]);
+
+  return (
+    <>
+      {error && (
+        <div className="mb-4 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+      {loading ? (
+        <div className="flex items-center justify-center gap-2 py-20 text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading outliers…
+        </div>
+      ) : outliers.length === 0 ? (
+        <Card>
+          <CardContent className="py-12 text-center text-sm text-muted-foreground">
+            No outliers right now. Sync more competitors, or try again after
+            their videos have had time to accumulate views.
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          {outliers.map((o) => (
+            <OutlierCard
+              key={o.videoId}
+              outlier={o}
+              onOpen={() => setOpenOutlier(o)}
+            />
+          ))}
+        </div>
+      )}
+      {openOutlier && (
+        <ExplainModal
+          outlier={openOutlier}
+          onClose={() => setOpenOutlier(null)}
+        />
+      )}
+    </>
+  );
+}
+
+/* ---------------- Outlier card + explain modal (unchanged from prior step) ---------------- */
 
 function OutlierCard({
   outlier,
@@ -423,8 +357,6 @@ function OutlierCard({
               {fmtDuration(outlier.durationSeconds)}
             </span>
           ) : null}
-          {/* Hover overlay — appears at the bottom on hover, so the
-              thumbnail stays clean by default. */}
           <div className="absolute inset-x-0 bottom-0 flex translate-y-full items-center justify-center bg-gradient-to-t from-black/85 via-black/55 to-transparent p-3 opacity-0 transition-all group-hover:translate-y-0 group-hover:opacity-100">
             <span className="inline-flex items-center gap-1.5 rounded-md bg-white/15 px-3 py-1 text-xs font-medium text-white backdrop-blur">
               <Sparkles className="h-3.5 w-3.5" />
@@ -463,8 +395,6 @@ function OutlierCard({
     </button>
   );
 }
-
-/* ---------------- Explain modal ---------------- */
 
 function ExplainModal({
   outlier,
@@ -516,10 +446,7 @@ function ExplainModal({
       className="fixed inset-0 z-40 flex items-center justify-center bg-background/80 p-4 backdrop-blur-sm"
       onClick={onClose}
     >
-      <Card
-        className="w-full max-w-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <Card className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
         <CardHeader>
           <div className="flex items-start justify-between gap-3">
             <div>
@@ -538,12 +465,7 @@ function ExplainModal({
                 </span>
               </CardDescription>
             </div>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={onClose}
-              aria-label="Close"
-            >
+            <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close">
               <X className="h-4 w-4" />
             </Button>
           </div>
@@ -577,7 +499,6 @@ function ExplainModal({
               Open on YouTube ↗
             </a>
           </div>
-
           <div className="border-t border-border/60 pt-3">
             <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
               What made it work
@@ -616,219 +537,420 @@ function ExplainModal({
   );
 }
 
-/* ---------------- Generate Ideas modal ---------------- */
+/* ---------------- Patterns tab (Format Library) ---------------- */
 
-function GenerateIdeasModal({
-  userChannelId,
-  outlierVideoIds,
-  outliersById,
-  onClose,
-}: {
-  userChannelId: string;
-  outlierVideoIds: string[];
-  outliersById: Record<string, Outlier>;
-  onClose: () => void;
-}) {
-  const [ideas, setIdeas] = useState<Idea[] | null>(null);
-  const [loading, setLoading] = useState(false);
+type SortKey = "rising" | "avgMultiplier" | "totalViewsMonth";
+
+function PatternsTab({ scope }: { scope: string | "all" | null }) {
+  const [formats, setFormats] = useState<FormatRow[] | null>(null);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [dismissed, setDismissed] = useState<Set<number>>(new Set());
-  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const [query, setQuery] = useState("");
+  const [sortKey, setSortKey] = useState<SortKey>("rising");
+  const [extracting, setExtracting] = useState(false);
+  const [extractError, setExtractError] = useState<string | null>(null);
+  const [extractStatus, setExtractStatus] = useState<string | null>(null);
 
-  const generate = useCallback(async () => {
+  // Resolve concrete channel id (Patterns is per-channel — "all" mode
+  // doesn't make sense here because formats are keyed by user_channel_id).
+  const channelIdParam =
+    scope === "all" ? null : scope; // null → server falls back to active
+
+  const load = useCallback(async () => {
+    if (scope === null) return;
     setLoading(true);
     setError(null);
-    setDismissed(new Set());
     try {
-      const r = await fetch("/api/outliers/generate-ideas", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userChannelId, outlierVideoIds }),
-      });
-      const d = (await r.json().catch(() => ({}))) as {
-        ideas?: Idea[];
-        error?: string;
-        retryAfterSec?: number;
-      };
-      if (!r.ok || !d.ideas) {
-        const detail = d.retryAfterSec
-          ? `${d.error} (try again in ${d.retryAfterSec}s)`
-          : (d.error ?? `HTTP ${r.status}`);
-        setError(detail);
+      const qs = channelIdParam
+        ? `?userChannelId=${encodeURIComponent(channelIdParam)}`
+        : "";
+      const r = await fetch(`/api/outliers/formats${qs}`, { cache: "no-store" });
+      const d = (await r.json()) as { formats?: FormatRow[]; error?: string };
+      if (d.error) {
+        setError(d.error);
+        setFormats([]);
         return;
       }
-      setIdeas(d.ideas);
+      setFormats(d.formats ?? []);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Network error.");
+      setError(e instanceof Error ? e.message : "Failed to load formats.");
     } finally {
       setLoading(false);
     }
-  }, [userChannelId, outlierVideoIds]);
+  }, [scope, channelIdParam]);
 
-  const copy = async (text: string, idx: number) => {
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const extract = async () => {
+    setExtracting(true);
+    setExtractError(null);
+    setExtractStatus(null);
     try {
-      await navigator.clipboard.writeText(text);
-      setCopiedIdx(idx);
-      setTimeout(() => setCopiedIdx(null), 1500);
-    } catch {
-      /* ignore — fallback would be selectable text but the button still works visually */
+      const r = await fetch("/api/outliers/formats/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          channelIdParam ? { userChannelId: channelIdParam } : {}
+        ),
+      });
+      const d = (await r.json()) as {
+        formatsCreated?: number;
+        videosLinked?: number;
+        error?: string;
+        retryAfterSec?: number;
+      };
+      if (!r.ok) {
+        setExtractError(
+          d.retryAfterSec
+            ? `${d.error} (try again in ${Math.ceil(d.retryAfterSec / 60)} min)`
+            : (d.error ?? `HTTP ${r.status}`)
+        );
+        return;
+      }
+      setExtractStatus(
+        `Extracted ${d.formatsCreated} formats covering ${d.videosLinked} videos.`
+      );
+      await load();
+    } catch (e) {
+      setExtractError(e instanceof Error ? e.message : "Network error.");
+    } finally {
+      setExtracting(false);
     }
   };
 
-  const dismiss = (idx: number) =>
-    setDismissed((prev) => new Set(prev).add(idx));
+  const visible = useMemo(() => {
+    if (!formats) return [];
+    const q = query.trim().toLowerCase();
+    let rows = formats;
+    if (q) {
+      rows = rows.filter((f) => f.template.toLowerCase().includes(q));
+    }
+    rows = [...rows];
+    if (sortKey === "rising") {
+      rows.sort((a, b) => (b.risingRate ?? 0) - (a.risingRate ?? 0));
+    } else if (sortKey === "avgMultiplier") {
+      rows.sort((a, b) => (b.avgMultiplier ?? 0) - (a.avgMultiplier ?? 0));
+    } else {
+      rows.sort((a, b) => (b.totalViewsMonth ?? 0) - (a.totalViewsMonth ?? 0));
+    }
+    return rows;
+  }, [formats, query, sortKey]);
 
   return (
-    <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-background/80 p-4 backdrop-blur-sm"
-      onClick={onClose}
-    >
-      <Card
-        className="w-full max-w-3xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <CardHeader>
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Sparkles className="h-4 w-4 text-primary" />
-                Generate video ideas
-              </CardTitle>
-              <CardDescription>
-                Claude reads your channel context + the top outliers currently
-                visible and proposes video ideas grounded in real data.
-              </CardDescription>
-            </div>
-            <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close">
-              <X className="h-4 w-4" />
-            </Button>
+    <>
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold tracking-tight">
+            Trending Formats
+          </h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            Title-format templates extracted from your competitor outliers, per{" "}
+            <code className="rounded bg-muted px-1 py-0.5 text-[10px]">
+              MENTOR_METHOD.md §4
+            </code>
+            .
+          </p>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={extract}
+          disabled={extracting}
+          className="shrink-0 gap-1.5"
+        >
+          {extracting ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <RefreshCw className="h-3.5 w-3.5" />
+          )}
+          {formats && formats.length > 0 ? "Re-extract" : "Extract"} format patterns
+        </Button>
+      </div>
+
+      {extractError && (
+        <div className="mb-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          {extractError}
+        </div>
+      )}
+      {extractStatus && (
+        <div className="mb-3 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400">
+          {extractStatus}
+        </div>
+      )}
+
+      {/* Search + sort */}
+      {formats && formats.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <div className="relative flex-1 min-w-[200px]">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              className="pl-8"
+              placeholder="Search templates…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
           </div>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {ideas === null && !loading && !error && (
-            <Button onClick={generate} disabled={outlierVideoIds.length === 0}>
-              <Sparkles className="mr-1 h-3.5 w-3.5" />
-              Generate
-            </Button>
+          <select
+            value={sortKey}
+            onChange={(e) => setSortKey(e.target.value as SortKey)}
+            className="rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+          >
+            <option value="rising">Trending (rising rate)</option>
+            <option value="avgMultiplier">Avg outlier</option>
+            <option value="totalViewsMonth">Most views (month)</option>
+          </select>
+        </div>
+      )}
+
+      {error && (
+        <div className="mb-4 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      {loading ? (
+        <div className="flex items-center justify-center gap-2 py-20 text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading formats…
+        </div>
+      ) : formats && formats.length === 0 ? (
+        <Card>
+          <CardContent className="space-y-3 py-12 text-center">
+            <Sparkles className="mx-auto h-6 w-6 text-primary" />
+            <h3 className="text-base font-semibold">
+              No formats extracted yet
+            </h3>
+            <p className="mx-auto max-w-md text-sm text-muted-foreground">
+              Click <strong>Extract format patterns</strong> above to have
+              Claude group your current outliers into structural title
+              templates (per MENTOR_METHOD §4). Takes 15–30 seconds.
+            </p>
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="space-y-3">
+          {visible.map((f) => (
+            <FormatCard key={f.id} format={f} />
+          ))}
+          {visible.length === 0 && query && (
+            <Card>
+              <CardContent className="py-8 text-center text-sm text-muted-foreground">
+                No format matches &ldquo;{query}&rdquo;.
+              </CardContent>
+            </Card>
           )}
-          {loading && (
-            <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              Reading channel context + {outlierVideoIds.length} outliers…
-            </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function FormatCard({ format }: { format: FormatRow }) {
+  return (
+    <Card>
+      <CardContent className="space-y-4 p-4">
+        {/* Template line with blue placeholders */}
+        <div>
+          <div className="break-words text-base font-semibold leading-snug">
+            <TemplateLine template={format.template} />
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            <span className="inline-flex items-center gap-1 font-medium text-emerald-600 dark:text-emerald-400">
+              <ArrowUp className="h-3 w-3" />
+              Rising{" "}
+              {format.risingRate !== null
+                ? `${format.risingRate.toFixed(1)}×`
+                : "—"}
+            </span>
+            <span className="mx-2">·</span>
+            <span>
+              {format.avgMultiplier !== null
+                ? `${format.avgMultiplier.toFixed(1)}× avg outlier`
+                : "— avg"}
+            </span>
+            <span className="mx-2">·</span>
+            <span>
+              {fmtCount(format.totalViewsMonth ?? 0)} views (month)
+            </span>
+          </div>
+        </div>
+
+        {/* Examples */}
+        <div>
+          <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Examples
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+            {format.examples.map((ex) => (
+              <ExampleTile key={ex.videoId} ex={ex} />
+            ))}
+          </div>
+        </div>
+
+        {/* Per-format weekly charts */}
+        <ChartsStrip weekly={format.weekly} />
+      </CardContent>
+    </Card>
+  );
+}
+
+function TemplateLine({ template }: { template: string }) {
+  // Split on the brackets but keep them in the result.
+  const parts = template.split(/(\[[^\]]+\])/g);
+  return (
+    <>
+      {parts.map((p, i) =>
+        p.startsWith("[") && p.endsWith("]") ? (
+          <span key={i} className="font-mono text-sky-600 dark:text-sky-400">
+            {p}
+          </span>
+        ) : (
+          <span key={i}>{p}</span>
+        )
+      )}
+    </>
+  );
+}
+
+function ExampleTile({ ex }: { ex: FormatExample }) {
+  return (
+    <a
+      href={`https://www.youtube.com/watch?v=${ex.videoId}`}
+      target="_blank"
+      rel="noreferrer"
+      className="block rounded-md border border-border/60 transition-colors hover:bg-accent/30"
+    >
+      <div className="relative aspect-video w-full overflow-hidden rounded-t-md bg-muted">
+        {ex.thumbnailUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={ex.thumbnailUrl}
+            alt=""
+            className="h-full w-full object-cover"
+            referrerPolicy="no-referrer"
+          />
+        ) : null}
+        <span
+          className={cn(
+            "absolute left-1 top-1 rounded px-1.5 py-0.5 text-[10px] font-bold tabular-nums",
+            TIER_PILL[ex.tier]
           )}
-          {error && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-              {error}
-            </div>
+        >
+          {ex.multiplierAtExtract.toFixed(1)}×
+        </span>
+      </div>
+      <div className="space-y-0.5 p-2">
+        <div className="line-clamp-2 text-[11px] font-medium leading-snug">
+          {ex.title}
+        </div>
+        <div className="truncate text-[10px] text-muted-foreground">
+          {ex.competitorHandle ?? ex.competitorTitle ?? "—"}
+          {ex.competitorSubs !== null && (
+            <> · {fmtCount(ex.competitorSubs)} subs</>
           )}
-          {ideas !== null && ideas.length > 0 && (
-            <div className="max-h-[60vh] space-y-3 overflow-y-auto pr-1">
-              {ideas.map((idea, i) => {
-                const source = outliersById[idea.sourceOutlierVideoId];
-                const isDismissed = dismissed.has(i);
-                return (
-                  <div
-                    key={i}
-                    className={cn(
-                      "rounded-md border border-border/60 p-3 transition-opacity",
-                      isDismissed && "opacity-40"
-                    )}
-                  >
-                    <div className="text-base font-semibold leading-snug">
-                      {idea.topic}
-                    </div>
-                    <div className="mt-1 font-mono text-xs text-foreground/90">
-                      {idea.suggestedTitle}
-                    </div>
-                    <div className="mt-2 flex items-center gap-2">
-                      <span className="inline-flex items-center rounded-full bg-primary/15 px-2 py-0.5 text-[10px] font-medium text-primary">
-                        {idea.angle}
-                      </span>
-                      <div className="flex-1">
-                        <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                          <div
-                            className="h-full rounded-full bg-emerald-500"
-                            style={{ width: `${Math.round(idea.confidence * 100)}%` }}
-                          />
-                        </div>
-                      </div>
-                      <span className="w-10 text-right text-[10px] text-muted-foreground tabular-nums">
-                        {Math.round(idea.confidence * 100)}%
-                      </span>
-                    </div>
-                    {source && (
-                      <div className="mt-2 text-[11px] text-muted-foreground">
-                        from:{" "}
-                        <Link
-                          href={`/competitors/${source.competitorId}`}
-                          className="text-primary hover:underline"
-                        >
-                          {source.competitorTitle ?? source.competitorHandle ?? "—"}
-                        </Link>{" "}
-                        — &ldquo;{source.title}&rdquo;
-                      </div>
-                    )}
-                    <div className="mt-2 flex items-center gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => copy(idea.suggestedTitle, i)}
-                        disabled={isDismissed}
-                        className="h-7 gap-1 px-2 text-[11px]"
-                      >
-                        {copiedIdx === i ? (
-                          <>
-                            <Check className="h-3 w-3" />
-                            Copied
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="h-3 w-3" />
-                            Copy title
-                          </>
-                        )}
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => dismiss(i)}
-                        disabled={isDismissed}
-                        className="h-7 px-2 text-[11px] text-muted-foreground"
-                      >
-                        <X className="mr-1 h-3 w-3" />
-                        Dismiss
-                      </Button>
-                    </div>
-                  </div>
-                );
-              })}
-              <div className="flex items-center justify-between border-t border-border/60 pt-3">
-                <span className="text-[11px] text-muted-foreground">
-                  <TrendingUp className="mr-1 inline h-3 w-3" />
-                  {ideas.length} ideas from {outlierVideoIds.length} outliers
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={generate}
-                  disabled={loading}
-                  className="gap-1.5"
-                >
-                  <Sparkles className="h-3.5 w-3.5" />
-                  Generate another batch
-                </Button>
-              </div>
-            </div>
-          )}
-          {ideas !== null && ideas.length === 0 && !loading && (
-            <div className="text-sm text-muted-foreground">
-              Claude returned no usable ideas. Try widening the outlier filter
-              (more results) or refining your channel context.
-            </div>
-          )}
-        </CardContent>
-      </Card>
+        </div>
+        <div className="text-[10px] text-muted-foreground">
+          {fmtCount(ex.views)} · {fmtRelative(ex.publishedAt)}
+        </div>
+      </div>
+    </a>
+  );
+}
+
+function ChartsStrip({
+  weekly,
+}: {
+  weekly: { weekIndex: number; n: number; avgMult: number }[];
+}) {
+  if (weekly.length < 4) {
+    return (
+      <div className="rounded-md border border-border/60 bg-muted/20 p-3 text-center text-[11px] text-muted-foreground">
+        Not enough data yet — needs more outliers in this format to plot a
+        weekly trend.
+      </div>
+    );
+  }
+
+  // Build a dense 10-bucket series (weekIndex 0..9), filling missing weeks
+  // with 0 so the SVG geometry is stable. Week 0 = most recent.
+  const dense: { week: number; n: number; avg: number }[] = [];
+  for (let w = 0; w < 10; w++) {
+    const row = weekly.find((x) => x.weekIndex === w);
+    dense.push({ week: w, n: row?.n ?? 0, avg: row?.avgMult ?? 0 });
+  }
+  // Render oldest → newest left-to-right.
+  const ordered = [...dense].reverse();
+
+  return (
+    <div className="grid grid-cols-2 gap-3 border-t border-border/60 pt-3">
+      <ChartPanel label="Views" data={ordered.map((d) => d.n)} kind="bar" />
+      <ChartPanel
+        label="Avg outlier"
+        data={ordered.map((d) => d.avg)}
+        kind="line"
+      />
+    </div>
+  );
+}
+
+function ChartPanel({
+  label,
+  data,
+  kind,
+}: {
+  label: string;
+  data: number[];
+  kind: "bar" | "line";
+}) {
+  const max = Math.max(...data, 1);
+  const w = 100;
+  const h = 32;
+  return (
+    <div>
+      <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+        {label}
+      </div>
+      <svg
+        viewBox={`0 0 ${w} ${h}`}
+        preserveAspectRatio="none"
+        className="h-8 w-full text-primary"
+      >
+        {kind === "bar"
+          ? data.map((v, i) => {
+              const bw = w / data.length;
+              const bh = (v / max) * h;
+              return (
+                <rect
+                  key={i}
+                  x={i * bw + 0.5}
+                  y={h - bh}
+                  width={Math.max(0, bw - 1)}
+                  height={bh}
+                  fill="currentColor"
+                  opacity={0.75}
+                />
+              );
+            })
+          : (() => {
+              const dx = data.length > 1 ? w / (data.length - 1) : w;
+              const points = data
+                .map(
+                  (v, i) =>
+                    `${(i * dx).toFixed(1)},${(h - (v / max) * h).toFixed(1)}`
+                )
+                .join(" L");
+              return (
+                <path
+                  d={`M${points}`}
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                />
+              );
+            })()}
+      </svg>
     </div>
   );
 }

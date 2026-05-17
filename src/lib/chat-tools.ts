@@ -33,6 +33,7 @@ import { exaGetContents, exaSearch } from "./exa";
 import { apifyYouTubeScrape } from "./apify";
 import { transcribeYouTubeVideo } from "./deepgram";
 import { runSelect, SQL_SCHEMA } from "./sql-tool";
+import { extractSection, loadMentorMethod } from "./mentor-method";
 import {
   fetchChannelOverview,
   fetchVideoAnalytics,
@@ -440,6 +441,47 @@ const STRATEGY_TOOLS: Tool[] = [
       type: "object",
       properties: { videoId: { type: "string" } },
       required: ["videoId"],
+    },
+  },
+  {
+    name: "list_outliers",
+    description:
+      "List the active channel's competitor outliers — competitor videos that beat their own channel's 30-day median by 3× or more (per MENTOR_METHOD §2). Sorted by multiplier DESC. Always scoped to the active channel; no window/multiplier/tier filters here — that nuance lives on the /outliers page UI. Returns: { outliers: [{ videoId, title, thumbnailUrl, views, multiplier, channelMedian, publishedAt, competitorTitle, tier }] }.",
+    input_schema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", default: 50 },
+      },
+    },
+  },
+  {
+    name: "explain_outlier",
+    description:
+      "Get the cached \"what made it work\" lever tags (per MENTOR_METHOD §9) + 2-3 sentence explanation for one outlier video. If no cache exists yet, this call generates one and caches it permanently. Use after list_outliers to reason about WHY a specific video broke out. Returns: { levers: string[2-3], explanation: string, cached: boolean }.",
+    input_schema: {
+      type: "object",
+      properties: { videoId: { type: "string" } },
+      required: ["videoId"],
+    },
+  },
+  {
+    name: "generate_ideas",
+    description:
+      "Synthesise 5-10 new video ideas for the user's active channel, grounded in their channel context AND in real competitor outliers. If `outlierVideoIds` is omitted, the top 10 outliers by multiplier in the active scope are auto-picked. Each idea references a specific source outlier and uses one lever from §9. Rate-limited to 1 call per channel per 5 min. Returns: { ideas: [{ topic, suggestedTitle, angle, confidence, sourceOutlierVideoId }] }.",
+    input_schema: {
+      type: "object",
+      properties: {
+        outlierVideoIds: { type: "array", items: { type: "string" } },
+      },
+    },
+  },
+  {
+    name: "list_format_patterns",
+    description:
+      "List the active channel's extracted title-format patterns (per MENTOR_METHOD §4). Each pattern is a structural template like \"[Place]'s most [Adjective] [Thing]\" plus its avg multiplier, total monthly views, and rising rate. Sorted by rising rate DESC. Pre-requisite: the user has run 'Extract format patterns' on the /outliers Patterns tab — without that this returns an empty array. Returns: { formats: [{ template, avgMultiplier, totalViewsMonth, risingRate, exampleVideoIds: string[] }] }.",
+    input_schema: {
+      type: "object",
+      properties: { limit: { type: "number", default: 20 } },
     },
   },
 ];
@@ -896,6 +938,98 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
           },
         };
       }
+      case "list_outliers": {
+        const limit = Math.min(200, Math.max(1, Number(input.limit) || 50));
+        const { listOutliersForActiveChannel } = await import("./outliers");
+        const { outliers } = listOutliersForActiveChannel({ limit });
+        return {
+          ok: true,
+          data: {
+            outliers: outliers.map((o) => ({
+              videoId: o.videoId,
+              title: o.title,
+              thumbnailUrl: o.thumbnailUrl,
+              views: o.views,
+              multiplier: o.multiplier,
+              channelMedian: o.channelMedian,
+              publishedAt: o.publishedAt,
+              competitorTitle: o.competitorTitle,
+              tier: o.tier,
+            })),
+          },
+        };
+      }
+      case "explain_outlier": {
+        const videoId = String(input.videoId ?? "").trim();
+        if (!videoId) return { ok: false, error: "videoId required" };
+        const { explainOutlier } = await import("./outlier-explain");
+        const r = await explainOutlier({ videoId });
+        if (!r.ok) return { ok: false, error: r.error };
+        return {
+          ok: true,
+          data: {
+            videoId: r.videoId,
+            levers: r.levers,
+            explanation: r.explanation,
+            cached: r.cached,
+          },
+        };
+      }
+      case "generate_ideas": {
+        const activeId = getActiveChannelId();
+        if (!activeId) {
+          return {
+            ok: false,
+            error:
+              "No active channel — set one from the top-right channel picker before generating ideas.",
+          };
+        }
+        const outlierVideoIds = Array.isArray(input.outlierVideoIds)
+          ? input.outlierVideoIds.filter((v): v is string => typeof v === "string")
+          : undefined;
+        const { generateIdeasForChannel } = await import("./idea-generator");
+        const r = await generateIdeasForChannel({
+          userChannelId: activeId,
+          outlierVideoIds,
+        });
+        if (!r.ok) {
+          return {
+            ok: false,
+            error: r.retryAfterSec
+              ? `${r.error} (try again in ${r.retryAfterSec}s)`
+              : r.error,
+          };
+        }
+        return {
+          ok: true,
+          data: { ideas: r.ideas, generatedAt: r.generatedAt },
+        };
+      }
+      case "list_format_patterns": {
+        const activeId = getActiveChannelId();
+        if (!activeId) {
+          return {
+            ok: false,
+            error:
+              "No active channel — set one from the top-right channel picker.",
+          };
+        }
+        const limit = Math.min(50, Math.max(1, Number(input.limit) || 20));
+        const { getFormatsForChannel } = await import("./outlier-formats");
+        const formats = getFormatsForChannel(activeId, limit);
+        return {
+          ok: true,
+          data: {
+            formats: formats.map((f) => ({
+              template: f.template,
+              avgMultiplier: f.avgMultiplier,
+              totalViewsMonth: f.totalViewsMonth,
+              risingRate: f.risingRate,
+              exampleVideoIds: f.examples.map((e) => e.videoId),
+            })),
+          },
+        };
+      }
       default:
         return { ok: false, error: `unknown tool: ${name}` };
     }
@@ -921,18 +1055,47 @@ export function buildSystemPrompt(
   // more than one, we have to make it crystal clear which one is
   // currently active, otherwise Claude has historically confused them.
   const allChannels = listAllChannels();
+
+  // Methodology quotes — load once per request. MENTOR_METHOD.md lives
+  // at the project root and is small (<10KB), so the cached read is
+  // free. If the file ever moves the helpers fall back to empty strings
+  // and the prompt still functions (just with less context).
+  const md = loadMentorMethod();
+  const sec1 = extractSection(md, 1);
+  const sec2 = extractSection(md, 2);
+  const sec4 = extractSection(md, 4);
+  const sec7 = extractSection(md, 7);
+  const sec9 = extractSection(md, 9);
+
   const lines: string[] = [
-    `You are "YT Channel AI", an expert YouTube growth strategist embedded in a local desktop app used by content creators and their teams.`,
+    `You are HAmo's central YouTube ideation agent for the Eric YT Channel AI app. Your job: turn channel context, competitor data, and outlier patterns into video ideas that follow the methodology below. Every output must be practical, specific, evidence-cited from tool calls, and grounded in MENTOR_METHOD.md — never speculation.`,
     ``,
     `## Mission`,
-    `This tool exists for ONE reason: to help YouTube channels grow. Your output must be practical, specific, and usable. A creator reading your response should know exactly what to do tomorrow. If your answer could fit any channel in any niche, you failed — rewrite it with channel-specific evidence.`,
+    `This app exists to help YouTube channels grow. Every recommendation must name a specific action grounded in data the user can see. If your answer could fit any channel in any niche, you failed — rewrite it with channel-specific evidence.`,
     ``,
     `## Quality bar — non-negotiable`,
     `- **No banal advice.** Forbidden phrases and any paraphrase of them: "post consistently", "optimize your titles", "engage with your audience", "understand your niche", "be authentic", "create quality content", "use SEO", "thumbnails matter". If you catch yourself writing something that sounds like generic creator-coach content, delete it and replace with a data-backed claim.`,
     `- **Every number must come from a tool call**, not from your training knowledge. If you don't have the number, say so.`,
     `- **Every recommendation must name a specific action.** Bad: "Try longer videos". Good: "Make a 15-20 min video titled 'X' — your 3 longest videos (>12min) have 2.4× the watch time of your Shorts, and competitor @Y publishes only this format."`,
-    `- **Honesty over polish.** If the channel is small/inactive/wrong-niche, say it directly. Don't soften bad news. Creators paying for this tool want the truth, not a hype letter.`,
+    `- **Honesty over polish.** If the channel is small/inactive/wrong-niche, say it directly. Don't soften bad news.`,
     `- **No preamble.** Don't open with "Great question!" or "Let me analyse…". Go straight to the work.`,
+    ``,
+    `## Methodology — MENTOR_METHOD.md (load-bearing for every reply)`,
+    ``,
+    `### §1 — Competitor mapping (B&S Method)`,
+    sec1 || "(section unavailable)",
+    ``,
+    `### §2 — Outliers (the engine)`,
+    sec2 || "(section unavailable)",
+    ``,
+    `### §4 — Title formats (structural patterns, not literal titles)`,
+    sec4 || "(section unavailable)",
+    ``,
+    `### §7 — Ideation (synthesizing the inputs)`,
+    sec7 || "(section unavailable)",
+    ``,
+    `### §9 — The "what made it work" lever taxonomy`,
+    sec9 || "(section unavailable)",
     ``,
     `## User context`,
   ];
@@ -962,37 +1125,103 @@ export function buildSystemPrompt(
     lines.push(`- No channel is bound yet. Suggest connecting a YouTube channel in Integrations before deep analysis.`);
   }
 
-  lines.push(``, `## Available tools in this conversation`);
+  lines.push(``, `## Available tools — by name, by purpose`);
   if (activeGroups.length === 0) {
     lines.push(
-      `- None. You can only reason from conversation + your prior knowledge. If the user asks for live data, tell them to enable a tool group via the "+" menu.`
+      `- None active in this conversation. Reason from prior knowledge only; if the user asks for live data, tell them to enable a tool group via the "+" menu.`
     );
   } else {
-    if (activeGroups.includes("youtube"))
+    lines.push(
+      `Always call a tool when one can answer the question — never speculate when data is available. Cite the tool that produced each fact ("from list_outliers: …").`,
+      ``
+    );
+
+    if (activeGroups.includes("youtube")) {
       lines.push(
-        `- **YouTube** — local DB queries on the USER'S OWN videos/transcripts/comments, fetch live comments, search YouTube.`
+        `### Channel data (active-channel-scoped local DB)`,
+        `- channel_summary — channel + headline stats`,
+        `- list_my_videos — your videos, sortable, searchable`,
+        `- search_my_transcripts — keyword search across your video transcripts`,
+        `- get_video_comments / list_video_comments_cached / search_my_comments / get_comment_thread — comment data`,
+        ``
       );
-    if (activeGroups.includes("analytics"))
+    }
+
+    if (activeGroups.includes("analytics")) {
       lines.push(
-        `- **Analytics** — execute_sql over local DB (use this for correlations, cohort analysis, outliers), youtube_trending, niche_explorer (top channels + outlier videos in a niche), fetch_transcript.`
+        `### Analytics & SQL (deeper local work)`,
+        `- execute_sql — read-only SQL over local DB tables (videos, transcripts, comments, etc.)`,
+        `- youtube_trending — top-trending videos in a niche/region`,
+        `- niche_explorer — top channels + outlier videos in a niche`,
+        `- fetch_transcript — transcript for any public YouTube video`,
+        ``
       );
-    if (activeGroups.includes("research"))
+    }
+
+    if (activeGroups.includes("research")) {
       lines.push(
-        `- **Research** — youtube_suggest (autocomplete → real search demand, what people actually type when looking for content in this niche).`
+        `### Research`,
+        `- youtube_suggest — YouTube autocomplete (real search-demand signal)`,
+        ``
       );
-    if (activeGroups.includes("exa"))
-      lines.push(`- **Exa** — semantic web search + page contents. Use for competitor research, articles, external context.`);
-    if (activeGroups.includes("apify"))
-      lines.push(`- **Apify** — scrape competitor YouTube channels + transcripts. Use when you need competitor data that isn't in the user's DB.`);
-    if (activeGroups.includes("yt_analytics"))
+    }
+
+    if (activeGroups.includes("exa")) {
       lines.push(
-        `- **YouTube Analytics** — live data from the user's connected channel: channel overview (views/watch time/subs Δ over a period), per-video analytics (retention curve, traffic sources, demographics, geography), channel-wide audience (demographics, devices, top countries, traffic), and revenue (only if Owner). This is the ground truth for "how is my channel actually doing" — use it before relying on stale local DB stats.`
+        `### External web`,
+        `- web_search / web_fetch — semantic web search + page contents via Exa. Use for competitor research, articles, external context.`,
+        ``
       );
-    if (activeGroups.includes("strategy"))
+    }
+
+    if (activeGroups.includes("apify")) {
       lines.push(
-        `- **Strategy** — read-only access to the platform's own analysis surfaces: tracked competitors + their outlier alerts + gap-analysis keywords, and AI Comment Analysis on the user's own videos (sentiment / themes / objections / future-video ideas / standout quote candidates). Use these when answering "what should I make next", "what are competitors doing I'm not", "what does my audience actually want" — every dashboard the creator sees, you can read.`
+        `### Apify (paid scrapers)`,
+        `- scrape_youtube_channel — full sync of a competitor channel via Apify (paid). Use when you need competitor data that isn't in the user's DB.`,
+        `- get_youtube_transcript — Apify-backed transcript fallback when fetch_transcript can't find one.`,
+        ``
       );
+    }
+
+    if (activeGroups.includes("yt_analytics")) {
+      lines.push(
+        `### YouTube Analytics (live, OAuth-gated)`,
+        `- get_channel_analytics_overview / get_channel_audience / get_channel_revenue — channel-wide period data`,
+        `- get_video_analytics — per-video retention, traffic sources, demographics, geography`,
+        `This is the ground truth for "how is my channel actually doing" — use it before relying on stale local DB stats.`,
+        ``
+      );
+    }
+
+    if (activeGroups.includes("strategy")) {
+      lines.push(
+        `### Competitive intelligence (per §1 B&S Method)`,
+        `- list_competitors — your tracked competitors, each tagged Authority / Breakthrough / Adjacent / Far`,
+        `- list_competitor_alerts — viral hits in your competitive set`,
+        `- competitor_gap_analysis — keywords frequent in competitor top videos that you've NEVER used`,
+        ``,
+        `### Outliers + ideation (the §2 + §9 engine)`,
+        `- list_outliers — competitor videos beating their own median 3×+, sorted by multiplier`,
+        `- explain_outlier — 2-3 §9 levers + reasoning for a specific outlier (cached permanently)`,
+        `- generate_ideas — 5–10 ideas grounded in §1/§7/§9, traceable to source outliers (rate-limited 1/5min per channel)`,
+        `- list_format_patterns — title-format templates extracted from outliers (§4 structural patterns)`,
+        ``,
+        `### Audience (your own videos)`,
+        `- get_comment_analysis — sentiment, themes, objections, future-video ideas, standout quote candidates per video`
+      );
+    }
   }
+
+  lines.push(
+    ``,
+    `## Operating rules`,
+    `1. Always call a tool when one can answer. No data speculation.`,
+    `2. Cite the tool that produced each fact ("from list_outliers: …", "from list_format_patterns: …").`,
+    `3. Active channel scope is sacred — never silently aggregate across the user's channels.`,
+    `4. For ideation questions: list_outliers → optionally list_format_patterns → generate_ideas. Don't skip to generate_ideas without the source.`,
+    `5. For "why did X work" questions: list_outliers (or accept the videoId from context) → explain_outlier.`,
+    `6. Avoid retrying the same tool+input combination — the dispatcher rejects duplicates.`
+  );
 
   // Tell the executor about the advisor ONLY when it's actually wired up for
   // this request — otherwise we'd be encouraging calls to a non-existent tool.
