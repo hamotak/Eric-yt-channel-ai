@@ -5,6 +5,9 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowUp,
+  Check,
+  ExternalLink,
+  Eye,
   Flame,
   Loader2,
   MessageSquare,
@@ -91,7 +94,50 @@ type FormatRow = {
 };
 
 const VIEW_MODE_KEY = "dashboard.viewMode";
-type TabName = "library" | "patterns";
+type TabName = "recent" | "library" | "patterns" | "gaps";
+
+/* ---------------- Recent + Topics Gap types (shared) ---------------- */
+
+type Alert = {
+  id: number;
+  competitor_id: number;
+  video_id: string;
+  title: string | null;
+  thumbnail_url: string | null;
+  views: number | null;
+  channel_median_views: number | null;
+  multiplier: number | null;
+  detected_at: number;
+  read_at: number | null;
+  competitor_title: string | null;
+  competitor_handle: string | null;
+  competitor_tier: Tier;
+  published_at: number | null;
+};
+
+type AlertSort = "outlier" | "newest" | "views";
+type AlertWindow = "all" | "7d" | "28d" | "90d";
+
+// 1× was dropped when the alert generation floor moved to 1.5×. Sourced
+// from the same per-browser key the old /competitors Alerts tab used —
+// existing users carry over their picked filter.
+const ALERTS_MIN_MULT_STOPS = [1.5, 2, 3, 5, 10] as const;
+const ALERTS_MIN_MULT_KEY = "alerts.min_multiplier";
+
+type TopicGap = {
+  topic: string;
+  reason: string;
+  avgMultiplier: number;
+  totalViews: number;
+  examples: Array<{
+    videoId: string;
+    title: string;
+    views: number;
+    thumbnailUrl: string;
+    competitorTitle: string | null;
+    tier: Tier;
+  }>;
+};
 
 /* ---------------- Formatters ---------------- */
 
@@ -135,8 +181,14 @@ function OutliersInner() {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+  // Default landing tab is Recent — the sidebar badge expects unread
+  // discoveries to be one click away, and most session entries come via
+  // that badge. Library / Patterns / Gaps remain reachable via ?tab=.
+  const tabParam = searchParams.get("tab");
   const activeTab: TabName =
-    searchParams.get("tab") === "patterns" ? "patterns" : "library";
+    tabParam === "library" || tabParam === "patterns" || tabParam === "gaps"
+      ? tabParam
+      : "recent";
 
   const [scope, setScope] = useState<string | "all" | null>(null);
 
@@ -167,7 +219,9 @@ function OutliersInner() {
 
   const goTab = (t: TabName) => {
     const qs = new URLSearchParams(searchParams.toString());
-    if (t === "library") qs.delete("tab");
+    // Recent is the default — strip ?tab= so the URL stays clean on
+    // the most common landing.
+    if (t === "recent") qs.delete("tab");
     else qs.set("tab", t);
     router.push(`${pathname}${qs.toString() ? `?${qs.toString()}` : ""}`);
   };
@@ -180,12 +234,13 @@ function OutliersInner() {
           Outliers
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Competitor videos that beat their own channel&apos;s median by 2× or
-          more (configurable below). Methodology in{" "}
+          Competitor videos that beat their own channel&apos;s median. Recent
+          shows fresh discoveries (≥1.5× generation floor); Library is the
+          methodology view (≥2× per{" "}
           <code className="rounded bg-muted px-1 py-0.5 text-xs">
             MENTOR_METHOD.md §2
           </code>
-          .
+          ).
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
           Want ideas from these outliers?{" "}
@@ -200,7 +255,13 @@ function OutliersInner() {
       </header>
 
       {/* Tab bar */}
-      <nav className="mb-6 flex gap-4 border-b border-border">
+      <nav className="mb-6 flex flex-wrap gap-4 border-b border-border">
+        <TabLink
+          active={activeTab === "recent"}
+          onClick={() => goTab("recent")}
+        >
+          Recent
+        </TabLink>
         <TabLink
           active={activeTab === "library"}
           onClick={() => goTab("library")}
@@ -213,12 +274,23 @@ function OutliersInner() {
         >
           Patterns
         </TabLink>
+        <TabLink
+          active={activeTab === "gaps"}
+          onClick={() => goTab("gaps")}
+        >
+          <Sparkles className="h-3.5 w-3.5" />
+          Topics Gap
+        </TabLink>
       </nav>
 
-      {activeTab === "library" ? (
+      {activeTab === "recent" ? (
+        <RecentTab scope={scope} />
+      ) : activeTab === "library" ? (
         <LibraryTab scope={scope} />
-      ) : (
+      ) : activeTab === "patterns" ? (
         <PatternsTab scope={scope} />
+      ) : (
+        <TopicsGapTab scope={scope} />
       )}
     </div>
   );
@@ -356,15 +428,24 @@ function LibraryTab({ scope }: { scope: string | "all" | null }) {
           </CardContent>
         </Card>
       ) : (
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        <ul className="space-y-2">
           {outliers.map((o) => (
-            <OutlierCard
+            <OutlierRow
               key={o.videoId}
-              outlier={o}
-              onOpen={() => setOpenOutlier(o)}
+              videoId={o.videoId}
+              title={o.title}
+              thumbnailUrl={o.thumbnailUrl}
+              views={o.views}
+              multiplier={o.multiplier}
+              publishedAt={o.publishedAt}
+              competitorTitle={o.competitorTitle}
+              competitorHandle={o.competitorHandle}
+              tier={o.tier}
+              durationSeconds={o.durationSeconds}
+              onExplain={() => setOpenOutlier(o)}
             />
           ))}
-        </div>
+        </ul>
       )}
       {openOutlier && (
         <ExplainModal
@@ -376,73 +457,527 @@ function LibraryTab({ scope }: { scope: string | "all" | null }) {
   );
 }
 
-/* ---------------- Outlier card + explain modal (unchanged from prior step) ---------------- */
+/* ---------------- Recent tab (the discovery log) ---------------- */
+/**
+ * Reads from competitor_alerts — discovered competitor videos at the
+ * 1.5× generation floor. Sorted newest first. Per-row mark-read clears
+ * the sidebar badge. Read-state and the filter/sort knobs live here;
+ * Library is the strictly-2× methodology view with no read state.
+ */
+function RecentTab({ scope }: { scope: string | "all" | null }) {
+  const [alerts, setAlerts] = useState<Alert[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [sort, setSort] = useState<AlertSort>("outlier");
+  const [windowKey, setWindowKey] = useState<AlertWindow>("all");
+  const [minMult, setMinMult] = useState<number>(2);
 
-function OutlierCard({
-  outlier,
-  onOpen,
-}: {
-  outlier: Outlier;
-  onOpen: () => void;
-}) {
+  // Preserve the per-browser filter the old /competitors Alerts tab used.
+  // Guard at 1.5 so a stale "1" from before the 1× pill was dropped snaps
+  // back to the default of 2 instead of leaving no pill highlighted.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const raw = window.localStorage.getItem(ALERTS_MIN_MULT_KEY);
+    if (!raw) return;
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 1.5) setMinMult(parsed);
+  }, []);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(ALERTS_MIN_MULT_KEY, String(minMult));
+  }, [minMult]);
+
+  const refresh = useCallback(async () => {
+    if (scope === null) return;
+    // The alerts endpoint scopes to one user channel. "all" mode falls
+    // back to the active channel server-side (passing "all" disables the
+    // scope and surfaces cross-channel alerts — Recent stays per-channel
+    // to match the sidebar badge semantics).
+    const channelParam = scope === "all" ? "all" : scope;
+    try {
+      const r = await fetch(
+        `/api/competitors/alerts?limit=100&userChannelId=${encodeURIComponent(
+          channelParam
+        )}`,
+        { cache: "no-store" }
+      );
+      const d = (await r.json()) as { alerts?: Alert[]; error?: string };
+      if (d.error) {
+        setError(d.error);
+        setAlerts([]);
+        return;
+      }
+      setAlerts(d.alerts ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load.");
+    }
+  }, [scope]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const markRead = async (id: number) => {
+    await fetch(`/api/competitors/alerts/${id}/read`, { method: "POST" });
+    await refresh();
+  };
+
+  const filtered = useMemo(() => {
+    if (!alerts) return [];
+    const now = Math.floor(Date.now() / 1000);
+    const windowSec =
+      windowKey === "7d"
+        ? 7 * 86400
+        : windowKey === "28d"
+          ? 28 * 86400
+          : windowKey === "90d"
+            ? 90 * 86400
+            : null;
+    const out = alerts.filter((a) => {
+      if (windowSec !== null) {
+        const t = a.published_at ?? a.detected_at;
+        if (now - t > windowSec) return false;
+      }
+      // Alerts without a multiplier slip through at the lowest stop and get
+      // dropped at anything higher — historical rows from before multiplier
+      // was tracked, harmless.
+      if (minMult > 1.5) {
+        if (a.multiplier === null || a.multiplier < minMult) return false;
+      }
+      return true;
+    });
+    return out.sort((a, b) => {
+      if (sort === "newest") {
+        return (
+          (b.published_at ?? b.detected_at) - (a.published_at ?? a.detected_at)
+        );
+      }
+      if (sort === "views") {
+        return (b.views ?? 0) - (a.views ?? 0);
+      }
+      return (b.multiplier ?? 0) - (a.multiplier ?? 0);
+    });
+  }, [alerts, sort, windowKey, minMult]);
+
+  if (alerts === null) {
+    return (
+      <div className="flex items-center justify-center gap-2 py-20 text-muted-foreground">
+        <Loader2 className="h-4 w-4 animate-spin" />
+        Loading recent discoveries…
+      </div>
+    );
+  }
+
   return (
-    <button
-      type="button"
-      onClick={onOpen}
-      className="group relative block w-full rounded-xl text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
-    >
-      <Card className="overflow-hidden transition-colors group-hover:bg-accent/30">
-        <div className="relative aspect-video w-full bg-muted">
-          {outlier.thumbnailUrl ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={outlier.thumbnailUrl}
-              alt=""
-              className="h-full w-full object-cover"
-              referrerPolicy="no-referrer"
-            />
-          ) : null}
-          {outlier.durationSeconds ? (
-            <span className="absolute bottom-2 right-2 rounded bg-black/75 px-1.5 py-0.5 text-[10px] font-mono text-white">
-              {fmtDuration(outlier.durationSeconds)}
-            </span>
-          ) : null}
-          <div className="absolute inset-x-0 bottom-0 flex translate-y-full items-center justify-center bg-gradient-to-t from-black/85 via-black/55 to-transparent p-3 opacity-0 transition-all group-hover:translate-y-0 group-hover:opacity-100">
-            <span className="inline-flex items-center gap-1.5 rounded-md bg-white/15 px-3 py-1 text-xs font-medium text-white backdrop-blur">
-              <Sparkles className="h-3.5 w-3.5" />
-              Explain why this worked
-            </span>
-          </div>
+    <>
+      {error && (
+        <div className="mb-4 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          {error}
         </div>
-        <CardContent className="space-y-2 p-3">
-          <div className="line-clamp-2 text-sm font-medium leading-snug">
-            {outlier.title}
+      )}
+
+      {/* Filter row — Sort + Window on line 1, Min outlier on line 2. */}
+      <div className="mb-3 space-y-2 border-b border-border/60 pb-3 text-xs">
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="inline-flex items-center gap-1.5 text-muted-foreground">
+            <span>Sort:</span>
+            <select
+              value={sort}
+              onChange={(e) => setSort(e.target.value as AlertSort)}
+              className="rounded-md border border-input bg-background px-2 py-1 text-xs"
+            >
+              <option value="outlier">Highest outlier score</option>
+              <option value="newest">Newest upload</option>
+              <option value="views">Most views</option>
+            </select>
+          </label>
+          <div className="inline-flex items-center gap-1.5">
+            <span className="text-muted-foreground">Window:</span>
+            {(["all", "7d", "28d", "90d"] as const).map((w) => (
+              <button
+                key={w}
+                type="button"
+                onClick={() => setWindowKey(w)}
+                className={cn(
+                  "rounded-full px-2 py-0.5 text-[11px] font-medium transition-colors",
+                  windowKey === w
+                    ? "bg-primary/15 text-primary"
+                    : "border border-border text-muted-foreground hover:text-foreground"
+                )}
+              >
+                {w === "all" ? "All" : w}
+              </button>
+            ))}
           </div>
-          <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="min-w-0 truncate text-muted-foreground">
-              {outlier.competitorTitle ?? outlier.competitorHandle ?? "—"}
-            </span>
-            <span
+          <span className="ml-auto text-[11px] text-muted-foreground">
+            {filtered.length} alert{filtered.length === 1 ? "" : "s"} shown
+            {filtered.length !== alerts.length && (
+              <span className="text-muted-foreground/60">
+                {" "}
+                (of {alerts.length})
+              </span>
+            )}
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-muted-foreground">Min outlier:</span>
+          {ALERTS_MIN_MULT_STOPS.map((v) => (
+            <button
+              key={v}
+              type="button"
+              onClick={() => setMinMult(v)}
               className={cn(
-                "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium",
-                TIER_PILL[outlier.tier]
+                "rounded-full px-2 py-0.5 text-[11px] font-medium transition-colors",
+                minMult === v
+                  ? "bg-primary/15 text-primary"
+                  : "border border-border text-muted-foreground hover:text-foreground"
               )}
             >
-              {TIER_LABEL[outlier.tier]}
-            </span>
+              {`${v}×`}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {filtered.length === 0 ? (
+        <div className="py-12 text-center text-sm text-muted-foreground">
+          {alerts.length === 0
+            ? "Alerts surface competitor videos at ≥ 1.5× their channel's median views. Add competitors and sync to populate."
+            : "No alerts match these filters. Try widening the window or lowering the min outlier."}
+        </div>
+      ) : (
+        <ul className="space-y-2">
+          {filtered.map((a) => (
+            <OutlierRow
+              key={a.id}
+              videoId={a.video_id}
+              title={a.title}
+              thumbnailUrl={a.thumbnail_url}
+              views={a.views}
+              multiplier={a.multiplier}
+              publishedAt={a.published_at}
+              detectedAt={a.detected_at}
+              competitorTitle={a.competitor_title}
+              competitorHandle={a.competitor_handle}
+              tier={a.competitor_tier}
+              isUnread={!a.read_at}
+              onMarkRead={() => markRead(a.id)}
+            />
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
+/* ---------------- Topics Gap tab (ported from /competitors) ---------------- */
+/**
+ * AI grouping of competitor outliers into topics the user hasn't covered.
+ * Lazy-loads on first tab open so we don't burn a Claude call on every
+ * page visit. Cached server-side per active channel for 4 hours.
+ */
+function TopicsGapTab({ scope }: { scope: string | "all" | null }) {
+  const [gaps, setGaps] = useState<TopicGap[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [generatedAt, setGeneratedAt] = useState<number | null>(null);
+  const [cached, setCached] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Topics Gap is per-channel; "all" mode doesn't make sense because the
+  // server keys the cache by user_channel_id. Pass scope through; the
+  // route falls back to the active channel when no userChannelId is given.
+  const fetchGaps = useCallback(
+    async (refresh: boolean) => {
+      if (scope === null) return;
+      setLoading(true);
+      setError(null);
+      try {
+        const r = await fetch("/api/competitors/topics-gap", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            scope === "all" ? { refresh } : { userChannelId: scope, refresh }
+          ),
+          cache: "no-store",
+        });
+        const d = (await r.json()) as {
+          ok?: boolean;
+          gaps?: TopicGap[];
+          cached?: boolean;
+          generatedAt?: number;
+          error?: string;
+        };
+        if (!r.ok || !d.ok || !Array.isArray(d.gaps)) {
+          setGaps(null);
+          setError(d.error ?? `HTTP ${r.status}`);
+          return;
+        }
+        setGaps(d.gaps);
+        setCached(d.cached ?? false);
+        setGeneratedAt(d.generatedAt ?? null);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "failed");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [scope]
+  );
+
+  // Lazy load on first render — only when we have a real scope.
+  useEffect(() => {
+    if (scope !== null && gaps === null && !loading) {
+      void fetchGaps(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope]);
+
+  return (
+    <Card>
+      <CardContent className="space-y-4 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="space-y-1">
+            <p className="text-sm text-foreground">
+              Topics working for your competitors that you haven&apos;t covered
+              yet. Grounded in MENTOR_METHOD §4 (topics ≠ formats).
+            </p>
+            <p className="text-[11px] text-muted-foreground">
+              {generatedAt ? (
+                <>
+                  {cached ? "Cached" : "Generated"} {fmtRelative(generatedAt)} ·
+                  refresh after 4 hours
+                </>
+              ) : (
+                "Click the button to generate. Cached 4 hours per channel."
+              )}
+            </p>
           </div>
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span>
-              {fmtCount(outlier.views)} views ·{" "}
-              <span className="font-bold text-amber-600 dark:text-amber-400 tabular-nums">
-                {outlier.multiplier.toFixed(1)}× median
-              </span>
-            </span>
-            <span>{fmtRelative(outlier.publishedAt)}</span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => fetchGaps(true)}
+            disabled={loading}
+            className="gap-1.5"
+          >
+            {loading ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Sparkles className="h-3.5 w-3.5" />
+            )}
+            {gaps ? "Re-generate" : "Generate"}
+          </Button>
+        </div>
+
+        {error && (
+          <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
+            {error}
           </div>
-        </CardContent>
-      </Card>
-    </button>
+        )}
+
+        {gaps === null && !loading && !error ? (
+          <div className="py-10 text-center text-sm text-muted-foreground">
+            Click <strong>Generate</strong> to run the AI topic-gap pass.
+          </div>
+        ) : loading ? (
+          <div className="py-10 text-center text-sm text-muted-foreground">
+            <Loader2 className="mb-1 inline h-4 w-4 animate-spin" />
+            <div>Asking Claude to group competitor outliers into topics…</div>
+          </div>
+        ) : gaps && gaps.length === 0 ? (
+          <div className="py-10 text-center text-sm text-muted-foreground">
+            No topic gaps found — either you&apos;ve covered every angle your
+            competitors are winning on, or there aren&apos;t enough outliers
+            yet.
+          </div>
+        ) : gaps ? (
+          <ul className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            {gaps.map((g) => (
+              <li
+                key={g.topic}
+                className="rounded-md border border-border/70 p-3"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <h3 className="text-sm font-semibold leading-snug">
+                    {g.topic}
+                  </h3>
+                  <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 font-mono text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
+                    {g.avgMultiplier.toFixed(1)}×
+                  </span>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">{g.reason}</p>
+                {g.examples.length > 0 && (
+                  <div className="mt-2 flex gap-1.5">
+                    {g.examples.map((ex) => (
+                      <a
+                        key={ex.videoId}
+                        href={`https://www.youtube.com/watch?v=${ex.videoId}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={`${ex.title} — ${ex.competitorTitle ?? "?"} (${TIER_LABEL[ex.tier]})`}
+                        className="block w-16 shrink-0"
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={ex.thumbnailUrl}
+                          alt=""
+                          className="h-9 w-16 rounded object-cover"
+                          referrerPolicy="no-referrer"
+                        />
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+/* ---------------- Shared row card (used by Recent + Library) ---------------- */
+/**
+ * Single row visual used by both Recent and Library. The two tabs feed
+ * different data shapes (alert row vs live outlier row) but they show
+ * the same fields in the same arrangement — keeps the visual contract
+ * consistent and means a card-styling change only happens in one place.
+ *
+ * Optional knobs:
+ *   - isUnread          → amber unread accent (Recent only)
+ *   - onExplain         → click anywhere on the row opens the ExplainModal
+ *                          (Library only; renders a Sparkles affordance)
+ *   - onMarkRead        → renders a Check button when isUnread (Recent only)
+ *   - durationSeconds   → small overlay on the thumbnail (Library only)
+ *   - detectedAt        → "detected Xh ago" tooltip on the upload date
+ *                          (Recent only)
+ */
+type OutlierRowProps = {
+  videoId: string;
+  title: string | null;
+  thumbnailUrl: string | null;
+  views: number | null;
+  multiplier: number | null;
+  publishedAt: number | null;
+  competitorTitle: string | null;
+  competitorHandle: string | null;
+  tier: Tier;
+  detectedAt?: number | null;
+  durationSeconds?: number | null;
+  isUnread?: boolean;
+  onExplain?: () => void;
+  onMarkRead?: () => void;
+};
+
+function OutlierRow(props: OutlierRowProps) {
+  const ytUrl = `https://www.youtube.com/watch?v=${props.videoId}`;
+  // Fall back to detection time for the rare orphaned-alert case
+  // (competitor_videos row deleted but alert remains).
+  const uploadTs = props.publishedAt ?? props.detectedAt ?? null;
+  const uploadLabel = props.publishedAt !== null ? "uploaded" : "detected";
+  const clickable = !!props.onExplain;
+  return (
+    <li
+      onClick={clickable ? props.onExplain : undefined}
+      className={cn(
+        "group flex flex-wrap items-start gap-3 rounded-md border p-3 transition-colors",
+        props.isUnread
+          ? "border-amber-500/40 bg-amber-500/5"
+          : "border-border bg-background",
+        clickable && "cursor-pointer hover:bg-accent/40"
+      )}
+    >
+      {props.thumbnailUrl && (
+        <div className="relative shrink-0">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={props.thumbnailUrl}
+            alt=""
+            className="h-16 w-28 rounded object-cover"
+            referrerPolicy="no-referrer"
+          />
+          {props.durationSeconds ? (
+            <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1 py-0.5 text-[9px] font-mono text-white">
+              {fmtDuration(props.durationSeconds)}
+            </span>
+          ) : null}
+        </div>
+      )}
+      <div className="min-w-0 flex-1">
+        <a
+          href={ytUrl}
+          target="_blank"
+          rel="noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          className="inline-flex items-start gap-1 text-sm font-medium leading-snug hover:underline"
+        >
+          <span className="line-clamp-2">{props.title ?? "(untitled)"}</span>
+          <ExternalLink className="mt-0.5 h-3 w-3 shrink-0 opacity-60" />
+        </a>
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+          <span>
+            <strong className="text-foreground">
+              {props.competitorTitle ?? props.competitorHandle ?? "?"}
+            </strong>
+          </span>
+          <span
+            className={cn(
+              "rounded-full px-1.5 py-0.5 text-[10px] font-medium",
+              TIER_PILL[props.tier]
+            )}
+          >
+            {TIER_LABEL[props.tier]}
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <Eye className="h-3 w-3" />
+            {fmtCount(props.views)} views
+          </span>
+          {props.multiplier !== null && props.multiplier !== undefined && (
+            <span className="rounded bg-amber-500/15 px-1.5 py-0.5 font-mono font-medium text-amber-700 dark:text-amber-400">
+              {props.multiplier.toFixed(1)}× median
+            </span>
+          )}
+          {uploadTs !== null && (
+            <span
+              title={
+                props.detectedAt
+                  ? `Detected ${fmtRelative(props.detectedAt)}`
+                  : undefined
+              }
+            >
+              · {uploadLabel} {fmtRelative(uploadTs)}
+            </span>
+          )}
+        </div>
+      </div>
+      {clickable && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onExplain?.();
+          }}
+          className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+          aria-label="Explain why this worked"
+          title="Explain why this worked"
+        >
+          <Sparkles className="h-3.5 w-3.5" />
+        </button>
+      )}
+      {props.isUnread && props.onMarkRead && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onMarkRead?.();
+          }}
+          className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+          aria-label="Mark read"
+          title="Mark read"
+        >
+          <Check className="h-3.5 w-3.5" />
+        </button>
+      )}
+    </li>
   );
 }
 

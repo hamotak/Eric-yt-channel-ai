@@ -21,10 +21,13 @@ import { cn } from "@/lib/utils";
 export function Sidebar() {
   const { t } = useI18n();
   const pathname = usePathname();
-  // Lightweight competitor-alerts badge. Polls every 60s so the user
-  // notices viral hits in their niche without having to open the
-  // Competitors page. Quiet failure — no badge if the fetch errors
-  // (e.g. before the migration ran on a fresh database).
+  // Lightweight outliers-discovery badge. Polls every 60s so the user
+  // notices viral hits in their niche without having to open /outliers.
+  // The count comes from competitor_alerts (the discovery log); /api/competitors
+  // returns it as `unreadAlerts` already (legacy name, still accurate). Quiet
+  // failure — no badge if the fetch errors (e.g. before the migration ran on
+  // a fresh database). When the badge is > 0, the Outliers link deep-links
+  // to the Recent tab so the click lands on the unread rows.
   const [unreadAlerts, setUnreadAlerts] = useState(0);
   useEffect(() => {
     let cancelled = false;
@@ -51,13 +54,13 @@ export function Sidebar() {
     { href: "/channel-info", label: "Channel Info", icon: Users, badge: 0 },
     { href: "/videos", label: t.nav.videos, icon: Video, badge: 0 },
     { href: "/chat", label: t.nav.chat, icon: MessageSquare, badge: 0 },
+    { href: "/competitors", label: "Competitors", icon: Search, badge: 0 },
     {
-      href: "/competitors",
-      label: "Competitors",
-      icon: Search,
+      href: unreadAlerts > 0 ? "/outliers?tab=recent" : "/outliers",
+      label: "Outliers",
+      icon: Flame,
       badge: unreadAlerts,
     },
-    { href: "/outliers", label: "Outliers", icon: Flame, badge: 0 },
     { href: "/settings", label: t.nav.settings, icon: Settings, badge: 0 },
     {
       href: "/tutorial",
@@ -98,10 +101,15 @@ export function Sidebar() {
       <nav className="flex-1 px-3 py-2">
         <ul className="space-y-1">
           {items.map((item) => {
+            // Strip any ?query string from the href before the activeness
+            // check — the Outliers item conditionally deep-links to
+            // /outliers?tab=recent and we still want it highlighted when
+            // pathname is plain /outliers.
+            const itemPath = item.href.split("?")[0];
             const active =
-              item.href === "/"
+              itemPath === "/"
                 ? pathname === "/"
-                : pathname === item.href || pathname.startsWith(item.href + "/");
+                : pathname === itemPath || pathname.startsWith(itemPath + "/");
             const Icon = item.icon;
             return (
               <Fragment key={item.href}>

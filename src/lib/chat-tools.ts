@@ -413,18 +413,6 @@ const STRATEGY_TOOLS: Tool[] = [
     input_schema: { type: "object", properties: {}, required: [] },
   },
   {
-    name: "list_competitor_alerts",
-    description:
-      "List recent outlier alerts — videos from tracked competitors that hit ≥1.5× their channel's median views (generation floor; methodology canon stays at 2×). Use to surface what's going viral in the user's niche right now.",
-    input_schema: {
-      type: "object",
-      properties: {
-        unreadOnly: { type: "boolean", default: false },
-        limit: { type: "number", default: 50 },
-      },
-    },
-  },
-  {
     name: "competitor_gap_analysis",
     description:
       "Find title keywords frequent in competitors' top videos that the user has NEVER used. Returns words ranked by aggregate competitor views, with usage frequency and example titles. Use when the user wants ideas grounded in proven competitor formulas.",
@@ -446,11 +434,23 @@ const STRATEGY_TOOLS: Tool[] = [
   {
     name: "list_outliers",
     description:
-      "List the active channel's competitor outliers — competitor videos that beat their own channel's 60-day median by 2× or more (per MENTOR_METHOD §2). Sorted by multiplier DESC. Always scoped to the active channel; no window/multiplier/tier filters here — that nuance lives on the /outliers page UI. Returns: { outliers: [{ videoId, title, thumbnailUrl, views, multiplier, channelMedian, publishedAt, competitorTitle, tier }] }.",
+      "List the active channel's competitor outliers — competitor videos that beat their own channel's median views. Two modes: (default) the methodology-canonical view — 60-day window, ≥2× median per MENTOR_METHOD §2, sorted by multiplier DESC; or set recent_only=true for the discovery log — alert rows generated when a competitor video first crossed the 1.5× generation floor, sorted by detection time DESC. Pass unreadOnly=true (with recent_only) to filter the discovery log to rows the user hasn't acknowledged. Always scoped to the active channel. Returns: { outliers: [{ videoId, title, thumbnailUrl, views, multiplier, channelMedian, publishedAt, competitorTitle, competitorHandle, tier, detectedAt?, unread? }] }.",
     input_schema: {
       type: "object",
       properties: {
         limit: { type: "number", default: 50 },
+        recent_only: {
+          type: "boolean",
+          description:
+            "When true, return the alert/discovery log (1.5× floor, sorted newest first) instead of the methodology view (2× floor, sorted by multiplier).",
+          default: false,
+        },
+        unreadOnly: {
+          type: "boolean",
+          description:
+            "Only honored when recent_only=true. Filters to alerts the user hasn't marked read.",
+          default: false,
+        },
       },
     },
   },
@@ -867,32 +867,6 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
           })),
         };
       }
-      case "list_competitor_alerts": {
-        const unreadOnly = !!input.unreadOnly;
-        const limit = Math.min(
-          200,
-          Math.max(1, Number(input.limit) || 50)
-        );
-        const alerts = listCompetitorAlerts({
-          unreadOnly,
-          limit,
-          userChannelId: getActiveChannelId(),
-        });
-        return {
-          ok: true,
-          data: alerts.map((a) => ({
-            id: a.id,
-            competitor: a.competitor_title ?? a.competitor_handle,
-            videoId: a.video_id,
-            title: a.title,
-            views: a.views,
-            multiplier: a.multiplier,
-            channelMedianViews: a.channel_median_views,
-            detectedAt: a.detected_at,
-            unread: !a.read_at,
-          })),
-        };
-      }
       case "competitor_gap_analysis": {
         const topN = Math.min(50, Math.max(5, Number(input.topN) || 25));
         // competitorGapAnalysis already falls back to getActiveChannelId
@@ -940,6 +914,34 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
       }
       case "list_outliers": {
         const limit = Math.min(200, Math.max(1, Number(input.limit) || 50));
+        const recentOnly = !!input.recent_only;
+        if (recentOnly) {
+          const unreadOnly = !!input.unreadOnly;
+          const alerts = listCompetitorAlerts({
+            unreadOnly,
+            limit,
+            userChannelId: getActiveChannelId(),
+          });
+          return {
+            ok: true,
+            data: {
+              outliers: alerts.map((a) => ({
+                videoId: a.video_id,
+                title: a.title,
+                thumbnailUrl: a.thumbnail_url,
+                views: a.views,
+                multiplier: a.multiplier,
+                channelMedian: a.channel_median_views,
+                publishedAt: a.published_at,
+                competitorTitle: a.competitor_title,
+                competitorHandle: a.competitor_handle,
+                tier: a.competitor_tier ?? null,
+                detectedAt: a.detected_at,
+                unread: !a.read_at,
+              })),
+            },
+          };
+        }
         const { listOutliersForActiveChannel } = await import("./outliers");
         const { outliers } = listOutliersForActiveChannel({ limit });
         return {
@@ -954,6 +956,7 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
               channelMedian: o.channelMedian,
               publishedAt: o.publishedAt,
               competitorTitle: o.competitorTitle,
+              competitorHandle: o.competitorHandle,
               tier: o.tier,
             })),
           },
@@ -1197,11 +1200,10 @@ export function buildSystemPrompt(
       lines.push(
         `### Competitive intelligence (per §1 B&S Method)`,
         `- list_competitors — your tracked competitors, each tagged Authority / Breakthrough / Adjacent / Far`,
-        `- list_competitor_alerts — viral hits in your competitive set`,
         `- competitor_gap_analysis — keywords frequent in competitor top videos that you've NEVER used`,
         ``,
         `### Outliers + ideation (the §2 + §9 engine)`,
-        `- list_outliers — competitor videos beating their own median 2×+ (60d window), sorted by multiplier`,
+        `- list_outliers — competitor videos beating their own median. Default mode (60d window, ≥2×, sorted by multiplier) for "what's working broadly". Pass recent_only=true for the discovery log (≥1.5× floor, sorted by detection time DESC) when the user asks "what's new" or "any viral hits since I last looked"; combine with unreadOnly=true to filter to unacknowledged.`,
         `- explain_outlier — 2-3 §9 levers + reasoning for a specific outlier (cached permanently)`,
         `- generate_ideas — 5–10 ideas grounded in §1/§7/§9, traceable to source outliers (rate-limited 1/5min per channel)`,
         `- list_format_patterns — title-format templates extracted from outliers (§4 structural patterns)`,

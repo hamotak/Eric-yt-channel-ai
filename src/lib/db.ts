@@ -3513,16 +3513,13 @@ export function competitorMetricsForOne(
 
 /**
  * Aggregate KPI strip values for /competitors. competitors = count of rows
- * in scope; combinedSubs = SUM of subscriber_count; outliersThisWeek = count
- * of competitor_videos rows in scope where views > 2× the channel's 60-day
- * median AND published in the last 7 days; lastSync = MAX(last_sync_at).
- * The strip itself was trimmed to Competitors + Last sync — the other
- * two fields are computed for internal consistency only.
+ * in scope; combinedSubs = SUM of subscriber_count; lastSync = MAX(last_sync_at).
+ * The strip itself only renders Competitors + Last sync — combinedSubs is
+ * kept in the wire shape for future use.
  */
 export type CompetitorListKpis = {
   competitors: number;
   combinedSubs: number;
-  outliersThisWeek: number;
   lastSync: number | null;
 };
 
@@ -3530,7 +3527,7 @@ export function competitorListKpis(
   userChannelId?: string | null
 ): CompetitorListKpis {
   const scope = userChannelId ?? null;
-  const basics = db
+  return db
     .prepare(
       `SELECT COUNT(*)                            AS competitors,
               COALESCE(SUM(subscriber_count), 0)  AS combinedSubs,
@@ -3538,43 +3535,7 @@ export function competitorListKpis(
        FROM competitors
        WHERE (? IS NULL OR user_channel_id = ?)`
     )
-    .get(scope, scope) as {
-    competitors: number;
-    combinedSubs: number;
-    lastSync: number | null;
-  };
-  const otw = db
-    .prepare(
-      `WITH videos_60d AS (
-         SELECT v.competitor_id, v.views,
-                ROW_NUMBER() OVER (PARTITION BY v.competitor_id ORDER BY v.views) AS rn,
-                COUNT(*)     OVER (PARTITION BY v.competitor_id)                  AS n_60d
-         FROM competitor_videos v
-         JOIN competitors c ON c.id = v.competitor_id
-         WHERE v.published_at > strftime('%s','now') - 60 * 86400
-           AND (? IS NULL OR c.user_channel_id = ?)
-       ),
-       qualified_medians AS (
-         SELECT competitor_id, AVG(views) AS median_views
-         FROM videos_60d
-         WHERE n_60d >= 5 AND rn IN ((n_60d + 1) / 2, (n_60d + 2) / 2)
-         GROUP BY competitor_id
-       )
-       SELECT COUNT(*) AS outliersThisWeek
-       FROM competitor_videos v
-       JOIN qualified_medians m ON m.competitor_id = v.competitor_id
-       JOIN competitors c       ON c.id            = v.competitor_id
-       WHERE v.published_at > strftime('%s','now') - 7 * 86400
-         AND v.views > 2 * m.median_views
-         AND (? IS NULL OR c.user_channel_id = ?)`
-    )
-    .get(scope, scope, scope, scope) as { outliersThisWeek: number };
-  return {
-    competitors: basics.competitors,
-    combinedSubs: basics.combinedSubs,
-    outliersThisWeek: otw.outliersThisWeek,
-    lastSync: basics.lastSync,
-  };
+    .get(scope, scope) as CompetitorListKpis;
 }
 
 /**
@@ -3637,6 +3598,7 @@ export function listCompetitorAlerts(
 ): (CompetitorAlert & {
   competitor_title: string | null;
   competitor_handle: string | null;
+  competitor_tier: CompetitorTier;
   published_at: number | null;
 })[] {
   const whereParts: string[] = [];
@@ -3651,11 +3613,14 @@ export function listCompetitorAlerts(
   // LEFT JOIN competitor_videos so the upload date travels with each alert.
   // detected_at stays (still useful internally — sorting + alert age tracking)
   // but the UI labels it as upload date by reading published_at.
+  // competitor_tier travels with the row so the Recent tab can show the
+  // same B&S tier pill that Library does.
   return db
     .prepare(
       `SELECT a.*,
               c.title  AS competitor_title,
               c.handle AS competitor_handle,
+              c.tier   AS competitor_tier,
               cv.published_at AS published_at
        FROM competitor_alerts a
        JOIN competitors c ON c.id = a.competitor_id
@@ -3669,6 +3634,7 @@ export function listCompetitorAlerts(
     .all(...args) as (CompetitorAlert & {
     competitor_title: string | null;
     competitor_handle: string | null;
+    competitor_tier: CompetitorTier;
     published_at: number | null;
   })[];
 }
