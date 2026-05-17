@@ -223,6 +223,60 @@ try {
   /* table didn't exist or rare concurrent issue — moving on either way */
 }
 
+/* ------------------------------------------------------------------ *
+ * Stale-job cleanup on boot.
+ *
+ * Background tasks (transcribe batch, comment sync) run in-process via
+ * `void runBatch(...)`. When the Node process exits — user closes the
+ * terminal, server restarts after `git pull`, OS reboots — those tasks
+ * vanish without ever updating their `comment_sync_jobs` /
+ * `transcription_jobs` row. The row stays at status='running' forever,
+ * and the next time the app boots the banner polls /jobs/latest, sees
+ * a "running" row, and shows a phantom "Syncing comments: 0/0" spinner
+ * with no actual work happening behind it.
+ *
+ * Fix: at startup, any row still marked 'running' from a previous
+ * process is a corpse — mark it 'failed' with an explanatory
+ * last_error so the UI shows a (dismissable) "previous job didn't
+ * finish" summary instead of a perpetual spinner.
+ *
+ * We DON'T also clear the `sync.inProgress` setting flag here because
+ * it's per-channel-sync, much shorter lived, and the user can re-trigger
+ * sync trivially. Adding cleanup for it would be reasonable but isn't
+ * the actual cause of the phantom-banner bug reported.
+ */
+if (!isBuildPhase) {
+  try {
+    db.exec(`
+      UPDATE transcription_jobs
+      SET status = 'failed',
+          completed_at = strftime('%s','now'),
+          last_error = COALESCE(last_error, '') ||
+            CASE WHEN COALESCE(last_error,'') = '' THEN '' ELSE ' | ' END ||
+            'Server restarted before this batch finished — auto-cancelled.'
+      WHERE status = 'running';
+
+      UPDATE comment_sync_jobs
+      SET status = 'failed',
+          completed_at = strftime('%s','now'),
+          last_error = COALESCE(last_error, '') ||
+            CASE WHEN COALESCE(last_error,'') = '' THEN '' ELSE ' | ' END ||
+            'Server restarted before this batch finished — auto-cancelled.'
+      WHERE status = 'running';
+
+      -- Same logic for the channel-sync flag. If the previous process
+      -- was killed mid-sync the flag stays at "1" and silently blocks
+      -- every future sync + transcribe-batch attempt.
+      UPDATE settings SET value = '0' WHERE key = 'sync.inProgress' AND value = '1';
+    `);
+  } catch (err) {
+    // Tables may not exist yet on a brand-new DB — first-time install
+    // hasn't run the CREATE TABLE statements yet. Either way the
+    // cleanup is best-effort, ignore.
+    void err;
+  }
+}
+
 export function getIntegration(name: string) {
   return db
     .prepare("SELECT name, api_key, enabled FROM integrations WHERE name = ?")

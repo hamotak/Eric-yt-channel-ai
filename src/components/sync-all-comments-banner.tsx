@@ -189,9 +189,23 @@ export function SyncAllCommentsBanner() {
   // Running
   if (job && job.status === "running") {
     const pct = job.total > 0 ? (job.done / job.total) * 100 : 0;
+    const cancelJob = async () => {
+      if (!confirm("Stop the running comment sync? Already-fetched comments stay saved; the rest are skipped.")) return;
+      try {
+        const r = await fetch("/api/comments/jobs/cancel", { method: "POST" });
+        if (!r.ok) {
+          const d = (await r.json().catch(() => ({}))) as { error?: string };
+          alert(d.error ?? "Failed to cancel.");
+          return;
+        }
+        loadPreview();
+      } catch {
+        alert("Failed to cancel — couldn't reach the server.");
+      }
+    };
     return (
       <div className="mb-4 space-y-2 rounded-lg border border-primary/30 bg-primary/5 p-3">
-        <div className="flex items-center justify-between text-sm">
+        <div className="flex items-center justify-between gap-2 text-sm">
           <span className="inline-flex items-center gap-2 font-medium">
             <Loader2 className="h-4 w-4 animate-spin text-primary" />
             Syncing comments: {job.done} / {job.total} videos
@@ -199,9 +213,21 @@ export function SyncAllCommentsBanner() {
               <span className="text-destructive">({job.failed} failed)</span>
             )}
           </span>
-          <span className="text-xs text-muted-foreground">
-            {job.comments_added.toLocaleString()} new comments so far
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-muted-foreground">
+              {job.comments_added.toLocaleString()} new comments so far
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={cancelJob}
+              className="h-7 gap-1 px-2 text-xs"
+              title="Cancel this running batch (use if it's stuck from a previous server run)"
+            >
+              <X className="h-3 w-3" />
+              Cancel
+            </Button>
+          </div>
         </div>
         <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
           <div
