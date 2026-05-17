@@ -163,7 +163,13 @@ function ownChannelLastN(
  *
  * Same tokenization rules as validateIdeaAgainstOwnCatalog (4+ char tokens,
  * stopwords stripped). Match rule: ≥2 keyword hits between the topic and
- * a video title counts that video. overused := matches >= 2.
+ * a video title counts that video. overused := matches >= 1.
+ *
+ * Threshold flipped from ≥2 to ≥1: HAmo's complaint was that a SINGLE
+ * recent overlap (e.g. a Betelgeuse idea proposed days after he shipped
+ * a Betelgeuse video) shouldn't survive. The Skipped research-block
+ * line surfaces every drop so the user sees what got filtered and can
+ * loosen the constraint per-channel via banned_topics later if desired.
  */
 export type TopicFrequencyResult = {
   matches: number;
@@ -221,7 +227,7 @@ export function checkTopicFrequency(
   return {
     matches: matched.length,
     matchedVideos: matched,
-    overused: matched.length >= 2,
+    overused: matched.length >= 1,
   };
 }
 

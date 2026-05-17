@@ -7,6 +7,7 @@ import {
   listFormatsForChannel,
   rebuildFormatVideoLinks,
   upsertOutlierFormat,
+  wipeFormatsForChannel,
   type OutlierFormat,
 } from "./db";
 import { providerModelId } from "./ai-provider-types";
@@ -131,8 +132,8 @@ export async function extractFormatsFromOutliers(
   }
 
   // Parse + validate.
-  const parsed = parseFormats(raw);
-  if (!parsed || parsed.length === 0) {
+  const rawParsed = parseFormats(raw);
+  if (!rawParsed || rawParsed.length === 0) {
     log.warn(
       "claude",
       `Format-extract ${channelId}: could not parse formats. Raw: ${raw.slice(0, 200)}`
@@ -145,11 +146,48 @@ export async function extractFormatsFromOutliers(
   }
 
   const knownIds = new Set(outliers.map((o) => o.videoId));
+  const titleByVideo = new Map(outliers.map((o) => [o.videoId, o.title]));
   const multByVideo = new Map(outliers.map((o) => [o.videoId, o.multiplier]));
   const viewsByVideo = new Map(outliers.map((o) => [o.videoId, o.views]));
   const publishedByVideo = new Map(
     outliers.map((o) => [o.videoId, o.publishedAt ?? 0])
   );
+
+  // DEF-F1/F2/F3/F4: combined post-LLM validation pass.
+  //   F3 — drop templates with <2 slot variables (no [X] markers).
+  //   F2/F4 — per (template, example) grammar-fit: literal anchors must
+  //          appear as whole words in the example; ≥60% of structural
+  //          markers must appear in order. Misfit examples drop.
+  //   F1 — cross-format dedup: each videoId can belong to at most one
+  //          template (the one with highest fit score). Ties broken by
+  //          earliest LLM-output index.
+  // Final pruning: any template with <3 surviving examples is dropped
+  // (raised from 2 — matches the trending-formats UI/chat-tool's
+  // "proven" threshold).
+  const parsed = validateAndDedupFormats(rawParsed, titleByVideo, knownIds);
+  if (parsed.length === 0) {
+    log.warn(
+      "claude",
+      `Format-extract ${channelId}: 0 templates survived dedup/validation. Raw: ${raw.slice(0, 200)}`
+    );
+    return {
+      ok: false,
+      status: 502,
+      error: "Extracted templates failed validation (grammar/dedup). Try again.",
+    };
+  }
+
+  // Re-extract is meant to be a clean slate: wipe the channel's prior
+  // formats + their video links so stale entries from older runs (which
+  // the new dedup pass would have removed) don't linger. Cascade through
+  // outlier_format_videos via FK.
+  const wipe = wipeFormatsForChannel(channelId);
+  if (wipe.formatsDeleted > 0) {
+    log.info(
+      "claude",
+      `Format-extract ${channelId}: wiped ${wipe.formatsDeleted} stale formats + ${wipe.linksDeleted} links before re-extract`
+    );
+  }
 
   let formatsCreated = 0;
   let videosLinked = 0;
@@ -160,7 +198,10 @@ export async function extractFormatsFromOutliers(
 
   for (const f of parsed) {
     const validIds = f.videoIds.filter((id) => knownIds.has(id));
-    if (validIds.length < 2) continue;
+    // ≥3 raised from ≥2 to match the "proven" trending-formats threshold
+    // surfaced in the UI + chat tool. Anything thinner is "emerging",
+    // not proven, and shouldn't ship as a stored format row.
+    if (validIds.length < 3) continue;
 
     const multipliers = validIds.map((id) => multByVideo.get(id) ?? 0);
     const avgMult =
@@ -247,6 +288,191 @@ export function getFormatsForChannel(
     ...f,
     examples: getExampleVideosForFormat(f.id, 5),
     weekly: getFormatWeeklyHistogram(f.id),
+  }));
+}
+
+/**
+ * Post-LLM validation + dedup for extracted formats. Four jobs:
+ *
+ *   DEF-F3 — drop any template with fewer than 2 [X] slot markers. The
+ *            "James Webb Just Found What Scientists Were Afraid Of" kind
+ *            of literal-string non-template gets caught here.
+ *
+ *   DEF-F2 — literal-anchor enforcement. Words outside [X] brackets that
+ *            are ≥4 chars (e.g. "James", "Webb", "Detected") must appear
+ *            as whole words in the example title. A "James Webb [Verb-ed]"
+ *            template cannot accept a CERN example.
+ *
+ *   DEF-F4 — structural-marker order. Short connector words inside the
+ *            template (Is, And, Has, About, From, etc.) must appear in
+ *            the example in the same order. Cheap order-preserving cursor.
+ *            ≥60% of markers must match.
+ *
+ *   DEF-F1 — cross-format dedup. After per-example fit pruning, each
+ *            videoId belongs to AT MOST ONE template — the one with the
+ *            highest fit score. Ties broken by LLM-output order (first
+ *            wins, since the model usually returns its strongest match
+ *            first when it duplicates).
+ *
+ * After all four passes, any template with fewer than 3 surviving
+ * examples is dropped entirely (the "proven" threshold the trending-
+ * formats UI + chat tool surface).
+ */
+function validateAndDedupFormats(
+  parsed: Array<{ template: string; videoIds: string[] }>,
+  titleByVideo: Map<string, string>,
+  knownIds: Set<string>
+): Array<{ template: string; videoIds: string[] }> {
+  const slotCount = (template: string): number =>
+    (template.match(/\[[^\]]+\]/g) || []).length;
+
+  // Literal anchors: words OUTSIDE [X] brackets, length ≥4, lowercased.
+  // Strip the bracket placeholders entirely before tokenizing.
+  const literalAnchors = (template: string): string[] => {
+    const withoutSlots = template.replace(/\[[^\]]+\]/g, " ");
+    return withoutSlots
+      .toLowerCase()
+      .replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
+      .split(/\s+/)
+      .filter((w) => w.length >= 4);
+  };
+
+  // Structural markers: short connector words OUTSIDE [X] brackets that
+  // anchor sentence structure. Tracked for order, not just presence.
+  const STRUCTURAL = new Set([
+    "is", "are", "was", "were", "be", "been", "and", "or", "but",
+    "of", "in", "on", "for", "to", "with", "as", "than", "then",
+    "has", "have", "had", "does", "did", "do", "about", "from",
+    "into", "over", "under", "after", "before", "by",
+  ]);
+  const structuralMarkers = (template: string): string[] => {
+    const withoutSlots = template.replace(/\[[^\]]+\]/g, " ");
+    return withoutSlots
+      .toLowerCase()
+      .replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
+      .split(/\s+/)
+      .filter((w) => STRUCTURAL.has(w));
+  };
+
+  // Whole-word lookup on a title (lowercased).
+  const titleHasWord = (titleLower: string, word: string): boolean => {
+    // Escape regex metachars in word (defensive — shouldn't happen here).
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`\\b${escaped}\\b`).test(titleLower);
+  };
+
+  // Order-preserving cursor: do the markers appear in the title in the
+  // same order they appear in the template? Returns (matched, total).
+  const markerOrderFit = (
+    markers: string[],
+    titleLower: string
+  ): { matched: number; total: number } => {
+    if (markers.length === 0) return { matched: 0, total: 0 };
+    let cursor = 0;
+    let matched = 0;
+    for (const m of markers) {
+      const re = new RegExp(`\\b${m}\\b`);
+      const slice = titleLower.slice(cursor);
+      const found = slice.search(re);
+      if (found >= 0) {
+        matched++;
+        cursor += found + m.length;
+      }
+    }
+    return { matched, total: markers.length };
+  };
+
+  // Fit score per (template, example). Higher = better fit. Used both
+  // as the gate (literal anchors must ALL match) and as the dedup
+  // tiebreaker (anchor-count + marker-fraction).
+  type Fit = {
+    pass: boolean;
+    anchorHits: number;
+    anchorTotal: number;
+    markerFraction: number;
+    score: number;
+  };
+  const fitFor = (template: string, title: string): Fit => {
+    const titleLower = title.toLowerCase();
+    const anchors = literalAnchors(template);
+    let anchorHits = 0;
+    for (const a of anchors) {
+      if (titleHasWord(titleLower, a)) anchorHits++;
+    }
+    const allAnchorsMatch = anchors.length === 0 || anchorHits === anchors.length;
+    const markers = structuralMarkers(template);
+    const { matched, total } = markerOrderFit(markers, titleLower);
+    const markerFraction = total === 0 ? 1 : matched / total;
+    const pass = allAnchorsMatch && markerFraction >= 0.6;
+    // Score for dedup tiebreaker: weight anchors more than markers.
+    const score = anchorHits * 2 + markerFraction;
+    return { pass, anchorHits, anchorTotal: anchors.length, markerFraction, score };
+  };
+
+  // --- DEF-F3 pass: drop zero-slot templates.
+  const slotPassed = parsed.filter((f) => slotCount(f.template) >= 2);
+  const droppedF3 = parsed.length - slotPassed.length;
+
+  // --- DEF-F2 + DEF-F4 pass: per-example grammar fit. Build a parallel
+  //     array of {template, examples:[{videoId, fit}]} so we can dedup
+  //     by fit score in the next pass.
+  type ExWithFit = { videoId: string; fit: Fit };
+  type FmtWithFits = {
+    template: string;
+    llmIndex: number; // position in original LLM output (tiebreaker)
+    examples: ExWithFit[];
+  };
+  const fitsByFormat: FmtWithFits[] = slotPassed.map((f, i) => {
+    const examples: ExWithFit[] = [];
+    for (const vid of f.videoIds) {
+      if (!knownIds.has(vid)) continue;
+      const title = titleByVideo.get(vid);
+      if (!title) continue;
+      const fit = fitFor(f.template, title);
+      if (!fit.pass) continue;
+      examples.push({ videoId: vid, fit });
+    }
+    return { template: f.template, llmIndex: i, examples };
+  });
+
+  // --- DEF-F1 pass: cross-format dedup. For each videoId, pick the
+  //     format-index with the highest fit score; remove from others.
+  const bestByVideo = new Map<string, { fmtIdx: number; score: number; llmIdx: number }>();
+  for (let i = 0; i < fitsByFormat.length; i++) {
+    for (const ex of fitsByFormat[i].examples) {
+      const prev = bestByVideo.get(ex.videoId);
+      const cand = {
+        fmtIdx: i,
+        score: ex.fit.score,
+        llmIdx: fitsByFormat[i].llmIndex,
+      };
+      const winner =
+        !prev ||
+        cand.score > prev.score ||
+        (cand.score === prev.score && cand.llmIdx < prev.llmIdx)
+          ? cand
+          : prev;
+      bestByVideo.set(ex.videoId, winner);
+    }
+  }
+  for (let i = 0; i < fitsByFormat.length; i++) {
+    fitsByFormat[i].examples = fitsByFormat[i].examples.filter(
+      (ex) => bestByVideo.get(ex.videoId)?.fmtIdx === i
+    );
+  }
+
+  // --- Final size gate: ≥3 examples per template after all the above.
+  const final = fitsByFormat.filter((f) => f.examples.length >= 3);
+  const droppedSizeAfter = fitsByFormat.length - final.length;
+
+  log.info(
+    "claude",
+    `Format-validate: ${parsed.length} → ${slotPassed.length} (after F3) → ${final.length} survived (F1 dedup + ≥3 examples). F3 dropped ${droppedF3}, final size cut ${droppedSizeAfter}.`
+  );
+
+  return final.map((f) => ({
+    template: f.template,
+    videoIds: f.examples.map((e) => e.videoId),
   }));
 }
 

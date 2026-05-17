@@ -38,7 +38,9 @@ export type DroppedIdea = {
     | "banned_word"
     | "banned_topic"
     | "topic_overused"
-    | "originality";
+    | "originality"
+    | "format_dup"
+    | "own_channel";
   detail?: string;
 };
 
@@ -58,13 +60,15 @@ const FORMAT_LIMIT = 6;
 const MIN_FORMAT_CANDIDATES = 2;
 
 // Default ideation slate size after all filters (length, banned words,
-// banned topics, topic frequency, originality). We over-fetch from the
-// LLM to absorb the drop cascade — see OVER_FETCH_CLUSTERS.
+// banned topics, topic frequency, originality, format-cluster dedup).
+// We over-fetch from the LLM to absorb the drop cascade.
 const MAX_IDEAS = 10;
-// Ask the LLM for this many candidate clusters so the post-pass has room
-// to drop weak slots without leaving the user with 4 ideas. 12 keeps
-// the compose call within the 12k max_tokens budget below.
-const OVER_FETCH_CLUSTERS = 12;
+// Bumped 12 → 20 (DEF-I4): the drop cascade — own-channel filter +
+// banned-topic + frequency + length + banned-word + originality +
+// format-cluster dedup — was leaving us with 5 ideas. 20 clusters
+// gives enough buffer to ship 10 after all gates. Stays well within
+// the 12k compose max_tokens budget (≈300 output tokens per cluster).
+const OVER_FETCH_CLUSTERS = 20;
 
 // Title-length contract (T1). Proposed titles land in one of three
 // bands; only "ideal" + "acceptable" survive, anything over 100 chars
@@ -208,6 +212,11 @@ type OutlierLite = {
   thumbnailUrl: string | null;
   competitorTitle: string | null;
   competitorHandle: string | null;
+  // Carried through from listOutliersForActiveChannel so the defense-in-
+  // depth own-channel filter below can compare against the active
+  // userChannelId. The SQL already excludes self-tracked competitors;
+  // this is a belt-and-braces guard per DEF-I1.
+  competitorChannelId: string | null;
   tier: string;
   publishedAt: number | null;
 };
@@ -311,6 +320,7 @@ export async function generateIdeasForChannel(opts: {
         thumbnailUrl: ytThumbnail(r.videoId),
         competitorTitle: r.competitorTitle,
         competitorHandle: r.competitorHandle ?? null,
+        competitorChannelId: r.competitorChannelId ?? null,
         tier: r.tier,
         publishedAt: r.publishedAt,
       };
@@ -330,6 +340,7 @@ export async function generateIdeasForChannel(opts: {
       thumbnailUrl: o.thumbnailUrl ?? ytThumbnail(o.videoId),
       competitorTitle: o.competitorTitle,
       competitorHandle: o.competitorHandle ?? null,
+      competitorChannelId: o.competitorChannelId ?? null,
       tier: o.tier,
       publishedAt: o.publishedAt,
     }));
@@ -340,6 +351,24 @@ export async function generateIdeasForChannel(opts: {
         error: `No strong outliers (≥${viralMult}×) in the last ${viralWindow} days — only ${outlierLites.length} candidate${outlierLites.length === 1 ? "" : "s"} pass${outlierLites.length === 1 ? "es" : ""}, need ≥${MIN_VIRAL_CANDIDATES}. Ask the user whether to widen the window or lower the multiplier; do NOT silently lower these thresholds.`,
       };
     }
+  }
+  // DEF-I1 defense-in-depth: strip any outlier whose competitor channel
+  // matches the active user channel. The SQL in listOutliersForActiveChannel
+  // already excludes self-tracked-as-competitor rows; this is the second
+  // belt in case (a) a caller bypasses that helper, or (b) a future SQL
+  // refactor regresses the filter. Drops here are silent — they're a
+  // data-hygiene issue, not user-facing.
+  const ownChannelDrops = outlierLites.filter(
+    (o) => o.competitorChannelId !== null && o.competitorChannelId === userChannelId
+  );
+  if (ownChannelDrops.length > 0) {
+    outlierLites = outlierLites.filter(
+      (o) => !(o.competitorChannelId !== null && o.competitorChannelId === userChannelId)
+    );
+    log.warn(
+      "claude",
+      `Outlier-ideas ${userChannelId}: stripped ${ownChannelDrops.length} own-channel rows from inspiration pool (self-tracked-as-competitor leak — investigate competitors table)`
+    );
   }
   if (outlierLites.length === 0) {
     return {
@@ -760,12 +789,48 @@ export async function generateIdeasForChannel(opts: {
       detail: a.flagReason ?? `overlap=${a.maxOverlap.toFixed(2)}`,
     });
   }
-  // Cap surviving slate at MAX_IDEAS (T3). Sort by confidence so we keep
-  // the strongest survivors when the over-fetch overshoots.
-  const survivingSorted = annotated
+  // Pre-sort survivors by a combined "ship value": confidence weights
+  // intent, originalityScore weights novelty. Higher wins.
+  const preDedup = annotated
     .filter((a) => !a.flagged)
-    .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
-  const surviving = survivingSorted.slice(0, MAX_IDEAS);
+    .sort(
+      (a, b) =>
+        (b.confidence ?? 0) * 10 + (b.originalityScore ?? 0)
+        - ((a.confidence ?? 0) * 10 + (a.originalityScore ?? 0))
+    );
+
+  // DEF-I3: format-cluster dedup. Each sourceFormatId may appear in AT
+  // MOST ONE surviving idea — keep the highest-scoring, drop the rest.
+  // Combined with the over-fetch + the prompt-side instruction, this
+  // hands the user a slate where every idea uses a different format.
+  const seenFormats = new Set<number>();
+  const afterFormatDedup: typeof preDedup = [];
+  for (const a of preDedup) {
+    if (seenFormats.has(a.sourceFormatId)) {
+      dropped.push({
+        topicLabel: a.topicLabel,
+        proposedTitle: a.proposedTitle,
+        reason: "format_dup",
+        detail: `format ${a.sourceFormatId} already used by a higher-scoring idea`,
+      });
+      continue;
+    }
+    seenFormats.add(a.sourceFormatId);
+    afterFormatDedup.push(a);
+  }
+  // Cap surviving slate at MAX_IDEAS.
+  const surviving = afterFormatDedup.slice(0, MAX_IDEAS);
+
+  // DEF-I4: per-reason attrition logging. Drives the agent's "Skipped"
+  // research-block line and helps HAmo see where the cascade lost ideas.
+  const dropCounts: Record<string, number> = {};
+  for (const d of dropped) {
+    dropCounts[d.reason] = (dropCounts[d.reason] ?? 0) + 1;
+  }
+  log.info(
+    "claude",
+    `Outlier-ideas ${userChannelId}: attrition — LLM raw=${rawIdeas.length}, prefilter survived=${prefilter.surviving.length}, post-originality=${annotated.filter((x) => !x.flagged).length}, post-format-dedup=${afterFormatDedup.length}, shipped=${Math.min(surviving.length, MAX_IDEAS)}; drops=${JSON.stringify(dropCounts)}`
+  );
 
   // --- 5. Validate each surviving idea against own catalog + hydrate
   //        secondary citation block (otherFormatExamples) ----------------
@@ -828,18 +893,12 @@ export async function generateIdeasForChannel(opts: {
     };
   });
 
+  // The attrition log already fired before mapping survivors — see
+  // dropCounts log above. This second info-line just summarises the
+  // shipped slate.
   log.info(
     "claude",
-    `Outlier-ideas ${userChannelId}: ${ideas.length} ideas (target ${MAX_IDEAS}, ${dropped.length} dropped — ${dropped
-      .map((d) => d.reason)
-      .reduce(
-        (acc: Record<string, number>, r) => {
-          acc[r] = (acc[r] ?? 0) + 1;
-          return acc;
-        },
-        {}
-      )
-      .toString?.() ?? "{}"}); formats=${formats.length}, viralOutliers=${outlierLites.length}`
+    `Outlier-ideas ${userChannelId}: shipped ${ideas.length}/${MAX_IDEAS} ideas (${dropped.length} total drops); formats=${formats.length}, viralOutliers=${outlierLites.length}`
   );
 
   return {
@@ -906,6 +965,7 @@ function buildSystemPromptForCompose(opts: {
     "# Hard rules",
     `- Output ${OVER_FETCH_CLUSTERS} candidate ideas — the server will drop some via length/banned-word/banned-topic/topic-frequency/originality filters and ship up to ${MAX_IDEAS}. Quality over quantity.`,
     "- Each idea cites the SOURCE FORMAT (by id) and the SOURCE OUTLIER VIDEO IDS (up to 3) the topic cluster came from.",
+    "- Each format ID may be used by AT MOST ONE idea. Distribute formats across the slate — do not stack 3 ideas on the same format. The server enforces this server-side (highest-scoring keeps the format, the rest are dropped) so stacking just wastes your output budget.",
     "- topicLabel is 4–8 words, the subject area, NOT the proposed title.",
     "- proposedTitle is YOUR composed title applying the format's slots to the topic. Never copy a source title's phrasing. 50-70 chars ideal, 80 chars hard ceiling.",
     "- angle is one §9 lever — the dominant lever the source cluster leans on, applied through the format.",

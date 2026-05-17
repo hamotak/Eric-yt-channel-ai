@@ -4331,6 +4331,33 @@ export function upsertOutlierFormat(input: {
 }
 
 /**
+ * Wipe every stored format + its video links for one user channel.
+ * Called at the top of extractFormatsFromOutliers so Re-extract is a
+ * clean slate. Without this, formats from prior extractions that the
+ * new LLM call doesn't re-emit linger forever, and stale video links
+ * survive even when the new dedup pass would have removed them.
+ * Cascade through outlier_format_videos via FK ON DELETE CASCADE.
+ */
+export function wipeFormatsForChannel(userChannelId: string): {
+  formatsDeleted: number;
+  linksDeleted: number;
+} {
+  const before = db
+    .prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM outlier_formats WHERE user_channel_id = ?)  AS formats,
+         (SELECT COUNT(*) FROM outlier_format_videos ofv
+            JOIN outlier_formats f ON f.id = ofv.format_id
+            WHERE f.user_channel_id = ?)                                   AS links`
+    )
+    .get(userChannelId, userChannelId) as { formats: number; links: number };
+  db.prepare(`DELETE FROM outlier_formats WHERE user_channel_id = ?`).run(
+    userChannelId
+  );
+  return { formatsDeleted: before.formats, linksDeleted: before.links };
+}
+
+/**
  * Replace this format's video links with a fresh set. Idempotent —
  * deletes existing rows for this format_id then inserts the new ones.
  * Called once per format on each re-extract.
@@ -4510,6 +4537,13 @@ export type OutlierRow = {
   competitorTitle: string | null;
   competitorHandle: string | null;
   competitorAvatar: string | null;
+  // YouTube channel id of the competitor (UC...). Used by callers to
+  // double-check that a row is not from the user's own channel — the
+  // SQL below already excludes self-tracked-as-competitor rows, but
+  // idea-generator runs an additional defense-in-depth filter on this
+  // field per DEF-I1 (Late Science was tracked as its own competitor
+  // and surfaced its own videos as "inspiration").
+  competitorChannelId: string | null;
   tier: string;
   multiplier: number;
   channelMedian: number;
@@ -4545,6 +4579,13 @@ export function outliersForUserChannel(opts: {
   // Topics Gap source, Patterns extraction, /competitors/[id], and
   // the per-channel /api/outliers fetch — because they all view
   // outliers through the lens of a specific user_channel.
+  // Self-tracked-as-competitor exclusion (DEF-I1): some installs have the
+  // user's own channel registered as a competitor of itself (Late Science
+  // had this — competitors row 8 with channel_id == user_channel_id). Those
+  // rows pollute the inspiration pool with the user's own videos. The
+  // `c.channel_id IS NULL OR c.channel_id != c.user_channel_id` clause
+  // strips them at the SQL layer; idea-generator runs a defense-in-depth
+  // filter on the OutlierRow.competitorChannelId field too.
   const outliers = db
     .prepare(
       `WITH scoped_videos AS (
@@ -4555,6 +4596,7 @@ export function outliersForUserChannel(opts: {
            c.title       AS competitor_title,
            c.handle      AS competitor_handle,
            c.avatar_url  AS competitor_avatar,
+           c.channel_id  AS competitor_channel_id,
            c.tier,
            c.user_channel_id,
            ROW_NUMBER() OVER (PARTITION BY cv.competitor_id ORDER BY cv.views) AS rn,
@@ -4569,6 +4611,7 @@ export function outliersForUserChannel(opts: {
            AND c.tier IN (?, ?, ?, ?)
            AND (? IS NULL OR c.id = ?)
            AND e.video_id IS NULL
+           AND (c.channel_id IS NULL OR c.channel_id != c.user_channel_id)
        ),
        qualified_medians AS (
          SELECT competitor_id, AVG(views) AS median_views
@@ -4581,7 +4624,7 @@ export function outliersForUserChannel(opts: {
          v.video_id, v.title, v.thumbnail_url, v.views,
          v.published_at, v.duration_seconds,
          v.competitor_id, v.competitor_title, v.competitor_handle,
-         v.competitor_avatar, v.tier,
+         v.competitor_avatar, v.competitor_channel_id, v.tier,
          CAST(m.median_views AS INTEGER)   AS channel_median,
          (v.views * 1.0 / m.median_views)  AS multiplier
        FROM scoped_videos v
@@ -4613,6 +4656,7 @@ export function outliersForUserChannel(opts: {
     competitor_title: string | null;
     competitor_handle: string | null;
     competitor_avatar: string | null;
+    competitor_channel_id: string | null;
     tier: string;
     channel_median: number;
     multiplier: number;
@@ -4675,6 +4719,7 @@ export function outliersForUserChannel(opts: {
       competitorTitle: r.competitor_title,
       competitorHandle: r.competitor_handle,
       competitorAvatar: r.competitor_avatar,
+      competitorChannelId: r.competitor_channel_id,
       tier: r.tier,
       multiplier: Number(r.multiplier.toFixed(2)),
       channelMedian: r.channel_median,
@@ -4700,6 +4745,7 @@ export function getCompetitorVideosByIds(
   competitorId: number;
   competitorTitle: string | null;
   competitorHandle: string | null;
+  competitorChannelId: string | null;
   tier: string;
   userChannelId: string | null;
 }> {
@@ -4711,6 +4757,7 @@ export function getCompetitorVideosByIds(
               cv.competitor_id,
               c.title       AS competitor_title,
               c.handle      AS competitor_handle,
+              c.channel_id  AS competitor_channel_id,
               c.tier,
               c.user_channel_id
        FROM competitor_videos cv
@@ -4726,6 +4773,7 @@ export function getCompetitorVideosByIds(
     competitor_id: number;
     competitor_title: string | null;
     competitor_handle: string | null;
+    competitor_channel_id: string | null;
     tier: string;
     user_channel_id: string | null;
   }>;
@@ -4738,6 +4786,7 @@ export function getCompetitorVideosByIds(
     competitorId: r.competitor_id,
     competitorTitle: r.competitor_title,
     competitorHandle: r.competitor_handle,
+    competitorChannelId: r.competitor_channel_id,
     tier: r.tier,
     userChannelId: r.user_channel_id,
   }));
