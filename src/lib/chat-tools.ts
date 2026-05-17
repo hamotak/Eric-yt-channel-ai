@@ -484,6 +484,35 @@ const STRATEGY_TOOLS: Tool[] = [
       properties: { limit: { type: "number", default: 20 } },
     },
   },
+  {
+    name: "update_channel_context",
+    description:
+      "Update the active channel's strategic context fields — niche, positioning, audience, voice, external_sources — when the user describes the channel naturally in conversation. TWO-STEP CONFIRM IS MANDATORY. First call ALWAYS with confirm:false (or omitted) — the tool returns a diff of before/after values per field. Show that diff to the user in plain prose and ask them to reply 'yes' (apply), 'edit <field>' (revise), or 'no' (cancel). Only after they explicitly approve in chat do you call AGAIN with confirm:true and the SAME `changes` payload. NEVER call with confirm:true in the same turn as the user's initial description — the user must see and approve the diff first. The active channel is resolved server-side; you do not pass a channel id. Empty-string field values mean CLEAR that field — get explicit per-field approval before clearing anything. Each field caps at 2000 chars after trim. Returns (confirm:false): { pending:true, diff:[{field, before, after}], agentInstruction }. Returns (confirm:true): { applied:true, changedFields:string[], message }.",
+    input_schema: {
+      type: "object",
+      properties: {
+        changes: {
+          type: "object",
+          description:
+            "Map of context fields to new values. Include only the fields you intend to change. At least one field is required.",
+          properties: {
+            niche: { type: "string" },
+            positioning: { type: "string" },
+            audience: { type: "string" },
+            voice: { type: "string" },
+            external_sources: { type: "string" },
+          },
+        },
+        confirm: {
+          type: "boolean",
+          description:
+            "Always false on the first call (returns a diff). Set true only after the user has explicitly approved the diff in chat — and then with the SAME `changes` payload.",
+          default: false,
+        },
+      },
+      required: ["changes"],
+    },
+  },
 ];
 
 export function getToolsFor(groups: ToolGroup[]): Tool[] {
@@ -1035,6 +1064,117 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
           },
         };
       }
+      case "update_channel_context": {
+        const activeId = getActiveChannelId();
+        if (!activeId) {
+          return {
+            ok: false,
+            error:
+              "No active channel — set one from the top-right channel picker before updating context.",
+          };
+        }
+        const activeChannel = getChannel(activeId);
+        if (!activeChannel) {
+          return {
+            ok: false,
+            error: `Active channel ${activeId} not found in DB.`,
+          };
+        }
+
+        const rawChanges = input.changes;
+        if (!rawChanges || typeof rawChanges !== "object") {
+          return {
+            ok: false,
+            error:
+              "changes must be an object with at least one of: niche, positioning, audience, voice, external_sources.",
+          };
+        }
+        const changesObj = rawChanges as Record<string, unknown>;
+        const allowedFields = [
+          "niche",
+          "positioning",
+          "audience",
+          "voice",
+          "external_sources",
+        ] as const;
+        type CtxField = (typeof allowedFields)[number];
+        const cleaned: Partial<Record<CtxField, string>> = {};
+        for (const field of allowedFields) {
+          if (!(field in changesObj)) continue;
+          const v = changesObj[field];
+          if (typeof v !== "string") {
+            return {
+              ok: false,
+              error: `${field}: must be a string (got ${typeof v}).`,
+            };
+          }
+          const trimmed = v.trim();
+          if (trimmed.length > 2000) {
+            return {
+              ok: false,
+              error: `${field}: exceeds 2000 char limit (got ${trimmed.length}).`,
+            };
+          }
+          cleaned[field] = trimmed;
+        }
+        if (Object.keys(cleaned).length === 0) {
+          return {
+            ok: false,
+            error:
+              "changes must include at least one of: niche, positioning, audience, voice, external_sources.",
+          };
+        }
+
+        const confirm = input.confirm === true;
+
+        // Diff every changed field against the channel's current value.
+        // Empty-string after-values are kept — they represent a CLEAR
+        // operation and must be visible in the diff so the user can
+        // approve or veto the wipe explicitly.
+        const diff = Object.entries(cleaned).map(([field, after]) => ({
+          field,
+          before: (activeChannel[field as CtxField] ?? "") as string,
+          after: after as string,
+        }));
+
+        if (!confirm) {
+          const { log: logger } = await import("./logger");
+          logger.debug("chat", "update_channel_context diff requested", {
+            activeChannelId: activeId,
+            fields: Object.keys(cleaned),
+          });
+          return {
+            ok: true,
+            data: {
+              pending: true,
+              channelTitle: activeChannel.title ?? activeChannel.id,
+              diff,
+              agentInstruction:
+                "Present this diff to the user verbatim (one line per field, showing before → after). Ask them to reply 'yes' to apply, 'edit <field>' to revise a specific field, or 'no' to cancel. After they explicitly approve (yes / apply / go ahead / equivalent), call update_channel_context AGAIN with the SAME `changes` payload plus confirm:true. Do NOT call with confirm:true until the user has approved in this turn.",
+            },
+          };
+        }
+
+        // Confirm path: apply atomically.
+        const { updateChannelContextBatch } = await import("./db");
+        const { log: logger } = await import("./logger");
+        const updated = updateChannelContextBatch(activeId, cleaned);
+        logger.info("chat", "update_channel_context applied", {
+          activeChannelId: activeId,
+          channelTitle: activeChannel.title,
+          fields: Object.keys(cleaned),
+        });
+        return {
+          ok: true,
+          data: {
+            applied: true,
+            channelTitle: updated?.title ?? activeChannel.title ?? activeId,
+            changedFields: Object.keys(cleaned),
+            message:
+              "Confirm to the user that the update is applied, then offer the next concrete step (e.g. 'I can now run list_outliers grounded in this voice — say the word').",
+          },
+        };
+      }
       default:
         return { ok: false, error: `unknown tool: ${name}` };
     }
@@ -1109,6 +1249,22 @@ export function buildSystemPrompt(
       `- **Active channel** (this is the one every local-DB tool is scoped to right now): "${channel.title ?? "(unknown)"}"${channel.handle ? ` — ${channel.handle}` : ""}, id \`${channel.id}\``,
       `- Subscribers: ${channel.subscriber_count ?? "?"}, total views: ${channel.view_count ?? "?"}, videos in DB: ${channel.video_count ?? "?"}`,
       `- When the user says "my channel" they mean THIS one — never another channel from the list below.`
+    );
+    // Per-channel strategic context. These fields live on the channels
+    // table (set via /channel-info) and steer every output the agent
+    // produces — niche framing, voice match, audience fit. When a field
+    // is empty, the LLM is told to either ask or capture-via-tool: the
+    // `update_channel_context` tool is the durable path.
+    const notSet = "(not set — ask the user or call update_channel_context to capture it)";
+    const fmt = (s: string | undefined): string =>
+      typeof s === "string" && s.trim().length > 0 ? s.trim() : notSet;
+    lines.push(
+      `- Niche: ${fmt(channel.niche)}`,
+      `- Positioning: ${fmt(channel.positioning)}`,
+      `- Target audience: ${fmt(channel.audience)}`,
+      `- Voice / tone: ${fmt(channel.voice)}`,
+      `- External sources the creator follows: ${fmt(channel.external_sources)}`,
+      `- When the user describes the channel's niche / audience / voice in natural conversation, call \`update_channel_context\` to propose a diff — do NOT silently note it for later. Capture it durably.`
     );
     if (allChannels.length > 1) {
       const others = allChannels
@@ -1209,6 +1365,7 @@ export function buildSystemPrompt(
         `- explain_outlier — 2-3 §9 levers + reasoning for a specific outlier (cached permanently)`,
         `- generate_ideas — 5–10 ideas grounded in §1/§7/§9, traceable to source outliers (rate-limited 1/5min per channel)`,
         `- list_format_patterns — title-format templates extracted from outliers (§4 structural patterns)`,
+        `- update_channel_context — propose/apply edits to the active channel's niche/positioning/audience/voice/external_sources. MUST follow the two-step confirm: first call returns a diff, second call (after user says yes) writes.`,
         ``,
         `### Audience (your own videos)`,
         `- get_comment_analysis — sentiment, themes, objections, future-video ideas, standout quote candidates per video`
@@ -1224,7 +1381,8 @@ export function buildSystemPrompt(
     `3. Active channel scope is sacred — never silently aggregate across the user's channels.`,
     `4. For ideation questions: list_outliers → optionally list_format_patterns → generate_ideas. Don't skip to generate_ideas without the source.`,
     `5. For "why did X work" questions: list_outliers (or accept the videoId from context) → explain_outlier.`,
-    `6. Avoid retrying the same tool+input combination — the dispatcher rejects duplicates.`
+    `6. Avoid retrying the same tool+input combination — the dispatcher rejects duplicates.`,
+    `7. To update channel context (niche/positioning/audience/voice/external_sources), always propose a diff first via update_channel_context with confirm:false. Show the diff to the user, get an explicit yes, THEN call again with confirm:true and the same payload. Never blanket-clear fields without per-field confirmation — when the user says something like "delete my channel context", ask which field(s) and confirm one at a time.`
   );
 
   // Tell the executor about the advisor ONLY when it's actually wired up for

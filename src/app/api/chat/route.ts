@@ -43,6 +43,8 @@ const MAX_TOOL_ITERATIONS = 12;
 // the model from burning iterations re-calling a broken tool.
 const TOOL_FAILURE_LOCK_AT = 2;
 
+// Must mirror the ToolGroup union in chat-tools.ts. Missing entries cause
+// the route to silently drop those groups even when the UI sends them.
 const ALLOWED_GROUPS: ToolGroup[] = [
   "youtube",
   "analytics",
@@ -50,6 +52,7 @@ const ALLOWED_GROUPS: ToolGroup[] = [
   "exa",
   "apify",
   "yt_analytics",
+  "strategy",
 ];
 
 function encodeSSE(data: unknown): Uint8Array {

@@ -576,6 +576,48 @@ export function updateChannelContext(
   );
 }
 
+/**
+ * Batch variant — updates multiple context fields in a single SQL
+ * statement. Used by the chat tool `update_channel_context` so the
+ * agent's approved diff lands atomically (no partial write if one
+ * column update were to error). Unknown keys in `patch` are silently
+ * filtered out — the caller is expected to validate before calling,
+ * this is just a safety net.
+ */
+export type ChannelContextPatch = Partial<
+  Record<ChannelContextField, string>
+>;
+
+export function updateChannelContextBatch(
+  channelId: string,
+  patch: ChannelContextPatch
+): Channel | null {
+  const sets: string[] = [];
+  const args: string[] = [];
+  for (const field of CHANNEL_CONTEXT_FIELDS) {
+    const v = patch[field];
+    if (typeof v !== "string") continue;
+    sets.push(`${field} = ?`);
+    args.push(v);
+  }
+  if (sets.length === 0) {
+    return (
+      (db.prepare(`SELECT * FROM channels WHERE id = ?`).get(channelId) as
+        | Channel
+        | undefined) ?? null
+    );
+  }
+  args.push(channelId);
+  db.prepare(`UPDATE channels SET ${sets.join(", ")} WHERE id = ?`).run(
+    ...args
+  );
+  return (
+    (db.prepare(`SELECT * FROM channels WHERE id = ?`).get(channelId) as
+      | Channel
+      | undefined) ?? null
+  );
+}
+
 /* ---------- Tags ---------- */
 
 export type Tag = {
