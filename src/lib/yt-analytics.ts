@@ -958,8 +958,16 @@ export type ChannelAudienceBundle = {
   trafficSources: { source: string; views: number; watchMinutes: number }[];
 };
 
-export async function fetchChannelAudience(period: PeriodSpec): Promise<ChannelAudienceBundle> {
+export async function fetchChannelAudience(
+  period: PeriodSpec,
+  channelId?: string
+): Promise<ChannelAudienceBundle> {
   const { startDate, endDate, actualDays } = resolvePeriod(period);
+  // Multi-channel: callers (analyze-with-ai for a specific channel) can
+  // pin a target without flipping the active-channel pointer. Mirrors
+  // fetchChannelRevenue's contract. Omit → runReport falls back to
+  // resolveChannelIds() (active channel).
+  const ids = channelId ? `channel==${channelId}` : undefined;
 
   const soft = async <T>(fn: () => Promise<T>, fallback: T): Promise<T> => {
     try {
@@ -980,6 +988,7 @@ export async function fetchChannelAudience(period: PeriodSpec): Promise<ChannelA
           endDate,
           metrics: ["viewerPercentage"],
           dimensions: ["ageGroup", "gender"],
+          ids,
         }),
       { columnHeaders: [], rows: [] } as ReportResponse
     ),
@@ -992,6 +1001,7 @@ export async function fetchChannelAudience(period: PeriodSpec): Promise<ChannelA
           dimensions: ["country"],
           sort: "-views",
           maxResults: 25,
+          ids,
         }),
       { columnHeaders: [], rows: [] } as ReportResponse
     ),
@@ -1003,6 +1013,7 @@ export async function fetchChannelAudience(period: PeriodSpec): Promise<ChannelA
           metrics: ["views", "estimatedMinutesWatched"],
           dimensions: ["deviceType"],
           sort: "-views",
+          ids,
         }),
       { columnHeaders: [], rows: [] } as ReportResponse
     ),
@@ -1014,6 +1025,7 @@ export async function fetchChannelAudience(period: PeriodSpec): Promise<ChannelA
           metrics: ["views", "estimatedMinutesWatched"],
           dimensions: ["insightTrafficSourceType"],
           sort: "-views",
+          ids,
         }),
       { columnHeaders: [], rows: [] } as ReportResponse
     ),
