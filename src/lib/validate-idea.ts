@@ -69,13 +69,69 @@ const STOPWORDS = new Set([
   "over","out","off","up","down",
 ]);
 
+// Brand stop list — instrument/agency/mission names that act like proper
+// nouns across topics. Without this scrub, "James Webb finds biosignatures
+// on K2-18b" and "James Webb finds Planet Nine" both tokenize to
+// {james,webb,finds,…} — the topic-similarity check collapses both to
+// the same topic and the per-channel frequency gate eats them.
+//
+// Order matters: longer phrases first so "voyager 2" wins before
+// "voyager" turns it into a bare "2". Multi-word phrases are stripped
+// with word-boundary anchors so partial matches don't leak.
+const BRAND_PHRASES: readonly string[] = [
+  "james webb space telescope",
+  "james webb",
+  "webb telescope",
+  "jwst",
+  "voyager 1",
+  "voyager 2",
+  "voyager",
+  "mars rover",
+  "perseverance",
+  "curiosity",
+  "ingenuity",
+  "hubble",
+  "kepler",
+  "tess",
+  "chandra",
+  "starship",
+  "spacex",
+  "nasa",
+  "esa",
+  "cern",
+  "lhc",
+  "iss",
+];
+
+/**
+ * Strip brand phrases from a lowercase string. Exported so the
+ * idea-generator's local tokenizer can reuse the same brand list —
+ * single source of truth across topic clustering, frequency checks,
+ * and per-idea catalog lookup.
+ */
+export function stripBrandPhrases(s: string): string {
+  let out = s;
+  for (const phrase of BRAND_PHRASES) {
+    // \b boundaries work across the inner spaces because the boundaries
+    // land at the outer letter↔non-letter transitions.
+    out = out.replace(new RegExp(`\\b${phrase}\\b`, "g"), " ");
+  }
+  return out;
+}
+
+/**
+ * Returns the content-noun tokens of a string AFTER stripping brand
+ * phrases. Used by every topic-overlap calculation in this file so the
+ * brand list applies uniformly: same-instrument titles no longer
+ * collapse to the same topic just because they share "james webb".
+ */
 function tokenize(topic: string): string[] {
+  const stripped = stripBrandPhrases(
+    topic.toLowerCase().replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
+  );
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const raw of topic
-    .toLowerCase()
-    .replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
-    .split(/\s+/)) {
+  for (const raw of stripped.split(/\s+/)) {
     if (!raw) continue;
     if (raw.length < 4) continue;
     if (STOPWORDS.has(raw)) continue;
@@ -186,23 +242,11 @@ export function checkTopicFrequency(
   channelId: string,
   lookbackVideos: number = 20
 ): TopicFrequencyResult {
-  const keywords = (function tokenize(s: string): string[] {
-    // Reuse the file's tokenizer logic — exported separately would be
-    // nicer but the closure keeps the existing function private.
-    const seen = new Set<string>();
-    const out: string[] = [];
-    for (const raw of s
-      .toLowerCase()
-      .replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
-      .split(/\s+/)) {
-      if (!raw || raw.length < 4) continue;
-      if (STOPWORDS.has(raw)) continue;
-      if (seen.has(raw)) continue;
-      seen.add(raw);
-      out.push(raw);
-    }
-    return out;
-  })(topic);
+  // Use the file's shared tokenize() so the brand-phrase strip applies
+  // uniformly here too — "James Webb" in the topic and in a recent own
+  // video both reduce to no-brand tokens before the keyword overlap is
+  // counted.
+  const keywords = tokenize(topic);
 
   if (keywords.length === 0 || !channelId) {
     return { matches: 0, matchedVideos: [], overused: false };

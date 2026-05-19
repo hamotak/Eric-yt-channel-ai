@@ -315,10 +315,10 @@ const IDEATION_TOOLS: Tool[] = [
       "### Each numbered idea — EXACTLY this shape:",
       "### {N}. {proposedTitle}",
       "",
-      "**Topic:** [{topicSource.competitorTitle} — {topicSource.title}]({topicSource.youtubeUrl}) · {topicSource.multiplier}×",
-      "**Format:** `{format.template}` · from [{formatSource.competitorTitle} — {formatSource.title}]({formatSource.youtubeUrl})",
+      "**Topic:** [{topicSource.competitorTitle} — {topicSource.title}]({topicSource.youtubeUrl}) · {topicSource.views.toLocaleString()} views · {format topicSource.publishedAt as \"Mar 14, 2026\"} · {topicSource.multiplier}×",
+      "**Format:** `{format.template}` · from [{formatSource.competitorTitle} — {formatSource.title}]({formatSource.youtubeUrl}) · {formatSource.views.toLocaleString()} views · {format formatSource.publishedAt as \"Mar 14, 2026\"} · {formatSource.multiplier}×",
       "**Why this for {channel.title}:** {2-3 sentences explaining why this title fits THIS channel's voice + audience + positioning per the system prompt's `## About this channel`. Must reference at least one SPECIFIC element from that description (e.g. the dread/cinematic framing, the 35-65 male skew, the sleep-ritual viewing pattern, the second-person immersion technique — whichever is most relevant). Paraphrase or APPLY the channel context; do NOT quote it verbatim. \"leads with dread and wonder\" or \"second-person immersion\" lifted as a direct quote is a fail.}",
-      "**Catalog:** {one of: fresh | covered_recent | covered_recent — fresh angle needed | covered_old | covered_underperformed | 🔁 Remix — server populates idea.catalogTag, use it verbatim, then add a one-line gloss if catalogTag is \"remix\" naming the prior winner: 🔁 Remix of [your title](url) (3.2× your median).}",
+      "**Catalog:** {map server idea.catalogTag verbatim — fresh | covered_recent_winner — remix candidate | covered_recent_flop — skip | covered_old. When catalogTag is covered_recent_winner, follow the line with a sub-bullet \"🔁 Remix candidate of [{catalogRemixSource.title}](https://www.youtube.com/watch?v={catalogRemixSource.videoId}) ({catalogRemixSource.multiplier}× your median).\"}",
       "",
       "---",
       "",
@@ -326,9 +326,13 @@ const IDEATION_TOOLS: Tool[] = [
       "- NO `![image](...)` syntax in idea cards. Text-only.",
       "- topicSource.videoId !== formatSource.videoId. Server enforces.",
       "- \"Why this for {channel}\" must show the agent UNDERSTANDS the channel, not echo the description verbatim. Paraphrase or apply, don't quote.",
-      "- Multiplier on the Topic line stays compact (just \"24×\"). No views / median / dates in the card — those are noise here.",
-      "- If `idea.catalogTag === \"remix\"`, prefix the title with \"🔁 \" so the user can scan winners-to-remix at a glance.",
+      "- Topic + Format lines ALWAYS include views + absolute upload date + multiplier — three numbers per source. Compact: \"224,099 views · Apr 14, 2026 · 24×\".",
+      "- STALE-TOPIC RULE: if topicSource.publishedAt is more than 30 days ago, the proposedTitle MUST be a fresh structural reframe (NOT a paraphrase of the source title). Compose enforces this via coherenceRationale; if you spot a stale-topic + paraphrase combination, FLAG it back to the user instead of shipping.",
+      "- If `idea.catalogTag === \"covered_recent_winner\"`, prefix the title with \"🔁 \" so the user can scan remix candidates at a glance.",
       "- If a field is null/undefined, render \"(unknown)\" literally — NEVER fabricate.",
+      "",
+      "### Empty-pipeline reporting (when ideas:[])",
+      "When the tool returns `ideas: []` with a `pipeline_failure` block, DO NOT improvise titles from list_outliers or list_format_patterns. Operating rule 17. Report the failure verbatim: cite the gate that consumed the most candidates (read pipeline_failure for outliers_pulled, clusters_after_grouping, clusters_passing_distinct_or_monster, formats_pulled, compose_returned, post_filter_survivors, validator_pass / validator_total), echo fail_reason, then ask HAmo which threshold to loosen. STOP. Improvising bypasses originality + logical-fit guards.",
       "",
       "### Closing",
       "After ALL ideas: **Next step this week:** {one sentence — pick ONE idea and why}. One sentence. No follow-up paragraph.",
@@ -804,7 +808,15 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
         }
         return {
           ok: true,
-          data: { ideas: r.ideas, generatedAt: r.generatedAt },
+          data: {
+            ideas: r.ideas,
+            generatedAt: r.generatedAt,
+            // Surfaces the attrition counters + human-readable
+            // fail_reason when the pipeline produced zero ideas. The
+            // agent's op rule 17 mandates reporting this to the user
+            // and stopping rather than improvising.
+            pipeline_failure: r.pipelineFailure,
+          },
         };
       }
       case "list_format_patterns": {
@@ -1373,7 +1385,8 @@ export function buildSystemPrompt(
     "13. The mandatory ideation output format lives in the generate_ideas tool description. Follow it exactly when listing ideas.",
     "14. If the channel is small/inactive/wrong-niche, say it directly. Honesty over polish.",
     "15. When generating ideas and viral_topic candidates from list_outliers are sparse (fewer than 5 topics with ≥3× multiplier in last 14d), call web_search with the channel's niche + 'trending this week' to surface fresh angles. Compose ideas blending those web-sourced topics with the trending formats from list_format_patterns. ALWAYS cite source URLs in the reply when a web result drives a title.",
-    "16. Logical coherence is non-negotiable. A title mixing topic from video A with format from video B must describe a plausible video. Format provides STRUCTURE, topic provides SUBJECT. Cannot create fabricated facts. The server runs a Logical-Fit validator (Haiku 4.5) on every composed title — survivors are coherent by construction; if you spot a fabrication in the output anyway (rare, but possible when the retry compose ships under call-cap), surface it to the user verbatim and DO NOT paper over it."
+    "16. Logical coherence is non-negotiable. A title mixing topic from video A with format from video B must describe a plausible video. Format provides STRUCTURE, topic provides SUBJECT. Cannot create fabricated facts. The server runs a Logical-Fit validator (Haiku 4.5) on every composed title — survivors are coherent by construction; if you spot a fabrication in the output anyway (rare, but possible when the retry compose ships under call-cap), surface it to the user verbatim and DO NOT paper over it.",
+    "17. When generate_ideas returns ideas:[] with a pipeline_failure block, you MUST report the failure to the user and STOP. Do NOT improvise ideas from list_outliers or list_format_patterns data directly. Tell HAmo which gate ate the candidates (read pipeline_failure.fail_reason + the per-gate counters: outliers_pulled, clusters_after_grouping, clusters_passing_distinct_or_monster, formats_pulled, compose_returned, post_filter_survivors, validator_pass/validator_total) and ask if he wants to loosen a SPECIFIC threshold (widen the window, lower the multiplier, re-extract formats, ban fewer topics). Improvising bypasses the originality + logical-fit guards and produces lower-quality output than the pipeline — refuse the temptation."
   );
 
   // Per-mode addendum — drives WHAT the turn produces (ideas vs deep-dives

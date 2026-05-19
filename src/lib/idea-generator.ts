@@ -16,6 +16,7 @@ import {
   findOwnCatalogTopicMatches,
   findTopicSimilarOutliers,
   performanceBandFor,
+  stripBrandPhrases,
   type OwnCatalogMatch,
   type PerformanceBand,
   type TopicSimilarMatch,
@@ -70,9 +71,21 @@ const OUTLIER_SOURCE_LIMIT = 50;
 
 const TOPIC_CLUSTER_MIN_SHARED_NOUNS = 2;
 const TOPIC_CLUSTER_MIN_DISTINCT_CHANNELS = 2;
+// Single-channel monster bypass — a topic with only one competitor backing
+// it still ships if that one video hit at least this multiplier. The
+// magnitude alone is its own cross-channel validation.
+const TOPIC_CLUSTER_MONSTER_MULTIPLIER = 10;
 const TOPIC_CANDIDATE_LIMIT = 10;
 const TOPIC_CONFIRMATION_MIN = 2;
 const TOPIC_CONFIRMATION_MAX = 3;
+// Catalog-gate thresholds. The per-idea pass averages multipliers across
+// the user's matching own videos. Below MIN we drop (dead horse); at or
+// above WINNER we tag "covered_recent_winner" so the agent can flag the
+// idea as a remix candidate; in between we tag "covered_recent_flop" and
+// still ship so HAmo can decide.
+const CATALOG_DROP_AVG_MULTIPLIER = 1.5;
+const CATALOG_WINNER_AVG_MULTIPLIER = 3.0;
+const CATALOG_OLD_DAYS = 90;
 
 const FORMAT_CANDIDATE_LIMIT = 8;
 const FORMAT_MIN_EXAMPLES = 2;
@@ -190,15 +203,20 @@ export type ProposedIdea = {
   validation: ValidateResult;
   ownCatalogMatches: OwnCatalogMatch[];
 
-  // Winner-aware classification computed pre-validator. The chat agent
-  // renders this as the "Catalog:" line — "remix" gets the 🔁 prefix
-  // and a one-line gloss naming the prior winner. See spec §1.
+  // Winner-aware classification computed in the per-idea pass:
+  //   fresh                    no own-catalog matches at all
+  //   covered_recent_winner    matches' avg multiplier ≥ 3.0 → remix candidate
+  //   covered_recent_flop      matches' avg multiplier in [1.5, 3.0) → borderline
+  //   covered_old              matches exist but all >90d old
+  // Rows with avg < 1.5 are dropped server-side and never reach the agent.
   catalogTag:
     | "fresh"
-    | "covered_recent_fresh_angle"
-    | "remix";
-  // Highest-mult own-video that backs the "remix" tag. null for fresh
-  // and covered_recent_fresh_angle rows.
+    | "covered_recent_winner"
+    | "covered_recent_flop"
+    | "covered_old";
+  // Highest-mult own video — populated when catalogTag is
+  // "covered_recent_winner" so the agent can render
+  // "remix candidate of [title](url) (3.2× your median)".
   catalogRemixSource: OwnCatalogMatch | null;
 
   // Optional supplementary cross-channel siblings outside the cluster —
@@ -207,6 +225,22 @@ export type ProposedIdea = {
 };
 
 export type Idea = ProposedIdea;
+
+// Per-gate attrition counters. Returned alongside ideas:[] when the
+// pipeline produces zero survivors so the agent can tell HAmo WHICH gate
+// consumed the candidates instead of improvising.
+export type PipelineFailure = {
+  outliers_pulled: number;
+  clusters_after_grouping: number;
+  clusters_passing_distinct_or_monster: number;
+  clusters_passing_confirmation: number;
+  formats_pulled: number;
+  compose_returned: number;
+  post_filter_survivors: number;
+  validator_pass: number;
+  validator_total: number;
+  fail_reason: string;
+};
 
 export type GenerateIdeasResult =
   | {
@@ -217,6 +251,9 @@ export type GenerateIdeasResult =
       generatedAt: number;
       model: string;
       claudeCallCount: number;
+      // Present only when ideas.length === 0. Agent surfaces fail_reason
+      // to the user and STOPS instead of improvising.
+      pipelineFailure?: PipelineFailure;
     }
   | { ok: false; status: number; error: string; retryAfterSec?: number };
 
@@ -259,6 +296,21 @@ export async function generateIdeasForChannel(opts: {
   const bannedTopics = readBannedTopics(userChannelId);
   const dropped: DroppedIdea[] = [];
 
+  // Per-gate attrition counters. Populated through the pipeline; surfaced
+  // as `pipelineFailure` when the result ships ideas:[] so the chat agent
+  // can tell HAmo which gate consumed the candidates.
+  const stats = {
+    outliers_pulled: 0,
+    clusters_after_grouping: 0,
+    clusters_passing_distinct_or_monster: 0,
+    clusters_passing_confirmation: 0,
+    formats_pulled: 0,
+    compose_returned: 0,
+    post_filter_survivors: 0,
+    validator_pass: 0,
+    validator_total: 0,
+  };
+
   // Channel-context diagnostics — verifies the system prompt is actually
   // shipping the full description + rules to the chat agent (and therefore
   // through to the agent's "Why this for {channel}" rationale). Logged at
@@ -277,6 +329,25 @@ export async function generateIdeasForChannel(opts: {
     );
   }
 
+  // Wraps an ideas:[] return with the current attrition counters + a
+  // fail-reason string for the chat agent.
+  const failPipeline = (reason: string): GenerateIdeasResult => {
+    log.info(
+      "claude",
+      `[diag] ideation_pipeline outliers=${stats.outliers_pulled} clusters_grouped=${stats.clusters_after_grouping} clusters_passing=${stats.clusters_passing_confirmation} formats=${stats.formats_pulled} compose_returned=${stats.compose_returned} survivors=${stats.post_filter_survivors} fail_reason=${JSON.stringify(reason)}`
+    );
+    return {
+      ok: true,
+      ideas: [],
+      dropped,
+      bannedTopics,
+      generatedAt: now,
+      model: OPUS_COMPOSE_MODEL,
+      claudeCallCount: 0,
+      pipelineFailure: { ...stats, fail_reason: reason },
+    };
+  };
+
   // 1. Source pool ----------------------------------------------------------
   const outlierWindow = opts.windowDays ?? OUTLIER_WINDOW_DAYS;
   const outlierMult = opts.minMultiplier ?? OUTLIER_MIN_MULTIPLIER;
@@ -287,33 +358,33 @@ export async function generateIdeasForChannel(opts: {
     minMultiplier: outlierMult,
     bannedTopics,
   });
+  stats.outliers_pulled = outliers.length;
   if (outliers.length === 0) {
-    return {
-      ok: false,
-      status: 400,
-      error: "No outliers available for this channel. Add competitors and sync first.",
-    };
+    return failPipeline(
+      "No competitor outliers in the source window. Sync more competitors or widen the window."
+    );
   }
   if (!opts.outlierVideoIds && outliers.length < 4) {
-    return {
-      ok: false,
-      status: 409,
-      error: `Only ${outliers.length} outlier${outliers.length === 1 ? "" : "s"} ≥${outlierMult}× in the last ${outlierWindow} days — need ≥4 for topic clustering. Ask the user whether to widen the window or lower the multiplier; do NOT silently lower these thresholds.`,
-    };
+    return failPipeline(
+      `Only ${outliers.length} outlier${outliers.length === 1 ? "" : "s"} ≥${outlierMult}× in the last ${outlierWindow} days — need ≥4 for topic clustering. Ask HAmo whether to widen the window or lower the multiplier.`
+    );
   }
 
   // 2. Topic clustering -----------------------------------------------------
-  const topicCandidates = clusterTopics(outliers).slice(0, TOPIC_CANDIDATE_LIMIT);
+  const cluster = clusterTopics(outliers);
+  stats.clusters_after_grouping = cluster.stats.totalGroups;
+  stats.clusters_passing_distinct_or_monster =
+    cluster.stats.passedDistinctOrMonster;
+  stats.clusters_passing_confirmation = cluster.stats.passedConfirmation;
+  const topicCandidates = cluster.candidates.slice(0, TOPIC_CANDIDATE_LIMIT);
   log.info(
     "claude",
-    `[diag] ideation_clusters channel=${userChannelId} outliers=${outliers.length} clusters=${topicCandidates.length}`
+    `[diag] ideation_clusters channel=${userChannelId} outliers=${outliers.length} groups=${cluster.stats.totalGroups} pass_distinct_or_monster=${cluster.stats.passedDistinctOrMonster} pass_confirmation=${cluster.stats.passedConfirmation} candidates=${topicCandidates.length}`
   );
   if (topicCandidates.length === 0) {
-    return {
-      ok: false,
-      status: 409,
-      error: `No cross-channel topic clusters survived (need ≥${TOPIC_CLUSTER_MIN_DISTINCT_CHANNELS} distinct channels per topic). Sync more competitors or widen the outlier window.`,
-    };
+    return failPipeline(
+      `All ${cluster.stats.totalGroups} topic clusters fell below the survival gate: need ≥${TOPIC_CLUSTER_MIN_DISTINCT_CHANNELS} distinct channels OR a single-channel monster (≥${TOPIC_CLUSTER_MONSTER_MULTIPLIER}× multiplier). Sync more competitors or widen the outlier window.`
+    );
   }
 
   // 3. Format pool ----------------------------------------------------------
@@ -321,12 +392,11 @@ export async function generateIdeasForChannel(opts: {
     0,
     FORMAT_CANDIDATE_LIMIT
   );
+  stats.formats_pulled = formatCandidates.length;
   if (formatCandidates.length === 0) {
-    return {
-      ok: false,
-      status: 409,
-      error: "No format templates available for this channel. Run 'Re-extract trending formats' on /outliers Trending Formats tab first.",
-    };
+    return failPipeline(
+      "No format templates available for this channel. Run 'Re-extract trending formats' on the /outliers Trending Formats tab first."
+    );
   }
 
   // 4. Compose call ---------------------------------------------------------
@@ -353,6 +423,7 @@ export async function generateIdeasForChannel(opts: {
     log.error("claude", `[diag] ideation_compose failed: ${composeResult.error}`);
     return { ok: false, status: 502, error: composeResult.error };
   }
+  stats.compose_returned = composeResult.ideas.length;
   log.info(
     "claude",
     `[diag] ideation_call_1_compose ok=true ideas_raw=${composeResult.ideas.length}/${topicCandidates.length}`
@@ -370,16 +441,14 @@ export async function generateIdeasForChannel(opts: {
     formatId: number;
     formatSourceVideoId: string;
     formatSwapped: boolean;
-    // Winner-aware classification computed pre-validator. "remix" means
-    // the user has covered this topic before AND a prior video hit ≥3×
-    // their median — re-attacking the topic is high-value. The chat
-    // agent renders "🔁 Remix" on these. "covered_recent_fresh_angle"
-    // means the topic appears in own catalog with average performance —
-    // KEEP, but the agent should signal the user already touched it.
+    // Winner-aware catalog classification — see ProposedIdea.catalogTag
+    // doc for the threshold logic (avg multiplier across own-catalog
+    // matches: <1.5 drops, ≥3.0 winner, in between flop).
     catalogTag:
       | "fresh"
-      | "covered_recent_fresh_angle"
-      | "remix";
+      | "covered_recent_winner"
+      | "covered_recent_flop"
+      | "covered_old";
     catalogRemixSource: OwnCatalogMatch | null;
   };
 
@@ -455,42 +524,49 @@ export async function generateIdeasForChannel(opts: {
       });
       continue;
     }
-    // Winner-aware topic-frequency gate. Replaces the prior "any match in
-    // last 20 uploads → drop" rule which wiped every cross-channel
-    // cluster on dense catalogs (Late Science). New behavior:
-    //   - underperformer match (mult < 1.0) AND no winner → DROP (dead
-    //     horse; you've tried this and it tanked).
-    //   - winner match (mult ≥ 3.0) → KEEP, tag "remix" (the user has
-    //     proven they can win on this topic; re-attack it).
-    //   - any match exists, all mid-tier (1.0 ≤ mult < 3.0) → KEEP, tag
-    //     "covered_recent_fresh_angle" (covered but unproven; needs a
-    //     fresh angle which is what compose just produced).
-    //   - no matches → KEEP, tag "fresh".
+    // Winner-aware catalog gate. Drops only when the user's matching
+    // own videos averaged below CATALOG_DROP_AVG_MULTIPLIER (dead-horse
+    // topic). Above that floor, ships with a tag the agent surfaces:
+    //   - no matches            → fresh
+    //   - all matches >90d old  → covered_old (cooled but safe to revisit)
+    //   - avg ≥ 3.0             → covered_recent_winner (remix candidate)
+    //   - 1.5 ≤ avg < 3.0       → covered_recent_flop (borderline; HAmo decides)
+    //   - avg < 1.5             → drop (dead horse)
     const ownMatches = findOwnCatalogTopicMatches(
       idea.topicLabel,
       userChannelId,
       { limit: 5 }
     );
-    const winners = ownMatches.filter((m) => m.multiplier >= 3.0);
-    const underperformers = ownMatches.filter((m) => m.multiplier < 1.0);
     let catalogTag: ComposedSlot["catalogTag"] = "fresh";
     let catalogRemixSource: OwnCatalogMatch | null = null;
-    if (winners.length > 0) {
-      catalogTag = "remix";
-      // Pick the highest-multiplier winner as the displayed remix source.
-      catalogRemixSource = winners.reduce((acc, m) =>
-        m.multiplier > acc.multiplier ? m : acc
+    if (ownMatches.length > 0) {
+      const recentCutoff = now - CATALOG_OLD_DAYS * 86400;
+      const recent = ownMatches.filter(
+        (m) => m.publishedAt !== null && m.publishedAt >= recentCutoff
       );
-    } else if (underperformers.length > 0 && winners.length === 0) {
-      dropped.push({
-        topicLabel: idea.topicLabel,
-        proposedTitle: idea.proposedTitle,
-        reason: "topic_overused",
-        detail: `you covered this and it underperformed (${underperformers[0].multiplier}× — "${underperformers[0].title}")`,
-      });
-      continue;
-    } else if (ownMatches.length > 0) {
-      catalogTag = "covered_recent_fresh_angle";
+      if (recent.length === 0) {
+        catalogTag = "covered_old";
+      } else {
+        const avg =
+          recent.reduce((a, m) => a + m.multiplier, 0) / recent.length;
+        if (avg < CATALOG_DROP_AVG_MULTIPLIER) {
+          dropped.push({
+            topicLabel: idea.topicLabel,
+            proposedTitle: idea.proposedTitle,
+            reason: "topic_overused",
+            detail: `recent own coverage averaged ${avg.toFixed(1)}× — dead horse (e.g. "${recent[0].title}" at ${recent[0].multiplier}×)`,
+          });
+          continue;
+        }
+        if (avg >= CATALOG_WINNER_AVG_MULTIPLIER) {
+          catalogTag = "covered_recent_winner";
+          catalogRemixSource = recent.reduce((acc, m) =>
+            m.multiplier > acc.multiplier ? m : acc
+          );
+        } else {
+          catalogTag = "covered_recent_flop";
+        }
+      }
     }
 
     prelim.push({
@@ -505,6 +581,8 @@ export async function generateIdeasForChannel(opts: {
       catalogRemixSource,
     });
   }
+
+  stats.post_filter_survivors = prelim.length;
 
   // 6. Logical-fit validator -----------------------------------------------
   const validatorInputs: LogicalFitInput[] = prelim.map((slot, idx) => {
@@ -556,6 +634,8 @@ export async function generateIdeasForChannel(opts: {
         });
       }
       const passes = fit.verdicts.filter((v) => v.logicallyCoherent).length;
+      stats.validator_total = fit.verdicts.length;
+      stats.validator_pass = passes;
       log.info(
         "claude",
         `[diag] ideation_call_2_validator total=${fit.verdicts.length} pass=${passes} fail=${fit.verdicts.length - passes}`
@@ -858,6 +938,31 @@ export async function generateIdeasForChannel(opts: {
     "claude",
     `[diag] ideation_done channel=${userChannelId} shipped=${ideas.length} dropped=${dropped.length} drops=${JSON.stringify(dropCounts)} calls=${claudeCallCount}/${MAX_CLAUDE_CALLS}`
   );
+  log.info(
+    "claude",
+    `[diag] ideation_pipeline outliers=${stats.outliers_pulled} clusters_grouped=${stats.clusters_after_grouping} clusters_passing=${stats.clusters_passing_confirmation} formats=${stats.formats_pulled} compose_returned=${stats.compose_returned} survivors=${stats.post_filter_survivors} shipped=${ideas.length}`
+  );
+
+  // Empty-pipeline branch: attach the attrition + a human-readable
+  // fail_reason so the chat agent can report which gate consumed the
+  // candidates rather than improvising.
+  let pipelineFailure: PipelineFailure | undefined;
+  if (ideas.length === 0) {
+    let reason: string;
+    if (stats.compose_returned === 0) {
+      reason = "Claude compose returned 0 ideas. Re-run; if persistent, the topic/format pool may be too sparse — sync more competitors or widen the outlier window.";
+    } else if (stats.post_filter_survivors === 0) {
+      const topReason = Object.entries(dropCounts).sort(
+        (a, b) => b[1] - a[1]
+      )[0];
+      reason = `All ${stats.compose_returned} composed ideas dropped in the post-filter (top reason: ${topReason ? `${topReason[0]} × ${topReason[1]}` : "unknown"}).`;
+    } else if (stats.validator_total > 0 && stats.validator_pass === 0) {
+      reason = `Logical-fit validator rejected all ${stats.validator_total} composed ideas and the format-swap retry didn't recover any. The topic × format pairings produced fabrications the validator couldn't accept.`;
+    } else {
+      reason = "Pipeline drained candidates across multiple gates without surfacing a dominant cause. See dropped[] for per-idea reasons.";
+    }
+    pipelineFailure = { ...stats, fail_reason: reason };
+  }
 
   return {
     ok: true,
@@ -867,6 +972,7 @@ export async function generateIdeasForChannel(opts: {
     generatedAt: now,
     model,
     claudeCallCount,
+    ...(pipelineFailure ? { pipelineFailure } : {}),
   };
 }
 
@@ -985,12 +1091,16 @@ type TopicCandidate = {
 };
 
 function tokenize(s: string): string[] {
+  // Strip brand phrases ("james webb", "voyager 2", "nasa", etc.) so
+  // same-instrument titles don't collapse to the same topic. The brand
+  // list lives in validate-idea.ts (shared with the frequency/own-catalog
+  // helpers).
+  const stripped = stripBrandPhrases(
+    s.toLowerCase().replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
+  );
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const raw of s
-    .toLowerCase()
-    .replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
-    .split(/\s+/)) {
+  for (const raw of stripped.split(/\s+/)) {
     if (!raw || raw.length < 4) continue;
     if (STOPWORDS.has(raw)) continue;
     if (seen.has(raw)) continue;
@@ -1000,8 +1110,15 @@ function tokenize(s: string): string[] {
   return out;
 }
 
-function clusterTopics(outliers: OutlierLite[]): TopicCandidate[] {
-  if (outliers.length === 0) return [];
+function clusterTopics(
+  outliers: OutlierLite[]
+): { candidates: TopicCandidate[]; stats: ClusterStats } {
+  if (outliers.length === 0) {
+    return {
+      candidates: [],
+      stats: { totalGroups: 0, passedDistinctOrMonster: 0, passedConfirmation: 0 },
+    };
+  }
   const tokens = outliers.map((o) => new Set(tokenize(o.title)));
 
   // Union-find: edge when two videos share ≥TOPIC_CLUSTER_MIN_SHARED_NOUNS.
@@ -1039,28 +1156,48 @@ function clusterTopics(outliers: OutlierLite[]): TopicCandidate[] {
   }
 
   const candidates: TopicCandidate[] = [];
+  let passedDistinctOrMonster = 0;
+  let passedConfirmation = 0;
   for (const [, indices] of groups) {
-    if (indices.length < 2) continue;
     const members = indices.map((i) => outliers[i]);
     // distinct_channels — use competitorChannelId when present, else
     // competitor_id (numeric). Both keyed on the competitor row.
     const channelKey = (m: OutlierLite) =>
       m.competitorChannelId ?? `cid:${m.competitorId ?? "?"}`;
     const distinctChannels = new Set(members.map(channelKey)).size;
-    if (distinctChannels < TOPIC_CLUSTER_MIN_DISTINCT_CHANNELS) continue;
+    const maxMultiplier = members.reduce(
+      (acc, m) => (m.multiplier > acc ? m.multiplier : acc),
+      0
+    );
 
-    // Shared nouns across ≥2 cluster members → topicLabel.
+    // Survival gate: ≥2 distinct channels OR a single-channel monster
+    // (≥10× — magnitude alone is its own cross-channel validation).
+    const isMonster =
+      distinctChannels < TOPIC_CLUSTER_MIN_DISTINCT_CHANNELS &&
+      maxMultiplier >= TOPIC_CLUSTER_MONSTER_MULTIPLIER;
+    if (distinctChannels < TOPIC_CLUSTER_MIN_DISTINCT_CHANNELS && !isMonster) {
+      continue;
+    }
+    passedDistinctOrMonster++;
+
+    // Token aggregation → topicLabel. For multi-member clusters, require
+    // a noun to appear in ≥2 members; for single-member monsters, fall
+    // back to the source video's own (brand-stripped) tokens so the
+    // topic still has a recognizable label.
     const tokenCounts = new Map<string, number>();
     for (const idx of indices) {
       for (const t of tokens[idx]) {
         tokenCounts.set(t, (tokenCounts.get(t) ?? 0) + 1);
       }
     }
-    const sharedNouns = [...tokenCounts.entries()]
-      .filter(([, n]) => n >= 2)
-      .sort((a, b) => b[1] - a[1])
-      .map(([t]) => t)
-      .slice(0, 5);
+    const sharedNouns =
+      indices.length >= 2
+        ? [...tokenCounts.entries()]
+            .filter(([, n]) => n >= 2)
+            .sort((a, b) => b[1] - a[1])
+            .map(([t]) => t)
+            .slice(0, 5)
+        : [...tokens[indices[0]]].slice(0, 5);
     if (sharedNouns.length === 0) continue;
     const topicLabel = sharedNouns.slice(0, 3).join(" ");
 
@@ -1080,12 +1217,14 @@ function clusterTopics(outliers: OutlierLite[]): TopicCandidate[] {
       if (topicConfirmationVideos.length >= TOPIC_CONFIRMATION_MAX) break;
       topicConfirmationVideos.push(arr[0]);
     }
-    if (topicConfirmationVideos.length < TOPIC_CONFIRMATION_MIN) continue;
+    // Confirmation requirement: cross-channel clusters need ≥2 sibling
+    // videos from different competitors. Monsters bypass this — the
+    // ≥10× multiplier IS the validation.
+    if (!isMonster && topicConfirmationVideos.length < TOPIC_CONFIRMATION_MIN) {
+      continue;
+    }
+    passedConfirmation++;
 
-    const maxMultiplier = members.reduce(
-      (acc, m) => (m.multiplier > acc ? m.multiplier : acc),
-      0
-    );
     const mostRecent = members.reduce(
       (acc, m) => Math.max(acc, m.publishedAt ?? 0),
       0
@@ -1102,6 +1241,7 @@ function clusterTopics(outliers: OutlierLite[]): TopicCandidate[] {
     });
   }
 
+  // Prefer cross-channel clusters first; monsters fill in below them.
   candidates.sort((a, b) => {
     if (b.distinctChannels !== a.distinctChannels)
       return b.distinctChannels - a.distinctChannels;
@@ -1109,8 +1249,21 @@ function clusterTopics(outliers: OutlierLite[]): TopicCandidate[] {
       return b.maxMultiplier - a.maxMultiplier;
     return b.mostRecent - a.mostRecent;
   });
-  return candidates;
+  return {
+    candidates,
+    stats: {
+      totalGroups: groups.size,
+      passedDistinctOrMonster,
+      passedConfirmation,
+    },
+  };
 }
+
+export type ClusterStats = {
+  totalGroups: number;
+  passedDistinctOrMonster: number;
+  passedConfirmation: number;
+};
 
 function toSourceVideo(o: OutlierLite): SourceVideo {
   return {
@@ -1251,7 +1404,14 @@ async function runComposeCall(opts: {
       temperature: 1,
       system: systemPrompt,
       messages: [{ role: "user", content: userBody }],
-      thinking: { type: "enabled", budget_tokens: IDEATION_THINKING_BUDGET },
+      // Opus 4.7 requires the adaptive thinking shape (per the SDK
+      // 400 error: "thinking.type.enabled is not supported for this
+      // model"). "summarized" display matches the prior reasoning
+      // surface; "effort=high" caps the thinking budget at the high
+      // tier, roughly equivalent to the prior 6000-token budget on
+      // Sonnet 4.6.
+      thinking: { type: "adaptive", display: "summarized" },
+      output_config: { effort: "high" },
     });
     const text = resp.content
       .filter((b) => b.type === "text")
@@ -1317,6 +1477,7 @@ function buildComposeSystemPrompt(opts: {
     "- formatSourceVideoId MUST be the chosen format's primary source OR one of its confirmation video ids.",
     "- topicSourceVideoId !== formatSourceVideoId. ALWAYS.",
     "- coherenceRationale: 1 short sentence (≤180 chars). NEVER empty.",
+    "- STALE-TOPIC RULE: if the chosen topic source is older than 30 days (see the `age_days` field below each topic candidate), the proposedTitle MUST be a fresh STRUCTURAL REFRAME — not a paraphrase of the source title. Swap the rhetorical move, change the verb, invert the angle. State the transformation explicitly in coherenceRationale (e.g. \"reframes the 60-day-old detection story as a forensic re-investigation\").",
     "",
     ...ideationRulesBlock,
     ...bannedBlock,
@@ -1361,12 +1522,13 @@ function buildComposeUserBody(opts: {
     lines.push(
       `- distinct_channels=${t.distinctChannels}, max_multiplier=${t.maxMultiplier.toFixed(1)}×, shared_nouns=${t.sharedNouns.join(",")}`
     );
+    const topicAge = ageDaysOrUnknown(t.topicSourceVideo.publishedAt);
     lines.push(
-      `- primary source [${t.topicSourceVideo.videoId}] "${t.topicSourceVideo.title}" — ${t.topicSourceVideo.competitorTitle ?? "(unknown)"} (${t.topicSourceVideo.multiplier.toFixed(1)}×, ${t.topicSourceVideo.views.toLocaleString("en-US")} views)`
+      `- primary source [${t.topicSourceVideo.videoId}] "${t.topicSourceVideo.title}" — ${t.topicSourceVideo.competitorTitle ?? "(unknown)"} (${t.topicSourceVideo.multiplier.toFixed(1)}×, ${t.topicSourceVideo.views.toLocaleString("en-US")} views, age_days=${topicAge})`
     );
     for (const c of t.topicConfirmationVideos) {
       lines.push(
-        `- confirmation [${c.videoId}] "${c.title}" — ${c.competitorTitle ?? "(unknown)"} (${c.multiplier.toFixed(1)}×)`
+        `- confirmation [${c.videoId}] "${c.title}" — ${c.competitorTitle ?? "(unknown)"} (${c.multiplier.toFixed(1)}×, age_days=${ageDaysOrUnknown(c.publishedAt)})`
       );
     }
   }
@@ -1570,10 +1732,10 @@ async function runRetryComposeCall(opts: {
       temperature: 1,
       system: systemPrompt,
       messages: [{ role: "user", content: body.join("\n") }],
-      thinking: {
-        type: "enabled",
-        budget_tokens: Math.max(1024, Math.floor(IDEATION_THINKING_BUDGET / 2)),
-      },
+      // Opus 4.7 retry — adaptive thinking + lower effort tier since
+      // retries do less work (a handful of titles, not the whole slate).
+      thinking: { type: "adaptive", display: "summarized" },
+      output_config: { effort: "medium" },
     });
     const text = resp.content
       .filter((b) => b.type === "text")
@@ -1594,6 +1756,13 @@ async function runRetryComposeCall(opts: {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function ageDaysOrUnknown(ts: number | null): string {
+  if (!ts || !Number.isFinite(ts)) return "unknown";
+  const diff = Math.floor(Date.now() / 1000 - ts);
+  if (diff <= 0) return "0";
+  return String(Math.floor(diff / 86400));
+}
 
 function ytThumbnail(videoId: string): string {
   return `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
