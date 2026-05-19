@@ -9,7 +9,13 @@ import {
   recordClaudeUsage,
   renameSession,
 } from "@/lib/db";
-import { buildSystemPrompt, getToolsFor, runTool, type ToolGroup } from "@/lib/chat-tools";
+import {
+  buildSystemPrompt,
+  getToolsFor,
+  runTool,
+  type ChatMode,
+  type ToolGroup,
+} from "@/lib/chat-tools";
 import { resolveAttachmentsForClaude, type AttachmentInput } from "@/lib/attachments";
 import { costMillicents } from "@/lib/claude-pricing";
 import { log } from "@/lib/logger";
@@ -70,9 +76,22 @@ export async function POST(req: Request) {
     sessionId?: string;
     content?: string;
     tools?: string[];
+    mode?: string;
     attachments?: AttachmentInput[];
     provider?: ProviderChoice;
   };
+
+  // T2 mode picker. Defaults to "ideate" when missing. Invalid values
+  // also collapse to ideate (no 400 — keeps old clients working).
+  const VALID_MODES: ReadonlySet<ChatMode> = new Set<ChatMode>([
+    "ideate",
+    "research",
+    "validate",
+  ]);
+  const mode: ChatMode =
+    typeof body.mode === "string" && VALID_MODES.has(body.mode as ChatMode)
+      ? (body.mode as ChatMode)
+      : "ideate";
 
   const userText = body.content?.trim() ?? "";
   const rawAttachments = Array.isArray(body.attachments) ? body.attachments : [];
@@ -106,8 +125,15 @@ export async function POST(req: Request) {
     );
   }
 
-  const activeGroups: ToolGroup[] = (body.tools ?? [])
-    .filter((g): g is ToolGroup => ALLOWED_GROUPS.includes(g as ToolGroup));
+  // The mode whitelist is authoritative for tool exposure. Groups
+  // default to all three so the mode filter has every tool to draw
+  // from. Old clients that still POST `tools: [...]` are honored, but
+  // the intersection with the mode whitelist always wins.
+  const requestedGroups = (body.tools ?? []).filter(
+    (g): g is ToolGroup => ALLOWED_GROUPS.includes(g as ToolGroup)
+  );
+  const activeGroups: ToolGroup[] =
+    requestedGroups.length > 0 ? requestedGroups : [...ALLOWED_GROUPS];
 
   // Resolve attachments against the local DB + decode any inline images.
   // The UI renders the user's plain text, while the model sees text +
@@ -189,8 +215,11 @@ export async function POST(req: Request) {
     history[history.length - 1] = { role: "user", content: claudeMessageContent };
   }
 
-  const tools = getToolsFor(activeGroups);
-  const system = buildSystemPrompt(activeGroups, { advisorEnabled: false });
+  const tools = getToolsFor(activeGroups, mode);
+  const system = buildSystemPrompt(activeGroups, {
+    advisorEnabled: false,
+    mode,
+  });
 
   // Mark the session as "turn in progress" so the /chat UI can show a
   // "generating…" indicator even after the user navigates away and back,

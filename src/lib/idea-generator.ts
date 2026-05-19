@@ -21,7 +21,9 @@ import { getFormatsForChannel } from "./outlier-formats";
 import { log } from "./logger";
 import {
   checkTopicFrequency,
+  findOwnCatalogTopicMatches,
   findTopicSimilarOutliers,
+  type OwnCatalogMatch,
   type TopicFrequencyResult,
   type TopicSimilarMatch,
   validateIdeaAgainstOwnCatalog,
@@ -155,10 +157,17 @@ export type ProposedIdea = {
   sourceTopicOutliers: Array<{
     videoId: string;
     title: string;
+    // T4 forensic-evidence fields. Every outlier surfaces verifiable
+    // numbers so the agent's output renders "224K views vs channel
+    // median 4K", not just "52×".
+    views: number;
+    channelMedian: number;
     multiplier: number;
     thumbnailUrl: string | null;
+    publishedAt: number | null;
     competitorTitle: string | null;
     competitorHandle: string | null;
+    competitorSubscriberCount: number | null;
     performanceBand: PerformanceBand;
   }>;
   // Up to 3 OTHER competitor outliers covering the SAME TOPIC (token
@@ -168,6 +177,11 @@ export type ProposedIdea = {
   // user wants to see who else covered the SAME TOPIC and how hard it
   // hit. Falls back to [] when no cross-channel topic siblings exist.
   topicSimilarOutliers: TopicSimilarMatch[];
+  // T5: 0-3 of the user's OWN videos that share content nouns with the
+  // topic. Surfaces the "Your catalog comparison" block inline in the
+  // agent's forensic markdown so HAmo sees instantly whether the channel
+  // has touched the topic and how it performed.
+  ownCatalogMatches: OwnCatalogMatch[];
   topicLabel: string;
   proposedTitle: string;
   angle: string;
@@ -231,10 +245,15 @@ type OutlierLite = {
   videoId: string;
   title: string;
   views: number;
+  // T4: surfaced through to ProposedIdea.sourceTopicOutliers so the
+  // forensic markup can render "views vs median" rather than naked
+  // multipliers.
+  channelMedian: number;
   multiplier: number;
   thumbnailUrl: string | null;
   competitorTitle: string | null;
   competitorHandle: string | null;
+  competitorSubscriberCount: number | null;
   // Carried through from listOutliersForActiveChannel so the defense-in-
   // depth own-channel filter below can compare against the active
   // userChannelId. The SQL already excludes self-tracked competitors;
@@ -334,10 +353,16 @@ export async function generateIdeasForChannel(opts: {
         videoId: r.videoId,
         title: r.title,
         views: r.views,
+        channelMedian: med,
         multiplier: med > 0 ? r.views / med : 0,
         thumbnailUrl: ytThumbnail(r.videoId),
         competitorTitle: r.competitorTitle,
         competitorHandle: r.competitorHandle ?? null,
+        // The bulk-fetch helper doesn't carry subscriber_count; users
+        // who pass curated outlierVideoIds get null here, which the
+        // markup renders as "(unknown subs)". Acceptable for the
+        // power-user override path.
+        competitorSubscriberCount: null,
         competitorChannelId: r.competitorChannelId ?? null,
         tier: r.tier,
         publishedAt: r.publishedAt,
@@ -354,10 +379,12 @@ export async function generateIdeasForChannel(opts: {
       videoId: o.videoId,
       title: o.title,
       views: o.views,
+      channelMedian: o.channelMedian,
       multiplier: o.multiplier,
       thumbnailUrl: o.thumbnailUrl ?? ytThumbnail(o.videoId),
       competitorTitle: o.competitorTitle,
       competitorHandle: o.competitorHandle ?? null,
+      competitorSubscriberCount: o.competitorSubscriberCount,
       competitorChannelId: o.competitorChannelId ?? null,
       tier: o.tier,
       publishedAt: o.publishedAt,
@@ -926,6 +953,15 @@ export async function generateIdeasForChannel(opts: {
       userChannelId,
       { limit: 3, excludeVideoIds: [...sourceIds] }
     );
+    // T5 — own-channel catalog matches for the forensic "Your catalog
+    // comparison" block. Up to 3 of the user's videos that share content
+    // nouns with the proposed topic, with full views/median/date so the
+    // agent's markdown shows verifiable evidence inline.
+    const ownCatalogMatches = findOwnCatalogTopicMatches(
+      a.topicLabel,
+      userChannelId,
+      { limit: 3 }
+    );
     return {
       raw: a,
       shaped: {
@@ -941,17 +977,25 @@ export async function generateIdeasForChannel(opts: {
             : null,
         sourceTopicOutliers: a.sources.map((s) => {
           const m = Math.round(s.multiplier * 10) / 10;
+          // OutlierLite carries views; channelMedian + subs were added
+          // to OutlierRow in T4 and now flow through OutlierLite as
+          // additional fields.
           return {
             videoId: s.videoId,
             title: s.title,
+            views: s.views,
+            channelMedian: s.channelMedian,
             multiplier: m,
             thumbnailUrl: s.thumbnailUrl,
+            publishedAt: s.publishedAt,
             competitorTitle: s.competitorTitle,
             competitorHandle: s.competitorHandle,
+            competitorSubscriberCount: s.competitorSubscriberCount,
             performanceBand: performanceBandFor(m),
           };
         }),
         topicSimilarOutliers,
+        ownCatalogMatches,
         topicLabel: a.topicLabel,
         proposedTitle: a.proposedTitle,
         angle: a.angle,

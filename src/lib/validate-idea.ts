@@ -90,7 +90,7 @@ function tokenize(topic: string): string[] {
 // baseline for performance bands. No window — the band should reflect
 // each video's place in the creator's overall catalogue distribution,
 // not a transient 60d window.
-function ownChannelMedian(channelId: string): number {
+export function ownChannelMedian(channelId: string): number {
   const row = db
     .prepare(
       `WITH ordered AS (
@@ -442,10 +442,19 @@ export type TopicSimilarMatch = {
   videoId: string;
   title: string;
   thumbnailUrl: string | null;
+  // T4: forensic-evidence fields. Every reference to an outlier in the
+  // agent's output must include views + median + subs + absolute date so
+  // the multiplier is verifiable (no naked "52×" — must be paired with
+  // "224K views vs channel median 4K"). These get surfaced inline in
+  // the agent's structured markdown by the OUTPUT FORMAT spec.
+  views: number;
+  channelMedian: number;
   multiplier: number;
   performanceBand: PerformanceBand;
+  publishedAt: number | null;
   competitorTitle: string | null;
   competitorHandle: string | null;
+  competitorSubscriberCount: number | null;
   matchedKeywords: string[];
 };
 
@@ -476,10 +485,12 @@ export function findTopicSimilarOutliers(
            cv.video_id,
            cv.title,
            cv.thumbnail_url,
+           cv.published_at,
            COALESCE(cv.views, 0) AS views,
            cv.competitor_id,
-           c.title  AS competitor_title,
-           c.handle AS competitor_handle,
+           c.title              AS competitor_title,
+           c.handle             AS competitor_handle,
+           c.subscriber_count   AS competitor_subscriber_count,
            c.user_channel_id,
            ROW_NUMBER() OVER (PARTITION BY cv.competitor_id ORDER BY cv.views) AS rn,
            COUNT(*)     OVER (PARTITION BY cv.competitor_id)                  AS n_in_window
@@ -506,8 +517,10 @@ export function findTopicSimilarOutliers(
          s.title,
          s.thumbnail_url,
          s.views,
+         s.published_at,
          s.competitor_title,
          s.competitor_handle,
+         s.competitor_subscriber_count,
          COALESCE(m.median_views, 0) AS median_views
        FROM scoped s
        LEFT JOIN medians m ON m.competitor_id = s.competitor_id`
@@ -517,8 +530,10 @@ export function findTopicSimilarOutliers(
     title: string;
     thumbnail_url: string | null;
     views: number;
+    published_at: number | null;
     competitor_title: string | null;
     competitor_handle: string | null;
+    competitor_subscriber_count: number | null;
     median_views: number;
   }>;
 
@@ -526,8 +541,12 @@ export function findTopicSimilarOutliers(
     videoId: string;
     title: string;
     thumbnailUrl: string | null;
+    views: number;
+    channelMedian: number;
+    publishedAt: number | null;
     competitorTitle: string | null;
     competitorHandle: string | null;
+    competitorSubscriberCount: number | null;
     matchedKeywords: string[];
     overlap: number;
     multiplier: number;
@@ -549,8 +568,12 @@ export function findTopicSimilarOutliers(
       videoId: r.video_id,
       title: r.title,
       thumbnailUrl: r.thumbnail_url,
+      views: r.views,
+      channelMedian: Math.round(r.median_views),
+      publishedAt: r.published_at,
       competitorTitle: r.competitor_title,
       competitorHandle: r.competitor_handle,
+      competitorSubscriberCount: r.competitor_subscriber_count,
       matchedKeywords: hits,
       overlap: hits.length,
       multiplier,
@@ -567,10 +590,104 @@ export function findTopicSimilarOutliers(
     title: s.title,
     thumbnailUrl:
       s.thumbnailUrl ?? `https://i.ytimg.com/vi/${s.videoId}/mqdefault.jpg`,
+    views: s.views,
+    channelMedian: s.channelMedian,
     multiplier: s.multiplier,
     performanceBand: performanceBandFor(s.multiplier),
+    publishedAt: s.publishedAt,
     competitorTitle: s.competitorTitle,
     competitorHandle: s.competitorHandle,
+    competitorSubscriberCount: s.competitorSubscriberCount,
     matchedKeywords: s.matchedKeywords,
+  }));
+}
+
+/**
+ * T4 — own-channel topic siblings. Sibling of findTopicSimilarOutliers
+ * but scoped to the USER's own catalog. Powers the "Your catalog
+ * comparison" block in the agent's forensic ideation output: for each
+ * proposed idea, surface 0-3 of the user's own videos that share content
+ * nouns with the topic, so the user can see at a glance whether they've
+ * already covered it.
+ *
+ * Match rule mirrors validateIdeaAgainstOwnCatalog: ≥2 keyword overlap
+ * on the title (transcript scan is skipped — too slow for the per-idea
+ * cost). Ranked by (overlap DESC, multiplier DESC).
+ */
+export type OwnCatalogMatch = {
+  videoId: string;
+  title: string;
+  views: number;
+  channelMedian: number;
+  multiplier: number;
+  performanceBand: PerformanceBand;
+  publishedAt: number | null;
+  matchedKeywords: string[];
+};
+
+export function findOwnCatalogTopicMatches(
+  topic: string,
+  channelId: string,
+  opts: { limit?: number; lookbackDays?: number } = {}
+): OwnCatalogMatch[] {
+  const trimmed = topic.trim();
+  if (!trimmed || !channelId) return [];
+  const keywords = tokenize(trimmed);
+  if (keywords.length === 0) return [];
+  const limit = Math.max(1, Math.min(10, opts.limit ?? 3));
+  // Default lookback is "last 365 days" — generous enough to surface
+  // anything still on the channel's relevant history horizon.
+  const lookbackDays = Math.max(7, Math.min(3650, opts.lookbackDays ?? 365));
+
+  const median = ownChannelMedian(channelId);
+  const rows = db
+    .prepare(
+      `SELECT id, title, COALESCE(views, 0) AS views, published_at
+       FROM videos
+       WHERE channel_id = ?
+         AND published_at IS NOT NULL
+         AND published_at >= strftime('%s','now') - ? * 86400
+       ORDER BY COALESCE(published_at, imported_at) DESC`
+    )
+    .all(channelId, lookbackDays) as Array<{
+    id: string;
+    title: string;
+    views: number;
+    published_at: number | null;
+  }>;
+
+  type Scored = {
+    row: { id: string; title: string; views: number; published_at: number | null };
+    hits: string[];
+    multiplier: number;
+  };
+  const scored: Scored[] = [];
+  for (const r of rows) {
+    const titleLower = r.title.toLowerCase();
+    const hits: string[] = [];
+    for (const kw of keywords) {
+      if (titleLower.includes(kw)) hits.push(kw);
+    }
+    if (hits.length < 2) continue;
+    const multiplier =
+      median > 0
+        ? Math.round((r.views / median) * 10) / 10
+        : 0;
+    scored.push({ row: r, hits, multiplier });
+  }
+  scored.sort((a, b) => {
+    if (b.hits.length !== a.hits.length) return b.hits.length - a.hits.length;
+    return b.multiplier - a.multiplier;
+  });
+
+  return scored.slice(0, limit).map((s) => ({
+    videoId: s.row.id,
+    title: s.row.title,
+    views: s.row.views,
+    channelMedian: median,
+    multiplier: s.multiplier,
+    performanceBand: performanceBandFor(s.multiplier),
+    publishedAt: s.row.published_at,
+    matchedKeywords: s.hits,
   }));
 }

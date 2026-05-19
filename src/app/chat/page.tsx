@@ -16,7 +16,6 @@ import {
   Check,
   PlaySquare,
   Paperclip,
-  Activity,
   ImagePlus,
   AlertCircle,
   ChevronRight,
@@ -75,61 +74,53 @@ type Message = {
   thinking?: string;
 };
 
-type ToolGroup = "ideation" | "my_channel" | "studio_analytics";
 type IntegrationsStatus = Record<
   "claude" | "youtube" | "exa" | "apify" | "google_gemini",
   { hasKey: boolean } | undefined
 >;
 
 const PROVIDER_PREF_KEY = "yt-channel-ai:chat-provider";
+const CHAT_MODE_KEY = "yt-channel-ai:chat-mode";
+
+// T1 mode picker — three modes drive WHAT the agent does on the turn.
+// See chat-tools.ts ChatMode for the full semantics; this UI just sets
+// the body.mode field on POST /api/chat. Default is "ideate".
+type ChatMode = "ideate" | "research" | "validate";
+const CHAT_MODES: {
+  key: ChatMode;
+  emoji: string;
+  label: string;
+  description: string;
+}[] = [
+  {
+    key: "ideate",
+    emoji: "💡",
+    label: "Ideate",
+    description: "10 fresh ideas grounded in your outliers + own-channel winners.",
+  },
+  {
+    key: "research",
+    emoji: "🔬",
+    label: "Research",
+    description: "Deep dive — outlier WHY analysis + 10 ideas + web search when local data is thin.",
+  },
+  {
+    key: "validate",
+    emoji: "✓",
+    label: "Validate",
+    description: "Go/no-go check on a topic. No new ideas — cross-channel evidence + own-catalog status + verdict.",
+  },
+];
 
 // Starter prompts shown above the input when a session is empty. Click
 // fills the input; the user can edit before sending. Tuned for the new
-// pruned tool surface (ideation engine + own-channel introspection).
+// mode picker — first three map to Ideate/Research/Validate flows.
 const STARTER_PROMPTS = [
   "Give me 5 video ideas from my current outliers",
   "Why did the top outlier in my niche perform so well?",
+  "Validate this topic: voyager probes hitting interstellar weather",
   "What are my audience's top complaints about my last video?",
-  "Free-form: give me 5 fresh title ideas, no format templates",
 ] as const;
-
-// Tool-picker rows. Three groups only (post-prune); each row gets a
-// 1-line tooltip + a toggle. Full descriptions are NOT rendered in the
-// picker — the Tool.description fields shipped to the SDK are the
-// authoritative spec; this UI just controls availability.
-const TOOL_GROUPS: {
-  key: ToolGroup;
-  label: string;
-  tooltip: string;
-  toolCount: number;
-  requires: "youtube" | "exa" | "apify" | "oauth" | null;
-  icon: React.ComponentType<{ className?: string }>;
-}[] = [
-  {
-    key: "ideation",
-    label: "Ideation",
-    tooltip: "Outliers, formats, idea composition, channel memory",
-    toolCount: 10,
-    requires: null,
-    icon: Sparkles,
-  },
-  {
-    key: "my_channel",
-    label: "My Channel",
-    tooltip: "Videos, transcripts, comments — local DB only",
-    toolCount: 4,
-    requires: null,
-    icon: PlaySquare,
-  },
-  {
-    key: "studio_analytics",
-    label: "Studio Analytics",
-    tooltip: "Live Studio metrics (OAuth required) — retention, audience, revenue",
-    toolCount: 4,
-    requires: "oauth",
-    icon: Activity,
-  },
-];
 
 /**
  * Top-level wrapper that satisfies Next 16's strict prerender requirement
@@ -158,8 +149,10 @@ function ChatPageInner() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
-  const [showToolMenu, setShowToolMenu] = useState(false);
-  const [activeTools, setActiveTools] = useState<Set<ToolGroup>>(new Set());
+  // T1 mode picker — drives WHICH tools and system prompt the agent
+  // uses on each turn. Persisted in localStorage so the user's pick
+  // survives reloads.
+  const [activeMode, setActiveMode] = useState<ChatMode>("ideate");
   // T4 — Agent Brain panel. Right-side collapsible drawer rendering the
   // active channel's description + ideation rules + memory. localStorage
   // persists open/closed per device. The panel's content lifts directly
@@ -191,27 +184,24 @@ function ChatPageInner() {
   const [sessionPending, setSessionPending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  // Refs used by the click-outside handler for the tool menu. The toggle
-  // button has its own ref so a click on it isn't treated as "outside" —
-  // otherwise the same click would close+reopen the menu instantly.
-  const toolMenuRef = useRef<HTMLDivElement>(null);
-  const toolToggleRef = useRef<HTMLButtonElement>(null);
-
-  // Close the tool menu when the user clicks anywhere outside of it.
+  // Hydrate the saved mode pick once on mount.
   useEffect(() => {
-    if (!showToolMenu) return;
-    const handler = (e: MouseEvent) => {
-      const target = e.target as Node;
-      if (toolMenuRef.current?.contains(target)) return; // click inside menu
-      if (toolToggleRef.current?.contains(target)) return; // click on the + toggle
-      setShowToolMenu(false);
-    };
-    // mousedown so we close before the click event fires elsewhere — feels
-    // snappier than waiting for click and avoids double-events on items
-    // that themselves listen for clicks.
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [showToolMenu]);
+    try {
+      const saved = window.localStorage.getItem(CHAT_MODE_KEY);
+      if (saved === "ideate" || saved === "research" || saved === "validate") {
+        setActiveMode(saved as ChatMode);
+      }
+    } catch {
+      /* swallow */
+    }
+  }, []);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(CHAT_MODE_KEY, activeMode);
+    } catch {
+      /* swallow */
+    }
+  }, [activeMode]);
 
   // Hydrate the saved provider pick once on mount. Wrapped in try/catch
   // because some Safari/private-mode sessions throw on localStorage access.
@@ -364,35 +354,10 @@ function ChatPageInner() {
         const ints = d.integrations ?? null;
         setIntegrations(ints);
         // Auto-enable every tool group whose required integration is set up.
-        // Without this the AI starts blind — questions like "analyse my
-        // comments" returned generic answers because Sonnet didn't even know
-        // the comment tools existed in the conversation. User can still
-        // disable individual groups via the "+" menu, and we don't override
-        // their choice if they've already toggled anything this page-load.
-        setActiveTools((prev) => {
-          // Strip any legacy group names from prior schema versions
-          // (youtube/analytics/exa/apify/research/strategy/yt_analytics).
-          // localStorage may still hold them on returning users.
-          const validKeys = new Set<ToolGroup>([
-            "ideation",
-            "my_channel",
-            "studio_analytics",
-          ]);
-          const cleaned = new Set<ToolGroup>();
-          for (const k of prev) {
-            if (validKeys.has(k as ToolGroup)) cleaned.add(k as ToolGroup);
-          }
-          if (cleaned.size > 0) return cleaned;
-          // First-load defaults: Ideation + My Channel always on (no
-          // external dep). Studio Analytics surfaces a clear "not
-          // connected" if OAuth is missing — leave it ON by default so
-          // HAmo sees the path to connect it.
-          const defaults = new Set<ToolGroup>();
-          defaults.add("ideation");
-          defaults.add("my_channel");
-          defaults.add("studio_analytics");
-          return defaults;
-        });
+        // Tool exposure is now mode-driven (see ChatMode picker). The
+        // server defaults all three legacy groups on and the mode
+        // whitelist narrows from there — no per-group toggle state on
+        // the client.
       })
       .catch(() => setIntegrations({} as IntegrationsStatus));
     refreshSessions();
@@ -562,7 +527,7 @@ function ChatPageInner() {
         body: JSON.stringify({
           sessionId,
           content,
-          tools: Array.from(activeTools),
+          mode: activeMode,
           attachments: sentAttachments.map((a) =>
             a.type === "image"
               ? { type: "image", data: a.data, mediaType: a.mediaType }
@@ -701,7 +666,7 @@ function ChatPageInner() {
     } finally {
       setSending(false);
     }
-  }, [input, sending, hasKey, activeId, refreshSessions, activeTools, attachments, provider]);
+  }, [input, sending, hasKey, activeId, refreshSessions, activeMode, attachments, provider]);
 
   // Maximum bytes per uploaded image. 5 MB matches Anthropic's per-image
   // limit on the messages API (Gemini's is higher but enforcing the lower
@@ -758,15 +723,6 @@ function ChatPageInner() {
       },
     ]);
   }, []);
-
-  const toggleTool = (key: ToolGroup) => {
-    setActiveTools((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -962,45 +918,40 @@ function ChatPageInner() {
                 ))}
               </div>
             )}
-            {showToolMenu && (
-              <div
-                ref={toolMenuRef}
-                className="absolute bottom-full left-0 mb-2 w-64 rounded-lg border border-border bg-popover p-1 shadow-lg"
-                data-testid="chat-tool-picker"
-              >
-                {TOOL_GROUPS.map((g) => {
-                  // Studio Analytics is the only group that requires
-                  // OAuth — surfacing a 'Connect' link instead of a toggle
-                  // when not connected guides the user to /integrations.
-                  // The toggle stays enabled regardless because the agent
-                  // tool returns a clear "not connected" error too.
-                  const active = activeTools.has(g.key);
-                  const Icon = g.icon;
-                  return (
-                    <div
-                      key={g.key}
-                      title={`${g.tooltip} — ${g.toolCount} tools`}
-                      className="flex items-center justify-between rounded-md px-3 py-2.5 hover:bg-accent"
-                    >
-                      <div className="flex items-center gap-2.5">
-                        <Icon className="h-4 w-4 text-muted-foreground" />
-                        <span className="text-sm font-medium">{g.label}</span>
-                      </div>
-                      <ToggleSwitch
-                        checked={active}
-                        onChange={() => toggleTool(g.key)}
-                        ariaLabel={`Toggle ${g.label}`}
-                      />
-                    </div>
-                  );
-                })}
-                <div className="mt-0.5 border-t border-border px-3 py-1.5 text-[10px] text-muted-foreground">
-                  <Link href="/integrations" className="hover:text-foreground">
-                    Manage integrations →
-                  </Link>
-                </div>
-              </div>
-            )}
+            {/* T1: Mode picker — three pill buttons pinned above the
+                composer. Active mode persists in localStorage. The
+                selected mode determines which tools the agent sees +
+                which system-prompt block injects on each turn. */}
+            <div
+              className="mb-2 flex items-center gap-2"
+              data-testid="chat-mode-picker"
+            >
+              {CHAT_MODES.map((m) => {
+                const active = activeMode === m.key;
+                return (
+                  <button
+                    key={m.key}
+                    type="button"
+                    onClick={() => setActiveMode(m.key)}
+                    title={m.description}
+                    aria-pressed={active}
+                    data-mode={m.key}
+                    className={cn(
+                      "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                      active
+                        ? "border-primary bg-primary text-primary-foreground"
+                        : "border-border bg-muted/40 text-muted-foreground hover:bg-accent hover:text-foreground"
+                    )}
+                  >
+                    <span>{m.emoji}</span>
+                    <span>{m.label}</span>
+                  </button>
+                );
+              })}
+              <span className="ml-2 text-[10px] text-muted-foreground">
+                Mode determines what tools and context the agent uses.
+              </span>
+            </div>
 
             {imageError && (
               <div className="mb-2 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
@@ -1023,23 +974,6 @@ function ChatPageInner() {
                 </div>
               )}
               <div className="flex items-end gap-2">
-                <Button
-                  ref={toolToggleRef}
-                  type="button"
-                  size="icon"
-                  variant={activeTools.size > 0 ? "default" : "ghost"}
-                  className="h-8 w-8 shrink-0 relative"
-                  onClick={() => setShowToolMenu((s) => !s)}
-                  aria-label="Add tools"
-                  title={t.chat.tools}
-                >
-                  <Plus className="h-4 w-4" />
-                  {activeTools.size > 0 && (
-                    <span className="absolute -right-1 -top-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-primary px-1 text-[10px] font-medium text-primary-foreground">
-                      {activeTools.size}
-                    </span>
-                  )}
-                </Button>
                 <Button
                   type="button"
                   size="icon"
@@ -1429,42 +1363,6 @@ function UntaggedSection({
         </ul>
       )}
     </div>
-  );
-}
-
-/**
- * Inline toggle switch styled like a shadcn Switch. Avoids dragging in a
- * Radix dep for one component used in two places (tool picker, future
- * settings). Click flips checked → onChange fires the boolean.
- */
-function ToggleSwitch({
-  checked,
-  onChange,
-  ariaLabel,
-}: {
-  checked: boolean;
-  onChange: () => void;
-  ariaLabel: string;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={ariaLabel}
-      onClick={onChange}
-      className={cn(
-        "relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors",
-        checked ? "bg-primary" : "bg-muted-foreground/30"
-      )}
-    >
-      <span
-        className={cn(
-          "inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform",
-          checked ? "translate-x-4" : "translate-x-0.5"
-        )}
-      />
-    </button>
   );
 }
 

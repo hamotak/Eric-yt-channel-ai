@@ -1386,6 +1386,95 @@ export function listVideos(opts: { limit?: number; search?: string } = {}): Vide
     .all(...args) as Video[];
 }
 
+/**
+ * T4 — "list_my_winners" chat tool source. Top-N own-channel videos
+ * within a window, ranked by multiplier (views/own-channel median) DESC.
+ * Used by the Research/Ideate modes so the agent can ground every
+ * recommendation in the user's own historical evidence — "you tried X
+ * before and it hit hard / underperformed".
+ *
+ * Median computed inline so the SQL stays self-contained; validate-idea
+ * exports the same helper for the per-idea catalog-comparison block
+ * (T5).
+ */
+export type MyWinnerRow = {
+  videoId: string;
+  title: string;
+  thumbnailUrl: string | null;
+  views: number;
+  channelMedian: number;
+  multiplier: number;
+  publishedAt: number | null;
+  likes: number;
+  comments: number;
+};
+
+export function listMyWinners(
+  channelId: string,
+  opts: { limit?: number; lookbackDays?: number; minMultiplier?: number } = {}
+): MyWinnerRow[] {
+  const limit = Math.max(1, Math.min(100, opts.limit ?? 20));
+  const lookbackDays = Math.max(7, Math.min(3650, opts.lookbackDays ?? 365));
+  const minMult = Math.max(0, opts.minMultiplier ?? 1.5);
+
+  const medianRow = db
+    .prepare(
+      `WITH ordered AS (
+         SELECT views,
+                ROW_NUMBER() OVER (ORDER BY views) AS rn,
+                COUNT(*)     OVER ()              AS cnt
+         FROM videos
+         WHERE channel_id = ?
+           AND views > 0
+       )
+       SELECT AVG(views) AS median
+       FROM ordered
+       WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2)`
+    )
+    .get(channelId) as { median: number | null } | undefined;
+  const median = Math.round(medianRow?.median ?? 0);
+  if (median === 0) return [];
+
+  const rows = db
+    .prepare(
+      `SELECT id, title, thumbnail_url,
+              COALESCE(views, 0) AS views,
+              COALESCE(likes, 0) AS likes,
+              COALESCE(comments, 0) AS comments,
+              published_at,
+              (COALESCE(views, 0) * 1.0 / ?) AS multiplier
+       FROM videos
+       WHERE channel_id = ?
+         AND published_at IS NOT NULL
+         AND published_at >= strftime('%s','now') - ? * 86400
+         AND views > ? * ?
+       ORDER BY multiplier DESC, views DESC
+       LIMIT ?`
+    )
+    .all(median, channelId, lookbackDays, minMult, median, limit) as Array<{
+    id: string;
+    title: string;
+    thumbnail_url: string | null;
+    views: number;
+    likes: number;
+    comments: number;
+    published_at: number | null;
+    multiplier: number;
+  }>;
+
+  return rows.map((r) => ({
+    videoId: r.id,
+    title: r.title,
+    thumbnailUrl: r.thumbnail_url,
+    views: r.views,
+    channelMedian: median,
+    multiplier: Number(r.multiplier.toFixed(2)),
+    publishedAt: r.published_at,
+    likes: r.likes,
+    comments: r.comments,
+  }));
+}
+
 export type VideoSort = "recent" | "oldest" | "views" | "likes" | "comments" | "engagement";
 export type DurationFilter = "all" | "short" | "long";
 
@@ -4868,6 +4957,10 @@ export type OutlierRow = {
   // field per DEF-I1 (Late Science was tracked as its own competitor
   // and surfaced its own videos as "inspiration").
   competitorChannelId: string | null;
+  // T4: surfaced so the agent can render "Channel (N subs)" inline
+  // without a second tool call. Pulled from the competitors row via
+  // JOIN in outliersForUserChannel.
+  competitorSubscriberCount: number | null;
   tier: string;
   multiplier: number;
   channelMedian: number;
@@ -4917,10 +5010,11 @@ export function outliersForUserChannel(opts: {
            cv.video_id, cv.title, cv.thumbnail_url, cv.views,
            cv.published_at, cv.duration_seconds,
            cv.competitor_id,
-           c.title       AS competitor_title,
-           c.handle      AS competitor_handle,
-           c.avatar_url  AS competitor_avatar,
-           c.channel_id  AS competitor_channel_id,
+           c.title              AS competitor_title,
+           c.handle             AS competitor_handle,
+           c.avatar_url         AS competitor_avatar,
+           c.channel_id         AS competitor_channel_id,
+           c.subscriber_count   AS competitor_subscriber_count,
            c.tier,
            c.user_channel_id,
            ROW_NUMBER() OVER (PARTITION BY cv.competitor_id ORDER BY cv.views) AS rn,
@@ -4948,7 +5042,8 @@ export function outliersForUserChannel(opts: {
          v.video_id, v.title, v.thumbnail_url, v.views,
          v.published_at, v.duration_seconds,
          v.competitor_id, v.competitor_title, v.competitor_handle,
-         v.competitor_avatar, v.competitor_channel_id, v.tier,
+         v.competitor_avatar, v.competitor_channel_id,
+         v.competitor_subscriber_count, v.tier,
          CAST(m.median_views AS INTEGER)   AS channel_median,
          (v.views * 1.0 / m.median_views)  AS multiplier
        FROM scoped_videos v
@@ -4981,6 +5076,7 @@ export function outliersForUserChannel(opts: {
     competitor_handle: string | null;
     competitor_avatar: string | null;
     competitor_channel_id: string | null;
+    competitor_subscriber_count: number | null;
     tier: string;
     channel_median: number;
     multiplier: number;
@@ -5044,6 +5140,7 @@ export function outliersForUserChannel(opts: {
       competitorHandle: r.competitor_handle,
       competitorAvatar: r.competitor_avatar,
       competitorChannelId: r.competitor_channel_id,
+      competitorSubscriberCount: r.competitor_subscriber_count,
       tier: r.tier,
       multiplier: Number(r.multiplier.toFixed(2)),
       channelMedian: r.channel_median,

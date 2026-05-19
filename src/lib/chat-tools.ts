@@ -11,6 +11,7 @@ import {
   listAllChannels,
   listChannelMemory,
   listCompetitorAlerts,
+  listMyWinners,
   listVideos,
   resolveChannelDescription,
   searchComments,
@@ -45,6 +46,44 @@ import { log } from "./logger";
  */
 export type ToolGroup = "ideation" | "my_channel" | "studio_analytics";
 
+/**
+ * Chat mode — drives WHICH tools are exposed + the system-prompt block.
+ * The 3-button picker in /chat/page.tsx maps directly to these values.
+ *
+ *   ideate    — default. Lean tool set, fast turn (~$0.10).
+ *   research  — wider tool set, deeper system prompt, more thinking budget (~$0.25).
+ *   validate  — go/no-go check for a specific topic. No compose call (~$0.05).
+ */
+export type ChatMode = "ideate" | "research" | "validate";
+
+/** Tool names exposed per mode. Anything not in the list is filtered out
+ *  before the agent's tool registration step — the model can't even see
+ *  the tool, so it can't try to call it. */
+const MODE_TOOL_WHITELIST: Record<ChatMode, ReadonlySet<string>> = {
+  ideate: new Set([
+    "list_outliers",
+    "list_my_videos",
+    "list_my_winners",
+    "generate_ideas",
+  ]),
+  research: new Set([
+    "list_outliers",
+    "list_my_videos",
+    "list_my_winners",
+    "list_format_patterns",
+    "validate_idea",
+    "explain_outlier",
+    "web_search",
+    "generate_ideas",
+  ]),
+  validate: new Set([
+    "validate_idea",
+    "list_my_videos",
+    "list_outliers",
+    "web_search",
+  ]),
+};
+
 type Tool = Anthropic.Tool;
 type ToolInput = Record<string, unknown>;
 
@@ -78,6 +117,23 @@ const MY_CHANNEL_TOOLS: Tool[] = [
       properties: {
         search: { type: "string" },
         limit: { type: "number", default: 50, maximum: 200 },
+      },
+    },
+  },
+  {
+    name: "list_my_winners",
+    description:
+      "Top own-channel videos ranked by multiplier (views / own-channel median) DESC within a lookback window. Use to answer \"what has actually worked on this channel\" — every recommendation should be grounded in real own-history evidence. Returns: { winners: [{ videoId, title, thumbnailUrl, views, channelMedian, multiplier, performanceBand, publishedAt, likes, comments }] }. Multiplier is computed against the channel's all-time median, so a 5× row is genuinely a top performer for THIS channel, not a relative-window artefact.",
+    input_schema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", default: 20, maximum: 100 },
+        lookbackDays: { type: "number", default: 365, minimum: 7, maximum: 3650 },
+        minMultiplier: {
+          type: "number",
+          default: 1.5,
+          description: "Floor for inclusion. ≥1.5 by default (the alert generation floor); pass higher (3, 5) when the user wants only big wins.",
+        },
       },
     },
   },
@@ -241,45 +297,71 @@ const IDEATION_TOOLS: Tool[] = [
   {
     name: "generate_ideas",
     description: [
-      "Compose up to 10 new YouTube video ideas. OUTLIERS-PRIMARY pipeline: server pulls top 30 competitor outliers ≥1.5× channel median in last 28d (PRIMARY inspiration) + top 5 trending formats (OPTIONAL remix templates, may be empty). Claude composes 1 idea per outlier; ~40% remix with a format (sourceFormat set), ~60% are free-form (sourceFormat null). Pass mode:\"free-form\" to force every idea to sourceFormat:null. Server drops via: length 50-80, banned words (op rule 13), per-channel banned_topics, topic-frequency (≥1 in last 20 own uploads), originality (≤45% overlap), topic-cluster dedup, NO-ANCHOR (no trending format AND <2 cross-channel topic siblings at ≥3× — both anchors missing = drop). Drops returned in `dropped[]`.",
+      "Compose up to 10 new YouTube video ideas. OUTLIERS-PRIMARY pipeline: server pulls top 30 competitor outliers ≥1.5× channel median in last 28d (PRIMARY inspiration) + top 5 trending formats (OPTIONAL remix templates, may be empty). Claude composes 1 idea per outlier; ~40% remix with a format, ~60% are free-form. Pass mode:\"free-form\" to force sourceFormat:null on every idea. Server drops via: length 50-80, banned words (op rule 13), banned_topics, topic-frequency (≥1 in last 20 own uploads), originality (≤45% overlap), topic-cluster dedup, NO-ANCHOR (no trending format AND <2 cross-channel topic siblings at ≥3×).",
       "",
-      "Each surviving idea has: sourceFormat ({id,template,risingRate,exampleCount}) | null, sourceTopicOutliers (1-3 with multiplier+thumbnailUrl+performanceBand+competitorTitle/Handle), topicSimilarOutliers (1-3 cross-channel topic siblings — guaranteed ≥1 when sourceFormat is null, since the anchor rule requires at least one anchor), topicLabel, proposedTitle, angle, confidence, validation, titleLengthBand. Top-level also returns bannedTopics:string[].",
+      "Each surviving idea has the full forensic evidence pack:",
+      "  - sourceFormat: { id, template, risingRate, exampleCount } | null",
+      "  - sourceTopicOutliers: [{ videoId, title, views, channelMedian, multiplier, thumbnailUrl, publishedAt, competitorTitle, competitorHandle, competitorSubscriberCount, performanceBand }]",
+      "  - topicSimilarOutliers: same forensic shape — 0-3 cross-channel siblings (server guarantees ≥1 when sourceFormat is null)",
+      "  - ownCatalogMatches: [{ videoId, title, views, channelMedian, multiplier, performanceBand, publishedAt, matchedKeywords }] — 0-3 of the USER's videos that share content nouns with the topic. Empty → fresh territory.",
+      "  - validation, topicLabel, proposedTitle, angle, confidence, titleLengthBand.",
       "",
       "## OUTPUT FORMAT (MANDATORY when you present ideas in chat)",
-      "Open with a pre-ideation research block, then list each idea in this exact terse markdown structure, then close with a one-sentence Next step. NO prose paragraphs anywhere. NO 'Why this format works'. NO levers row.",
+      "Open with the pre-ideation research block, then list each idea in the FORENSIC structure below, then close with a one-sentence Next step. NO prose paragraphs anywhere. Every reference to an outlier MUST carry full verifiable evidence — never naked multipliers, never relative-only dates.",
       "",
-      "Pre-ideation research block (output FIRST):",
+      "### Pre-ideation research block (output FIRST)",
       "**Pattern research (last 14d):**",
-      "- Top viral formats (last 14d): {3-5 format templates with example counts and avg multipliers — pull from list_format_patterns. Plain text, ≤10 words each.}",
-      "- Top viral topics (last 14d): {3-5 topic themes ranked by cross-channel signal — count of distinct competitors winning with the topic × max multiplier. Pull from list_outliers grouped by topic. ≤8 words each.}",
-      "- Not working: {topics with ≥2 underperformers in last 20 own uploads — pull from validate_idea matchedVideos where performanceBand='underperformed', ≤8 words each}",
-      "- Skipped: {banned topics from bannedTopics + drops from dropped[] where reason='topic_overused' or reason='no_anchor'. Cite term + count.}",
-      "Rules: bullets only, ≤5 items per group. OMIT a line if its group is empty — never print 'Top viral formats: (none)'.",
+      "- Top viral formats (last 14d): {3-5 format templates with example counts + avg multipliers from list_format_patterns. Plain text, ≤10 words each.}",
+      "- Top viral topics (last 14d): {3-5 topic themes — count of distinct competitors winning the topic × max multiplier from list_outliers. ≤8 words each.}",
+      "- Not working: {topics with ≥2 underperformers in last 20 own uploads from validate_idea/list_my_winners. ≤8 words each.}",
+      "- Skipped: {banned topics + drops from result.dropped where reason='topic_overused' or 'no_anchor'. Cite term + count.}",
+      "Rules: bullets only, ≤5 items per group, OMIT empty groups.",
       "",
-      "Then each numbered idea — EXACTLY this markdown shape:",
+      "### Then each numbered idea — EXACTLY this markdown shape",
       "### {n}. {proposedTitle}",
       "",
-      "[![]({sourceOutlier.thumbnailUrl})](https://www.youtube.com/watch?v={sourceOutlier.videoId}) **Inspired by:** [{sourceOutlier.competitorTitle} — {sourceOutlier.title}](https://www.youtube.com/watch?v={sourceOutlier.videoId}) · {performanceBand} ({multiplier}×)",
+      "[![]({sourceOutlier.thumbnailUrl})](https://www.youtube.com/watch?v={sourceOutlier.videoId})",
       "",
-      "**Same topic across competitors:** (REQUIRED when sourceFormat is null — show 1-2 entries; the server guarantees ≥1 in that case)",
-      "- [![](thumbnail)](url) [competitorTitle — title](url) · performanceBand (multiplier×)",
-      "(If sourceFormat is set AND topicSimilarOutliers is empty, OMIT this entire block — the format anchor carries the proof. If sourceFormat is set AND topicSimilarOutliers ≥1, show up to 2 entries.)",
+      "**Source outlier evidence:**",
+      "- Title: [{sourceOutlier.title}](https://www.youtube.com/watch?v={sourceOutlier.videoId})",
+      "- Channel: {sourceOutlier.competitorTitle} ({sourceOutlier.competitorSubscriberCount.toLocaleString()} subs)",
+      "- Views: {sourceOutlier.views.toLocaleString()}",
+      "- Uploaded: {format sourceOutlier.publishedAt as \"Mar 14, 2026 (12d ago)\" — ABSOLUTE date first, relative in parens}",
+      "- Multiplier: {sourceOutlier.multiplier}× this channel's median of {sourceOutlier.channelMedian.toLocaleString()} views",
+      "- Performance band: {performanceBand}",
       "",
-      "**Format:** `{template}` · rising {risingRate} (OMIT this entire line when sourceFormat is null)",
+      "**Your catalog comparison:**",
+      "{if ownCatalogMatches is non-empty: render up to 3 as a bullet list. EACH bullet:",
+      "  - [{match.title}](https://www.youtube.com/watch?v={match.videoId}) — {match.views.toLocaleString()} views ({match.multiplier}× your median of {match.channelMedian.toLocaleString()}), {performanceBand}, uploaded {format match.publishedAt as \"Mar 14, 2026 (45d ago)\"}}",
+      "{if ownCatalogMatches is empty: \"Fresh territory — no matching video in your last 12 months.\"}",
+      "",
+      "**Anchor proof:**",
+      "{if sourceFormat is set: \"Format `{template}` — proven across {sourceFormat.exampleCount} videos, rising {sourceFormat.risingRate}×.\"}",
+      "{if topicSimilarOutliers.length ≥ 2: list top 2 as bullets. EACH bullet:",
+      "  - [{sim.title}](https://www.youtube.com/watch?v={sim.videoId}) · {sim.competitorTitle} ({sim.competitorSubscriberCount.toLocaleString()} subs) · {sim.views.toLocaleString()} views ({sim.multiplier}× their median of {sim.channelMedian.toLocaleString()}), uploaded {sim.publishedAt formatted}}",
+      "{if sourceFormat IS set AND topicSimilarOutliers.length === 0: omit the topic sub-block — the format proves the anchor on its own.}",
+      "{if sourceFormat is NULL: topicSimilarOutliers is GUARANTEED ≥1 by the server, so the topic sub-block always renders.}",
       "",
       "{catalogEmoji} {catalogVerdictShort}",
       "",
       "---",
       "",
-      "Hard rules:",
-      "- Either Format: or Same topic: must be present for every idea — at least one anchor is required. Both is ideal. The server enforces this with the NO-ANCHOR drop gate; you should never see an idea here that's missing both.",
-      "- If a format is flagged is_single_channel (author-pattern, not cross-channel), prefix the format line with '(author pattern) ' so the user understands it's a softer signal than a true trend.",
-      "- Never print '(none)' — if topicSimilarOutliers is empty for a format-anchored idea, omit the entire 'Same topic' block.",
+      "### Hard rules (forensic-grade — server-verified)",
+      "- NO multipliers without median context. \"52×\" alone is meaningless. ALWAYS write it as \"52× (224K views vs channel median of 4K)\" or equivalent.",
+      "- NO relative-only dates. ALWAYS \"Mar 14, 2026 (12d ago)\" — absolute date first, relative in parentheses.",
+      "- NO channel name without subscriber count. \"@latescience\" alone is not enough; \"Late Science (116K subs)\".",
+      "- If any field is missing from the tool response (null/undefined), render \"(unknown)\" literally — NEVER fabricate.",
+      "- If a format is flagged is_single_channel (author-pattern, not cross-channel), prefix the Format line with \"(author pattern) \" so the user sees the softer signal.",
+      "- Either the Format line OR ≥2 topicSimilarOutliers must anchor every idea. Server enforces this — you should never see an unanchored idea.",
+      "- Catalog comparison block is REQUIRED on every idea: render either the bullet list OR the \"Fresh territory\" line. Never omit.",
       "",
-      "catalogEmoji + catalogVerdictShort map from validation.verdict:",
-      "  fresh → ✅ Fresh territory  |  covered_old → ⚠️ Touched 60-90d ago, none since",
-      "  covered_recently → 🛑 Covered recently, would compete  |  covered_underperformed → 🟠 Recent flop — fresh angle needed",
+      "### Verdict map (validation.verdict → emoji + short copy)",
+      "  fresh → ✅ Fresh territory",
+      "  covered_old → ⚠️ Touched 60-90d ago, none since",
+      "  covered_recently → 🛑 Covered recently, would compete",
+      "  covered_underperformed → 🟠 Recent flop — fresh angle needed",
       "",
+      "### Closing",
       "After ALL ideas: **Next step this week:** {one sentence — pick ONE idea and why}. One sentence. No follow-up paragraph.",
       "Elaborate ONLY when the user explicitly asks ('why this format' / 'explain idea N' / 'tell me more'). Default = terse.",
       "Never strip the structure to save tokens.",
@@ -449,13 +531,27 @@ const IDEATION_TOOLS: Tool[] = [
   },
 ];
 
-export function getToolsFor(groups: ToolGroup[]): Tool[] {
+/**
+ * Tool selection is two-step:
+ *   1. Group selector (legacy — chat-history sessions still pass tools:[]).
+ *   2. Mode whitelist (T2 redesign — the agent's per-mode tool surface).
+ *
+ * For new chats, the mode whitelist is authoritative; groups can default
+ * to every group (`["ideation","my_channel","studio_analytics"]`) and the
+ * mode filter narrows down to the per-mode subset.
+ *
+ * For old chats without a mode, the absence of `mode` collapses to
+ * `"ideate"` (the default) so the conversation keeps working.
+ */
+export function getToolsFor(groups: ToolGroup[], mode?: ChatMode): Tool[] {
   const set = new Set(groups);
-  const tools: Tool[] = [];
-  if (set.has("ideation")) tools.push(...IDEATION_TOOLS);
-  if (set.has("my_channel")) tools.push(...MY_CHANNEL_TOOLS);
-  if (set.has("studio_analytics")) tools.push(...STUDIO_ANALYTICS_TOOLS);
-  return tools;
+  const all: Tool[] = [];
+  if (set.has("ideation")) all.push(...IDEATION_TOOLS);
+  if (set.has("my_channel")) all.push(...MY_CHANNEL_TOOLS);
+  if (set.has("studio_analytics")) all.push(...STUDIO_ANALYTICS_TOOLS);
+  if (!mode) return all;
+  const whitelist = MODE_TOOL_WHITELIST[mode];
+  return all.filter((t) => whitelist.has(t.name));
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +583,55 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
             duration: v.duration_seconds,
             publishedAt: v.published_at,
           })),
+        };
+      }
+      case "list_my_winners": {
+        const activeId = getActiveChannelId();
+        if (!activeId) {
+          return {
+            ok: false,
+            error:
+              "No active channel — set one from the top-right channel picker before listing winners.",
+          };
+        }
+        const limit = Math.min(100, Math.max(1, Number(input.limit) || 20));
+        const lookbackDays = Math.min(
+          3650,
+          Math.max(7, Number(input.lookbackDays) || 365)
+        );
+        const minMultiplier =
+          typeof input.minMultiplier === "number" &&
+          Number.isFinite(input.minMultiplier)
+            ? Math.max(0, input.minMultiplier)
+            : 1.5;
+        const winners = listMyWinners(activeId, {
+          limit,
+          lookbackDays,
+          minMultiplier,
+        });
+        const { performanceBandFor } = await import("./validate-idea");
+        return {
+          ok: true,
+          data: {
+            winners: winners.map((w) => ({
+              videoId: w.videoId,
+              title: w.title,
+              thumbnailUrl:
+                w.thumbnailUrl ??
+                `https://i.ytimg.com/vi/${w.videoId}/mqdefault.jpg`,
+              youtubeUrl: `https://www.youtube.com/watch?v=${w.videoId}`,
+              views: w.views,
+              channelMedian: w.channelMedian,
+              multiplier: w.multiplier,
+              performanceBand: performanceBandFor(w.multiplier),
+              publishedAt: w.publishedAt,
+              likes: w.likes,
+              comments: w.comments,
+            })),
+            channelMedianUsed: winners[0]?.channelMedian ?? null,
+            lookbackDays,
+            minMultiplier,
+          },
         };
       }
       case "search_my_transcripts": {
@@ -1120,8 +1265,9 @@ let promptSizeDiagLogged = false;
 
 export function buildSystemPrompt(
   activeGroups: ToolGroup[],
-  opts: { advisorEnabled?: boolean } = {}
+  opts: { advisorEnabled?: boolean; mode?: ChatMode } = {}
 ): string {
+  const mode: ChatMode = opts.mode ?? "ideate";
   const channel = getChannel();
   const bound = getSetting("youtube.channelId");
   const allChannels = listAllChannels();
@@ -1260,6 +1406,57 @@ export function buildSystemPrompt(
     "15. When generating ideas and viral_topic candidates from list_outliers are sparse (fewer than 5 topics with ≥3× multiplier in last 14d), call web_search with the channel's niche + 'trending this week' to surface fresh angles. Compose ideas blending those web-sourced topics with the trending formats from list_format_patterns. ALWAYS cite source URLs in the reply when a web result drives a title."
   );
 
+  // Per-mode addendum — drives WHAT the turn produces (ideas vs deep-dives
+  // vs verdict) and how much thinking the agent invests.
+  if (mode === "research") {
+    lines.push(
+      "",
+      "## RESEARCH MODE (active)",
+      "The user wants you to think harder. Surface the WHY behind viral patterns, not just the WHAT. Use web_search if local data is thin (op rule 15). Compare findings against the user's catalog via list_my_winners + validate_idea + ownCatalogMatches on every idea.",
+      "",
+      "Output structure for Research:",
+      "1. Pre-ideation research block (Pattern research — same as Ideate).",
+      "2. **Outlier deep-dives (≥5):** For 5 of the strongest cross-channel outliers (from list_outliers + explain_outlier), output a short H3 each:",
+      "   ### Why \"{outlier.title}\" hit ({outlier.multiplier}× — {views} vs median {channelMedian})",
+      "   - Channel: {competitorTitle} ({competitorSubscriberCount.toLocaleString()} subs), uploaded {publishedAt absolute + relative}",
+      "   - Levers (§9): {2-3 from explain_outlier}",
+      "   - Why it worked: {1-2 sentences grounded in the levers}",
+      "   - Your channel comparison: {findOwnCatalogTopicMatches result or \"Fresh territory\"}",
+      "3. Then the 10 ideas in the FORENSIC format from the generate_ideas tool description.",
+      "4. Next step this week: one sentence."
+    );
+  } else if (mode === "validate") {
+    lines.push(
+      "",
+      "## VALIDATE MODE (active)",
+      "The user has a topic in mind. They want a go/no-go. DO NOT call generate_ideas. DO NOT compose new titles. Use validate_idea + list_outliers + list_my_videos (+ web_search if needed).",
+      "",
+      "Output structure for Validate:",
+      "**Topic:** {echo the topic verbatim}",
+      "",
+      "**Cross-channel evidence (last 60d):**",
+      "{call list_outliers, filter by topic match. If ≥2 distinct competitors hit ≥3×, list them with full forensic evidence per the generate_ideas spec (title link, channel + subs, views vs median, uploaded absolute date). If <2, say so explicitly: \"Only N competitor(s) have hit this topic ≥3× in 60d.\"}",
+      "",
+      "**Own-catalog status (last 12mo):**",
+      "{call validate_idea (or findOwnCatalogTopicMatches via the agent path: ask list_my_videos with the topic keywords). If matches exist, list 1-3 with views + multiplier + absolute date + performanceBand. If no matches, say \"Fresh — you haven't shipped this topic.\" If 1-2 underperformers, flag \"Tried, didn't work — needs a fresh angle.\"}",
+      "",
+      "**Recency signal:**",
+      "{is the topic still trending? Pull the most-recent outlier match date. If >30d ago, flag as \"cooling\". If ≤14d, \"hot now\". If web_search was used, cite source URLs.}",
+      "",
+      "**Verdict:**",
+      "{one of three: \"Do it — clear cross-channel signal + fresh for you.\" / \"Pivot the angle — covered it before / has competitors who already won.\" / \"Skip — no cross-channel evidence + no own-channel hook.\"}",
+      "",
+      "**Why:** {2-3 sentence rationale grounded in the evidence above.}"
+    );
+  } else {
+    // Ideate is the default — keep the system prompt lean.
+    lines.push(
+      "",
+      "## IDEATE MODE (active — default)",
+      "Lean turn: pull outliers + own-channel winners, compose 10 ideas via generate_ideas, render in the forensic format from the generate_ideas tool description. Do NOT over-research. Do NOT deep-dive on each outlier. The 10-idea output IS the deliverable."
+    );
+  }
+
   if (opts.advisorEnabled) {
     lines.push(
       "",
@@ -1274,7 +1471,7 @@ export function buildSystemPrompt(
     promptSizeDiagLogged = true;
     log.info(
       "chat",
-      `[diag] system prompt: ${prompt.length} chars (~${Math.ceil(prompt.length / 4)} tokens) for groups=${activeGroups.join(",")}`
+      `[diag] system prompt: ${prompt.length} chars (~${Math.ceil(prompt.length / 4)} tokens) for mode=${mode}, groups=${activeGroups.join(",")}`
     );
   }
 
