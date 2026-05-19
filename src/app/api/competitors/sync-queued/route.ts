@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import {
   claimNextQueuedCompetitor,
+  type Competitor,
   db,
   getSetting,
   markCompetitorSyncDone,
@@ -27,6 +28,13 @@ const STALE_LOCK_SEC = 600;
 // certainly hit the old "enrich-before-sync" worker-order bug. Re-queue
 // it so a fresh enrichment pass runs.
 const STALE_META_SEC = 300;
+// Apify free-tier concurrency ceiling. 5 in-flight runs is safe per their
+// per-account limits and gives a ~5x wall-clock speedup over the prior
+// serial loop. Lower this if a different tier or actor caps lower.
+const PARALLEL_CAP = 5;
+// Defensive total-processed cap. Was the prior loop's `i < 50` ceiling;
+// protects against runaway loops if the DB layer ever leaves a row stuck.
+const MAX_PROCESSED_PER_RUN = 50;
 
 /**
  * POST /api/competitors/sync-queued — worker route.
@@ -60,70 +68,92 @@ export async function POST(req: Request) {
   const errors: string[] = [];
   const origin = new URL(req.url).origin;
 
-  try {
-    // Defensive cap. A typical add session queues 1-3 rows. 50 protects
-    // against runaway loops if the DB layer ever leaves a row stuck.
-    for (let i = 0; i < 50; i++) {
-      const row = claimNextQueuedCompetitor();
-      if (!row) break;
-      processed++;
-      try {
-        // Apify FIRST — resolves channel_id from the handle so the
-        // subsequent YT enrich call has something to look up. (The
-        // previous order, enrich-then-sync, was the cause of
-        // "title syncs but no avatar/subs" for newly-added competitors.)
-        await syncCompetitor(row.id);
-        // YT enrich SECOND — now channel_id is set, channels.list works.
-        // Non-fatal: a YT failure here doesn't fail the sync overall.
-        await enrichCompetitorMetadataFromYouTube(row.id);
-        markCompetitorSyncDone(row.id);
-        succeeded++;
-        // Dev-side sanity log (Concern D): print the per-window view
-        // sums so HAmo can spot-check the math without opening sqlite.
-        const viewsLog = db
-          .prepare(
-            `SELECT
-               c.title,
-               SUM(CASE WHEN v.published_at > strftime('%s','now') -  7 * 86400 THEN v.views ELSE 0 END) AS v7,
-               SUM(CASE WHEN v.published_at > strftime('%s','now') - 28 * 86400 THEN v.views ELSE 0 END) AS v28,
-               SUM(CASE WHEN v.published_at > strftime('%s','now') - 90 * 86400 THEN v.views ELSE 0 END) AS v90
-             FROM competitors c
-             LEFT JOIN competitor_videos v ON v.competitor_id = c.id
-             WHERE c.id = ?`
-          )
-          .get(row.id) as
-          | { title: string | null; v7: number; v28: number; v90: number }
-          | undefined;
-        if (viewsLog) {
-          log.info("competitors", "Per-window views (sanity log)", {
-            competitor: viewsLog.title,
-            window7d: viewsLog.v7,
-            window28d: viewsLog.v28,
-            window90d: viewsLog.v90,
-          });
-        }
-        log.info(
-          "competitors",
-          `Queued sync succeeded for ${row.id} (${row.handle ?? row.channel_id ?? "?"})`
-        );
-        // Fire-and-forget similarity scoring. Failure is silent — the UI
-        // shows "—" for the score until a successful run lands.
-        void fetch(`${origin}/api/competitors/${row.id}/score-similarity`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-          cache: "no-store",
-        }).catch(() => {});
-      } catch (err) {
-        const msg =
-          err instanceof CompetitorSyncError || err instanceof Error
-            ? err.message
-            : "sync failed";
-        markCompetitorSyncFailed(row.id, msg);
-        failed++;
-        errors.push(`${row.id}: ${msg}`);
-        log.warn("competitors", `Queued sync failed for ${row.id}: ${msg}`);
+  // Per-row work — claim → apify → yt-enrich → mark done/failed, plus
+  // sanity logging and fire-and-forget similarity scoring. Hoisted out
+  // so the parallel-batch loop can run it for several rows at once.
+  const runOne = async (row: Competitor) => {
+    try {
+      // Apify FIRST — resolves channel_id from the handle so the
+      // subsequent YT enrich call has something to look up. (The
+      // previous order, enrich-then-sync, was the cause of
+      // "title syncs but no avatar/subs" for newly-added competitors.)
+      await syncCompetitor(row.id);
+      // YT enrich SECOND — now channel_id is set, channels.list works.
+      // Non-fatal: a YT failure here doesn't fail the sync overall.
+      await enrichCompetitorMetadataFromYouTube(row.id);
+      markCompetitorSyncDone(row.id);
+      succeeded++;
+      // Dev-side sanity log: per-window view sums so HAmo can
+      // spot-check the math without opening sqlite.
+      const viewsLog = db
+        .prepare(
+          `SELECT
+             c.title,
+             SUM(CASE WHEN v.published_at > strftime('%s','now') -  7 * 86400 THEN v.views ELSE 0 END) AS v7,
+             SUM(CASE WHEN v.published_at > strftime('%s','now') - 28 * 86400 THEN v.views ELSE 0 END) AS v28,
+             SUM(CASE WHEN v.published_at > strftime('%s','now') - 90 * 86400 THEN v.views ELSE 0 END) AS v90
+           FROM competitors c
+           LEFT JOIN competitor_videos v ON v.competitor_id = c.id
+           WHERE c.id = ?`
+        )
+        .get(row.id) as
+        | { title: string | null; v7: number; v28: number; v90: number }
+        | undefined;
+      if (viewsLog) {
+        log.info("competitors", "Per-window views (sanity log)", {
+          competitor: viewsLog.title,
+          window7d: viewsLog.v7,
+          window28d: viewsLog.v28,
+          window90d: viewsLog.v90,
+        });
       }
+      log.info(
+        "competitors",
+        `Queued sync succeeded for ${row.id} (${row.handle ?? row.channel_id ?? "?"})`
+      );
+      // Fire-and-forget similarity scoring. Failure is silent — the UI
+      // shows "—" for the score until a successful run lands.
+      void fetch(`${origin}/api/competitors/${row.id}/score-similarity`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        cache: "no-store",
+      }).catch(() => {});
+    } catch (err) {
+      const msg =
+        err instanceof CompetitorSyncError || err instanceof Error
+          ? err.message
+          : "sync failed";
+      markCompetitorSyncFailed(row.id, msg);
+      failed++;
+      errors.push(`${row.id}: ${msg}`);
+      log.warn("competitors", `Queued sync failed for ${row.id}: ${msg}`);
+    }
+  };
+
+  try {
+    // Batched-parallel drain. We claim up to PARALLEL_CAP rows from the
+    // queue at once and run their sync+enrich in parallel via
+    // Promise.allSettled. The lock still serialises *workers* (only
+    // one /api/competitors/sync-queued at a time), but inside a single
+    // worker the per-row Apify + YT calls fire concurrently — 7
+    // competitors that took ~5 minutes serially now take ~1 minute.
+    // Apify free-tier concurrency cap is the binding constraint, so
+    // PARALLEL_CAP defaults to 5.
+    while (processed < MAX_PROCESSED_PER_RUN) {
+      const batch: Array<Competitor> = [];
+      while (batch.length < PARALLEL_CAP && processed + batch.length < MAX_PROCESSED_PER_RUN) {
+        const row = claimNextQueuedCompetitor();
+        if (!row) break;
+        batch.push(row);
+      }
+      if (batch.length === 0) break;
+      processed += batch.length;
+      log.info(
+        "competitors",
+        `Queued sync: starting parallel batch of ${batch.length} (processed=${processed}/${MAX_PROCESSED_PER_RUN})`
+      );
+      await Promise.allSettled(batch.map(runOne));
     }
 
     // Background re-enrichment for rows that fell through the cracks of

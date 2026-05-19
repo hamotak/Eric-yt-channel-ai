@@ -118,6 +118,21 @@ export async function extractFormatsFromOutliers(
     "From MENTOR_METHOD.md §4 (Title formats — structural patterns, not literal titles):",
     sec4 || "(section unavailable)",
     "",
+    "# STRUCTURAL DIVERSITY (hardest rule — read carefully)",
+    "Produce AT LEAST 5 STRUCTURALLY DIFFERENT title templates if the outlier batch supports it. Two templates are STRUCTURALLY DIFFERENT only when they differ on at least ONE of:",
+    "  - Sentence shape — declarative vs interrogative vs quoted-fragment+statement vs imperative vs conditional.",
+    "  - Anchor position — '[Authority] Just [Verb-ed] [Object]' has the authority/agent first; 'The [Adjective] [Noun] of [Object]' leads with the noun phrase; '\"[Quoted reveal]\" — [What it means]' opens with a quoted fragment. These are different ANCHOR POSITIONS.",
+    "  - Rhetorical strategy — curiosity gap, scale reveal, authority claim, contradiction/negation, time-pressure, before/after, list reveal.",
+    "",
+    "Templates that swap only the proper noun are NOT different. Examples of pairs that count as the SAME structure (so only one belongs in the output):",
+    "  • 'CERN Just Detected [Thing]' and 'James Webb Just Detected [Thing]' — same structure, different brand.",
+    "  • 'Voyager Just Found [Thing]' and 'Hubble Just Found [Thing]' — same structure.",
+    "Examples of pairs that DO count as different structures:",
+    "  • '[Authority] Just Found [Thing]' (declarative + agent-first) vs 'What Did [Authority] Find at [Location]?' (interrogative).",
+    "  • 'The Terrifying Size of [Object]' (scale reveal, noun-first) vs '[Authority] Just Found [Thing] That Shouldn't Exist' (authority + contradiction).",
+    "",
+    "If you cannot find 5 structurally different patterns in this batch, return only the patterns that ARE structurally different. DO NOT pad with proper-noun-only variants — the server's downstream pipeline depends on diverse templates to fan out across topic clusters. One template = one shape on the slate.",
+    "",
     "# What counts as a TRENDING FORMAT (ALL must hold)",
     "A format qualifies ONLY if EVERY one of these is true after you assemble it:",
     "  i.   It has at least 3 example titles drawn from the outlier batch below.",
@@ -126,7 +141,8 @@ export async function extractFormatsFromOutliers(
     "  iv.  The template has at least 2 placeholder slot variables in square brackets. A no-slot template is a copied title, not a format.",
     "  v.   The average multiplier across the 3+ examples is ≥5×. Anything lower is noise.",
     "  vi.  Across any pair of examples, ≤50% of the content words overlap. If two examples share most content words, they are the same TOPIC, not the same FORMAT.",
-    "  vii. Aim for AT MOST 8 formats total. Quality over quantity — if only 4 qualify, return 4. Do NOT pad with weak candidates.",
+    "  vii. Across the FULL output list, every pair of templates must be STRUCTURALLY DIFFERENT per the rules above. Two minor-variation templates = one template — pick the strongest, drop the rest.",
+    "  viii. Aim for AT MOST 8 formats total. Quality over quantity — if only 4 qualify, return 4. Do NOT pad with weak candidates or proper-noun-only variants of a stronger pattern.",
     "",
     "The server re-checks every criterion above and drops any format that fails. Drops surface in the extraction log so HAmo can see which criterion fired. Don't try to game them: thin signal beats fabricated patterns.",
     "",
@@ -498,7 +514,12 @@ const PER_EXAMPLE_MIN_MULTIPLIER = 2;
 const MIN_EXAMPLES_PER_FORMAT = 2;
 const AVG_MULTIPLIER_MIN = 3;
 const MIN_DISTINCT_COMPETITORS = 2;
-const MAX_CONTENT_OVERLAP = 0.6;
+// Loosened 0.6 → 0.7 after observing the prior gate killing legitimate
+// variants of the same template family (e.g. two "Authority Just Found X"
+// examples that share "found" + a connector). Structural diversity is now
+// enforced by the LLM prompt + the per-template pairwise check (gate vii);
+// this floor stays as a defense-in-depth against true topic-collapse.
+const MAX_CONTENT_OVERLAP = 0.7;
 
 const VALIDATE_STOPWORDS = new Set([
   "the","a","an","and","or","but","if","of","in","on","for","to","with",

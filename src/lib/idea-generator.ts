@@ -203,16 +203,15 @@ export type ProposedIdea = {
   validation: ValidateResult;
   ownCatalogMatches: OwnCatalogMatch[];
 
-  // Winner-aware classification computed in the per-idea pass:
-  //   fresh                    no own-catalog matches at all
-  //   covered_recent_winner    matches' avg multiplier ≥ 3.0 → remix candidate
-  //   covered_recent_flop      matches' avg multiplier in [1.5, 3.0) → borderline
-  //   covered_old              matches exist but all >90d old
-  // Rows with avg < 1.5 are dropped server-side and never reach the agent.
+  // Winner-aware classification computed in the per-idea pass. Only
+  // three tags ship — the recent-flop band (1.5 ≤ avg < 3.0) and the
+  // dead-horse band (avg < 1.5) are both dropped server-side.
+  //   fresh                  no own-catalog matches at all
+  //   covered_recent_winner  matches' avg multiplier ≥ 3.0 → remix candidate
+  //   covered_old            matches exist but all >90d old
   catalogTag:
     | "fresh"
     | "covered_recent_winner"
-    | "covered_recent_flop"
     | "covered_old";
   // Highest-mult own video — populated when catalogTag is
   // "covered_recent_winner" so the agent can render
@@ -442,12 +441,12 @@ export async function generateIdeasForChannel(opts: {
     formatSourceVideoId: string;
     formatSwapped: boolean;
     // Winner-aware catalog classification — see ProposedIdea.catalogTag
-    // doc for the threshold logic (avg multiplier across own-catalog
-    // matches: <1.5 drops, ≥3.0 winner, in between flop).
+    // doc for the threshold logic. Only the three ship tags appear here;
+    // the recent-flop band (1.5 ≤ avg < 3.0) and dead-horse band
+    // (avg < 1.5) are both dropped before they reach this slot.
     catalogTag:
       | "fresh"
       | "covered_recent_winner"
-      | "covered_recent_flop"
       | "covered_old";
     catalogRemixSource: OwnCatalogMatch | null;
   };
@@ -524,13 +523,16 @@ export async function generateIdeasForChannel(opts: {
       });
       continue;
     }
-    // Winner-aware catalog gate. Drops only when the user's matching
-    // own videos averaged below CATALOG_DROP_AVG_MULTIPLIER (dead-horse
-    // topic). Above that floor, ships with a tag the agent surfaces:
+    // Winner-aware catalog gate. Only three tags ship — fresh, winner,
+    // covered_old. Anything in the recent-flop band (1.5 ≤ avg < 3.0) is
+    // an explicit "don't repeat losers" signal so the slot is DROPPED
+    // server-side rather than shipped with a label HAmo would skip
+    // anyway. Spec call: less noise on the slate, clearer drop reason
+    // in the failure block when the pipeline thins out.
     //   - no matches            → fresh
     //   - all matches >90d old  → covered_old (cooled but safe to revisit)
     //   - avg ≥ 3.0             → covered_recent_winner (remix candidate)
-    //   - 1.5 ≤ avg < 3.0       → covered_recent_flop (borderline; HAmo decides)
+    //   - 1.5 ≤ avg < 3.0       → drop (covered_recent_flop — skip)
     //   - avg < 1.5             → drop (dead horse)
     const ownMatches = findOwnCatalogTopicMatches(
       idea.topicLabel,
@@ -564,7 +566,15 @@ export async function generateIdeasForChannel(opts: {
             m.multiplier > acc.multiplier ? m : acc
           );
         } else {
-          catalogTag = "covered_recent_flop";
+          // 1.5 ≤ avg < 3.0 — recent-flop band. Drop instead of shipping
+          // "covered_recent_flop — skip"; HAmo would skip it anyway.
+          dropped.push({
+            topicLabel: idea.topicLabel,
+            proposedTitle: idea.proposedTitle,
+            reason: "topic_overused",
+            detail: `recent own coverage averaged ${avg.toFixed(1)}× — flop band (1.5–3.0×). Top match: "${recent[0].title}" at ${recent[0].multiplier}×.`,
+          });
+          continue;
         }
       }
     }
