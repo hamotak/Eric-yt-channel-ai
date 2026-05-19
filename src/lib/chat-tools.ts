@@ -309,58 +309,30 @@ const IDEATION_TOOLS: Tool[] = [
       "  - topicConfirmationVideos: SourceVideo[] — ≥2 cross-channel proofs (cluster siblings from different competitors)",
       "  - validation: ValidateResult, ownCatalogMatches: OwnCatalogMatch[], topicSimilarOutliers: TopicSimilarMatch[]",
       "",
-      "## OUTPUT FORMAT (MANDATORY when you present ideas in chat)",
-      "Open with the pre-ideation research block, then list each idea in the markdown shape below, then close with a one-sentence Next step. NO prose paragraphs anywhere.",
+      "## Ideation output format (MANDATORY when you present ideas in chat)",
+      "Text-only cards. NO thumbnails. NO `![]()` syntax anywhere in idea cards. NO 'Topic cross-channel proof' bullet list. NO 'Format proven across X channels' line. Title links stay as text-only `[title](url)` markdown links.",
       "",
-      "### Pre-ideation research block (output FIRST)",
-      "**Pattern research (last 28d):**",
-      "- Top viral formats: {3-5 format templates with example counts + distinct_channels from list_format_patterns. Plain text, ≤10 words each.}",
-      "- Top viral topics: {3-5 topic clusters — distinct_channels × max_multiplier from generate_ideas dropped + survivors. ≤8 words each.}",
-      "- Not working: {topics with ≥2 underperformers in last 20 own uploads. ≤8 words each.}",
-      "- Skipped: {drops from result.dropped — group by reason; cite count per reason.}",
-      "Rules: bullets only, ≤5 items per group, OMIT empty groups.",
-      "",
-      "### Then each numbered idea — EXACTLY this markdown shape",
+      "### Each numbered idea — EXACTLY this shape:",
       "### {N}. {proposedTitle}",
       "",
-      "{if formatSwapped is true, prefix the next line with \"🔁 Format swapped for fit — \"}",
-      "**Topic from:** [![]({topicSource.thumbnailUrl})]({topicSource.youtubeUrl}) {topicSource.competitorTitle} — [{topicSource.title}]({topicSource.youtubeUrl}) · {topicSource.performanceBand} ({topicSource.multiplier}× · {topicSource.views.toLocaleString()} views · {format topicSource.publishedAt as \"Mar 14, 2026 (12d ago)\"})",
-      "",
-      "**Format from:** [![]({formatSource.thumbnailUrl})]({formatSource.youtubeUrl}) {formatSource.competitorTitle} — [{formatSource.title}]({formatSource.youtubeUrl}) · {formatSource.performanceBand} ({formatSource.multiplier}×)",
-      "",
-      "**Format template:** `{format.template}` · {format.distinctChannels} channels, {format.exampleCount} videos{if format.isSingleChannel append \" (author pattern)\"}",
-      "",
-      "**Topic cross-channel proof:**",
-      "{render every topicConfirmationVideos entry (≥2 guaranteed) as a bullet:}",
-      "- [![]({c.thumbnailUrl})]({c.youtubeUrl}) {c.competitorTitle} — [{c.title}]({c.youtubeUrl}) ({c.multiplier}×)",
-      "",
-      "**Why this mix works:** {coherenceRationale}",
-      "",
-      "{if ownCatalogMatches is non-empty: prefix the verdict line below with a one-line bullet \"Your catalog: [{match.title}]({match.youtubeUrl}) ({match.multiplier}× your median, {match.performanceBand}, uploaded {absolute date})\" — top match only}",
-      "{catalogEmoji} {validation.verdictCopy}",
+      "**Topic:** [{topicSource.competitorTitle} — {topicSource.title}]({topicSource.youtubeUrl}) · {topicSource.multiplier}×",
+      "**Format:** `{format.template}` · from [{formatSource.competitorTitle} — {formatSource.title}]({formatSource.youtubeUrl})",
+      "**Why this for {channel.title}:** {2-3 sentences explaining why this title fits THIS channel's voice + audience + positioning per the system prompt's `## About this channel`. Must reference at least one SPECIFIC element from that description (e.g. the dread/cinematic framing, the 35-65 male skew, the sleep-ritual viewing pattern, the second-person immersion technique — whichever is most relevant). Paraphrase or APPLY the channel context; do NOT quote it verbatim. \"leads with dread and wonder\" or \"second-person immersion\" lifted as a direct quote is a fail.}",
+      "**Catalog:** {one of: fresh | covered_recent | covered_recent — fresh angle needed | covered_old | covered_underperformed | 🔁 Remix — server populates idea.catalogTag, use it verbatim, then add a one-line gloss if catalogTag is \"remix\" naming the prior winner: 🔁 Remix of [your title](url) (3.2× your median).}",
       "",
       "---",
       "",
-      "### Hard rules (forensic-grade — server-verified)",
-      "- TWO thumbnail-images per idea MINIMUM: topic source + format source. NEVER omit either.",
-      "- topicSource.videoId !== formatSource.videoId. Server enforces; you should never see them match.",
-      "- coherenceRationale is REQUIRED on every idea. Never skip. Never paraphrase to remove the sentence.",
-      "- ≥2 topicConfirmationVideos rendered per idea. Server guarantees the data — render every entry.",
-      "- NO multipliers without context. Always pair with views (\"52× · 224K views\") or median (\"52× your median of 4K\").",
-      "- NO relative-only dates. ALWAYS \"Mar 14, 2026 (12d ago)\" — absolute first, relative in parens.",
+      "### Hard rules",
+      "- NO `![image](...)` syntax in idea cards. Text-only.",
+      "- topicSource.videoId !== formatSource.videoId. Server enforces.",
+      "- \"Why this for {channel}\" must show the agent UNDERSTANDS the channel, not echo the description verbatim. Paraphrase or apply, don't quote.",
+      "- Multiplier on the Topic line stays compact (just \"24×\"). No views / median / dates in the card — those are noise here.",
+      "- If `idea.catalogTag === \"remix\"`, prefix the title with \"🔁 \" so the user can scan winners-to-remix at a glance.",
       "- If a field is null/undefined, render \"(unknown)\" literally — NEVER fabricate.",
-      "- Logical coherence is non-negotiable: if you see a title that mixes topic A's subject with format B's claim to imply a fact neither source supports, FLAG it back to the user — do not paper over it.",
-      "",
-      "### Verdict map (validation.verdict → emoji)",
-      "  fresh → ✅",
-      "  covered_old → ⚠️",
-      "  covered_recently → 🛑",
-      "  covered_underperformed → 🟠",
       "",
       "### Closing",
       "After ALL ideas: **Next step this week:** {one sentence — pick ONE idea and why}. One sentence. No follow-up paragraph.",
       "Elaborate ONLY when the user explicitly asks ('why this format' / 'explain idea N' / 'tell me more'). Default = terse.",
-      "Never strip the structure to save tokens.",
     ].join("\n"),
     input_schema: {
       type: "object",
@@ -1300,9 +1272,10 @@ export function buildSystemPrompt(
       ""
     );
 
-    // Channel description — single source of truth. Falls back to the
-    // concatenated legacy 5 fields when description is still empty
-    // (covers fresh installs + manual clears). Capped at 1500 chars.
+    // Channel description — single source of truth, UNCAPPED. The full
+    // resolved description (legacy-fallback handled by
+    // resolveChannelDescription) is injected verbatim so the agent's
+    // "Why this for {channel}" rationale has every detail HAmo wrote.
     const description = resolveChannelDescription(channel);
     lines.push("## About this channel");
     if (description.length > 0) {
@@ -1311,9 +1284,10 @@ export function buildSystemPrompt(
       lines.push("(not set — ask HAmo to fill /channel-info or the Brain panel in /chat)");
     }
 
-    // Ideation rules — HARD enforcement, capped at 1200 chars.
-    const rulesRaw = (channel.ideation_rules ?? "").trim();
-    const rules = rulesRaw.length > 1200 ? `${rulesRaw.slice(0, 1199)}…` : rulesRaw;
+    // Ideation rules — HARD enforcement, UNCAPPED. Per-channel rules
+    // override every compose heuristic; truncating them silently was a
+    // bug — the agent needs the full text to reason about edge cases.
+    const rules = (channel.ideation_rules ?? "").trim();
     lines.push(
       "",
       "## Ideation rules (HARD — override every compose heuristic)",

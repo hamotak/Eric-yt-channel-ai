@@ -9,18 +9,15 @@ import {
   resolveChannelDescription,
   type Channel,
 } from "./db";
-import { providerModelId } from "./ai-provider-types";
 import { getFormatsForChannel } from "./outlier-formats";
 import { listOutliersForActiveChannel } from "./outliers";
 import { log } from "./logger";
 import {
-  checkTopicFrequency,
   findOwnCatalogTopicMatches,
   findTopicSimilarOutliers,
   performanceBandFor,
   type OwnCatalogMatch,
   type PerformanceBand,
-  type TopicFrequencyResult,
   type TopicSimilarMatch,
   validateIdeaAgainstOwnCatalog,
   type ValidateResult,
@@ -40,7 +37,7 @@ import { checkLogicalFit, type LogicalFitInput } from "./logical-fit";
 //      ranked by (rising_rate DESC, exampleCount DESC, avg_multiplier
 //      DESC). Each carries a primary source video + 2 confirmation
 //      examples.
-//   4. CLAUDE CALL #1 (Sonnet 4.6, thinking 6000, temperature 1):
+//   4. CLAUDE CALL #1 (Opus 4.7, thinking 6000, temperature 1):
 //      compose ONE title per topic candidate by applying a format from
 //      the pool. The topic source video and the format source video
 //      MUST be different videos — the model picks the format and emits
@@ -108,6 +105,11 @@ const IDEATION_THINKING_BUDGET: number = (() => {
   const raw = Number(process.env.ANTHROPIC_THINKING_BUDGET_IDEATION);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 6000;
 })();
+
+// Compose uses Opus 4.7 for smarter coherence + voice-matching. Validator
+// stays on Haiku 4.5 (mechanical check).
+const OPUS_COMPOSE_MODEL = "claude-opus-4-7";
+const COMPOSE_MAX_TOKENS = 8000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -188,6 +190,17 @@ export type ProposedIdea = {
   validation: ValidateResult;
   ownCatalogMatches: OwnCatalogMatch[];
 
+  // Winner-aware classification computed pre-validator. The chat agent
+  // renders this as the "Catalog:" line — "remix" gets the 🔁 prefix
+  // and a one-line gloss naming the prior winner. See spec §1.
+  catalogTag:
+    | "fresh"
+    | "covered_recent_fresh_angle"
+    | "remix";
+  // Highest-mult own-video that backs the "remix" tag. null for fresh
+  // and covered_recent_fresh_angle rows.
+  catalogRemixSource: OwnCatalogMatch | null;
+
   // Optional supplementary cross-channel siblings outside the cluster —
   // used by the chat agent when topicConfirmationVideos is sparse.
   topicSimilarOutliers: TopicSimilarMatch[];
@@ -246,6 +259,24 @@ export async function generateIdeasForChannel(opts: {
   const bannedTopics = readBannedTopics(userChannelId);
   const dropped: DroppedIdea[] = [];
 
+  // Channel-context diagnostics — verifies the system prompt is actually
+  // shipping the full description + rules to the chat agent (and therefore
+  // through to the agent's "Why this for {channel}" rationale). Logged at
+  // every generate_ideas invocation so HAmo can audit the chars-in vs the
+  // chars-rendered in chat.
+  {
+    const descChars = resolveChannelDescription(
+      channel as unknown as Channel
+    ).length;
+    const rulesChars = (
+      (channel as unknown as Channel).ideation_rules ?? ""
+    ).trim().length;
+    log.info(
+      "claude",
+      `[diag] ideation_context channel=${userChannelId} description_chars=${descChars} rules_chars=${rulesChars} banned_topics_count=${bannedTopics.length}`
+    );
+  }
+
   // 1. Source pool ----------------------------------------------------------
   const outlierWindow = opts.windowDays ?? OUTLIER_WINDOW_DAYS;
   const outlierMult = opts.minMultiplier ?? OUTLIER_MIN_MULTIPLIER;
@@ -303,7 +334,10 @@ export async function generateIdeasForChannel(opts: {
     description: resolveChannelDescription(channel as unknown as Channel),
     ideationRules: ((channel as unknown as Channel).ideation_rules ?? "").trim(),
   };
-  const model = providerModelId("claude");
+  // Compose uses Opus 4.7 for smarter coherence + voice-matching. Validator
+  // stays on Haiku 4.5 (mechanical check). Cost delta per compose ~$0.20-
+  // $0.40 vs ~$0.06 on Sonnet — per ideation turn worst-case ~$0.50.
+  const model = OPUS_COMPOSE_MODEL;
 
   let claudeCallCount = 0;
   const composeResult = await runComposeCall({
@@ -336,6 +370,17 @@ export async function generateIdeasForChannel(opts: {
     formatId: number;
     formatSourceVideoId: string;
     formatSwapped: boolean;
+    // Winner-aware classification computed pre-validator. "remix" means
+    // the user has covered this topic before AND a prior video hit ≥3×
+    // their median — re-attacking the topic is high-value. The chat
+    // agent renders "🔁 Remix" on these. "covered_recent_fresh_angle"
+    // means the topic appears in own catalog with average performance —
+    // KEEP, but the agent should signal the user already touched it.
+    catalogTag:
+      | "fresh"
+      | "covered_recent_fresh_angle"
+      | "remix";
+    catalogRemixSource: OwnCatalogMatch | null;
   };
 
   const prelim: ComposedSlot[] = [];
@@ -410,15 +455,42 @@ export async function generateIdeasForChannel(opts: {
       });
       continue;
     }
-    const freq = checkTopicFrequency(idea.topicLabel, userChannelId, 20);
-    if (freq.overused) {
+    // Winner-aware topic-frequency gate. Replaces the prior "any match in
+    // last 20 uploads → drop" rule which wiped every cross-channel
+    // cluster on dense catalogs (Late Science). New behavior:
+    //   - underperformer match (mult < 1.0) AND no winner → DROP (dead
+    //     horse; you've tried this and it tanked).
+    //   - winner match (mult ≥ 3.0) → KEEP, tag "remix" (the user has
+    //     proven they can win on this topic; re-attack it).
+    //   - any match exists, all mid-tier (1.0 ≤ mult < 3.0) → KEEP, tag
+    //     "covered_recent_fresh_angle" (covered but unproven; needs a
+    //     fresh angle which is what compose just produced).
+    //   - no matches → KEEP, tag "fresh".
+    const ownMatches = findOwnCatalogTopicMatches(
+      idea.topicLabel,
+      userChannelId,
+      { limit: 5 }
+    );
+    const winners = ownMatches.filter((m) => m.multiplier >= 3.0);
+    const underperformers = ownMatches.filter((m) => m.multiplier < 1.0);
+    let catalogTag: ComposedSlot["catalogTag"] = "fresh";
+    let catalogRemixSource: OwnCatalogMatch | null = null;
+    if (winners.length > 0) {
+      catalogTag = "remix";
+      // Pick the highest-multiplier winner as the displayed remix source.
+      catalogRemixSource = winners.reduce((acc, m) =>
+        m.multiplier > acc.multiplier ? m : acc
+      );
+    } else if (underperformers.length > 0 && winners.length === 0) {
       dropped.push({
         topicLabel: idea.topicLabel,
         proposedTitle: idea.proposedTitle,
         reason: "topic_overused",
-        detail: `${freq.matches} of your last 20 uploads cover this`,
+        detail: `you covered this and it underperformed (${underperformers[0].multiplier}× — "${underperformers[0].title}")`,
       });
       continue;
+    } else if (ownMatches.length > 0) {
+      catalogTag = "covered_recent_fresh_angle";
     }
 
     prelim.push({
@@ -429,6 +501,8 @@ export async function generateIdeasForChannel(opts: {
       formatId: idea.formatId,
       formatSourceVideoId,
       formatSwapped: false,
+      catalogTag,
+      catalogRemixSource,
     });
   }
 
@@ -638,6 +712,10 @@ export async function generateIdeasForChannel(opts: {
             formatId: r.formatId,
             formatSourceVideoId,
             formatSwapped: true,
+            // Carry through the original slot's catalog classification —
+            // the topic didn't change, only the format did.
+            catalogTag: slot.catalogTag,
+            catalogRemixSource: slot.catalogRemixSource,
           });
         }
       } else {
@@ -765,6 +843,8 @@ export async function generateIdeasForChannel(opts: {
       topicConfirmationVideos,
       validation,
       ownCatalogMatches,
+      catalogTag: slot.catalogTag,
+      catalogRemixSource: slot.catalogRemixSource,
       topicSimilarOutliers,
     };
     ideas.push(idea);
@@ -1167,7 +1247,7 @@ async function runComposeCall(opts: {
     const client = new Anthropic({ apiKey });
     const resp = await client.messages.create({
       model,
-      max_tokens: 10000,
+      max_tokens: COMPOSE_MAX_TOKENS,
       temperature: 1,
       system: systemPrompt,
       messages: [{ role: "user", content: userBody }],
