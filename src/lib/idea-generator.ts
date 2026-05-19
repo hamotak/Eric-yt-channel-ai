@@ -10,30 +10,109 @@ import {
   type Channel,
 } from "./db";
 import { providerModelId } from "./ai-provider-types";
-import {
-  extractSection,
-  isLever,
-  LEVERS,
-  loadMentorMethod,
-} from "./mentor-method";
-import { listOutliersForActiveChannel } from "./outliers";
 import { getFormatsForChannel } from "./outlier-formats";
+import { listOutliersForActiveChannel } from "./outliers";
 import { log } from "./logger";
 import {
   checkTopicFrequency,
   findOwnCatalogTopicMatches,
   findTopicSimilarOutliers,
+  performanceBandFor,
   type OwnCatalogMatch,
+  type PerformanceBand,
   type TopicFrequencyResult,
   type TopicSimilarMatch,
   validateIdeaAgainstOwnCatalog,
   type ValidateResult,
 } from "./validate-idea";
-import { scoreOriginality } from "./idea-originality";
+import { checkLogicalFit, type LogicalFitInput } from "./logical-fit";
 
-// Drop reasons accumulated server-side during the post-LLM pass. Returned
-// to the chat tool so the agent's "Skipped" research-block bullet can
-// surface what got filtered + why. Visibility = trust.
+// ---------------------------------------------------------------------------
+// Topic × Format mix pipeline (2026-05 rebuild).
+//
+// Pipeline:
+//   1. Pull top 50 competitor outliers ≥1.5× channel median in last 28d.
+//   2. JS-side topic clustering — group videos sharing ≥2 content nouns.
+//      Keep clusters with ≥2 DISTINCT channels (single-channel topic
+//      clusters drop). Rank by (distinct_channels DESC, max_multiplier
+//      DESC, recency DESC). Top 10 surviving = TopicCandidates.
+//   3. JS-side format pool — top 8 formats (including is_single_channel)
+//      ranked by (rising_rate DESC, exampleCount DESC, avg_multiplier
+//      DESC). Each carries a primary source video + 2 confirmation
+//      examples.
+//   4. CLAUDE CALL #1 (Sonnet 4.6, thinking 6000, temperature 1):
+//      compose ONE title per topic candidate by applying a format from
+//      the pool. The topic source video and the format source video
+//      MUST be different videos — the model picks the format and emits
+//      the formatSourceVideoId alongside the proposedTitle.
+//   5. JS post-filter — title length 50-80, banned words (op rule 13),
+//      per-channel banned topics, topic-frequency vs own catalog. Drops
+//      are NOT retried (hard 3-call cap).
+//   6. CLAUDE CALL #2 (Haiku 4.5): Logical-Fit validator. Each
+//      (topicSource, formatSource, proposedTitle, coherenceRationale)
+//      gets a logically_coherent verdict + one-sentence reason. Drops
+//      get logged to app_logs as [diag] logical_fit pass/fail entries.
+//   7. Optional CLAUDE CALL #3 (Sonnet 4.6): Format-swap retry. For
+//      every slot the validator dropped, the model is asked to retry
+//      the SAME topic with a DIFFERENT format (max 2 swap attempts per
+//      slot — model picks among the next 2 ranked formats). One retry
+//      compose call total — failures past it drop the topic.
+//   8. Per-survivor hydration: validateIdeaAgainstOwnCatalog +
+//      findOwnCatalogTopicMatches + cross-channel proof videos.
+//
+// Hard rules
+//   - Max 3 Claude calls per turn (1 compose + 1 validator + 1 retry).
+//   - "Logical coherence is non-negotiable. Format provides STRUCTURE,
+//     topic provides SUBJECT. Cannot create fabricated facts."
+//   - No schema changes; idempotent.
+// ---------------------------------------------------------------------------
+
+const OUTLIER_MIN_MULTIPLIER = 1.5;
+const OUTLIER_WINDOW_DAYS = 28;
+const OUTLIER_SOURCE_LIMIT = 50;
+
+const TOPIC_CLUSTER_MIN_SHARED_NOUNS = 2;
+const TOPIC_CLUSTER_MIN_DISTINCT_CHANNELS = 2;
+const TOPIC_CANDIDATE_LIMIT = 10;
+const TOPIC_CONFIRMATION_MIN = 2;
+const TOPIC_CONFIRMATION_MAX = 3;
+
+const FORMAT_CANDIDATE_LIMIT = 8;
+const FORMAT_MIN_EXAMPLES = 2;
+const FORMAT_CONFIRMATION_TARGET = 2;
+
+const MAX_FORMAT_SWAPS_PER_SLOT = 2;
+const MAX_CLAUDE_CALLS = 3;
+
+const TITLE_LEN_IDEAL_MIN = 50;
+const TITLE_LEN_IDEAL_MAX = 70;
+const TITLE_LEN_HARD_MAX = 80;
+const TITLE_LEN_DROP_FLOOR = 35;
+
+const BANNED_WORDS_RE =
+  /(\bcinematic\b|\bsensory\b|\bvisceral\b|\bprofound\b|\bdesolate expanse\b|\bhumanity has ever charted\b|\bhumanity has ever mapped\b|\binexorable\b|\bvastest\b|\bthe most absolute\b|\bphysically impossible\b)/i;
+
+const STOPWORDS = new Set([
+  "the","a","an","and","or","but","if","of","in","on","for","to","with",
+  "is","are","was","were","be","been","this","that","these","those","i",
+  "you","he","she","it","we","they","my","your","his","her","its","our",
+  "their","do","does","did","done","have","has","had","not","no","yes",
+  "at","by","from","as","than","then","so","very","what","when","where",
+  "why","how","who","which","there","here","just","like","get","got",
+  "make","made","will","would","can","could","should","shall","may",
+  "might","one","two","three","new","video","videos","about","into",
+  "over","out","off","up","down",
+]);
+
+const IDEATION_THINKING_BUDGET: number = (() => {
+  const raw = Number(process.env.ANTHROPIC_THINKING_BUDGET_IDEATION);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 6000;
+})();
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 export type DroppedIdea = {
   topicLabel: string;
   proposedTitle: string;
@@ -43,277 +122,110 @@ export type DroppedIdea = {
     | "banned_word"
     | "banned_topic"
     | "topic_overused"
-    | "originality"
+    | "logical_fit"
     | "topic_dup"
-    | "no_anchor"
-    | "own_channel";
+    | "no_format_alternative"
+    | "compose_missing"
+    | "parse_failure";
   detail?: string;
 };
 
-/**
- * Anchor check: each idea must be grounded in a trending format OR a
- * cross-channel viral topic (≥2 topicSimilarOutliers from DIFFERENT
- * competitors, each with multiplier ≥3). Both is ideal; neither is a
- * hard drop. Returns the anchor type for the post-LLM filter.
- */
-const ANCHOR_TOPIC_MIN_MULTIPLIER = 3;
-const ANCHOR_TOPIC_MIN_DISTINCT_COMPETITORS = 2;
-
-// Outliers-primary pool. Soften pass (T2 of follow-up PR): the prior
-// format×topic pipeline required ≥5× / 14d outliers AND ≥3-example
-// formats — both gates were too strict on HAmo's pool. New shape:
-//
-//   Outliers are the PRIMARY inspiration. Formats are OPTIONAL
-//   remix templates the LLM may use for ~40% of titles, with the
-//   remaining ~60% free-form in the channel's voice.
-//
-// Floor matches the methodology's outlier definition (≥1.5× — the alert
-// generation floor in MENTOR_METHOD §2); the 28d window catches anything
-// that's broken out in the last month without going so wide that stale
-// hits dominate. Source pool is sorted by (multiplier DESC, publishedAt
-// DESC) and capped at 30 — same scan cost as the old viral pool.
-const OUTLIER_MIN_MULTIPLIER = 1.5;
-const OUTLIER_WINDOW_DAYS = 28;
-const OUTLIER_LIMIT = 30;
-const MIN_OUTLIER_CANDIDATES = 3;
-
-// Formats are now optional flavor — drop the prior MIN_FORMAT_CANDIDATES
-// hard floor (extraction can ship 0-2 formats without blocking ideation).
-// We still bound the pool size so the prompt body doesn't bloat.
-const FORMAT_MIN_EXAMPLES = 2;
-const FORMAT_LIMIT = 5;
-
-// Default ideation slate size after all filters (length, banned words,
-// banned topics, topic frequency, originality, topic-cluster dedup).
-// We over-fetch from the LLM to absorb the drop cascade.
-const MAX_IDEAS = 10;
-// Over-fetch budget. The new outliers-primary flow asks for 1 idea per
-// outlier (rather than clustering them first), so the cap matches the
-// source pool size. After all gates the slate is trimmed to MAX_IDEAS.
-const OVER_FETCH_IDEAS = 16;
-
-// Title-length contract (T1). Proposed titles land in one of three
-// bands; only "ideal" + "acceptable" survive, anything over 100 chars
-// drops outright after one regenerate attempt.
-const TITLE_LEN_IDEAL_MIN = 50;
-const TITLE_LEN_IDEAL_MAX = 70;
-const TITLE_LEN_HARD_MAX = 80;
-const TITLE_LEN_RETRY_MAX = 100;
-const TITLE_LEN_DROP_FLOOR = 35; // anything <35 chars is also dropped
-
-// Banned-words contract (T2). Single regex catches all 11 banned terms
-// listed in operating rule 13. `\b` word boundaries handle multi-word
-// phrases (the inner space is matched literally; boundaries land at
-// the outer letter↔non-letter transitions). Any match forces regenerate
-// (max 1 retry) or drop.
-const BANNED_WORDS_RE =
-  /(\bcinematic\b|\bsensory\b|\bvisceral\b|\bprofound\b|\bdesolate expanse\b|\bhumanity has ever charted\b|\bhumanity has ever mapped\b|\binexorable\b|\bvastest\b|\bthe most absolute\b|\bphysically impossible\b)/i;
-
-// Originality guard. Thresholds live in idea-originality.ts (token-overlap
-// ratio, shared-noun count, longest consecutive-word run — three independent
-// gates). Up to MAX_RETRY_PASSES focused regenerate calls per flagged slot;
-// surviving flagged slots are DROPPED rather than shipped. Dropping is the
-// right tradeoff: better to return 3 strong ideas than 5 echoes.
-const MAX_RETRY_PASSES = 3;
-
-// Extended-thinking budget for the format×topic compose call. Sonnet 4.6
-// supports thinking natively. Ideation benefits more from reasoning than a
-// chat turn does (clustering outliers, picking the right format, composing
-// a novel title that survives the originality guard) — so the default is
-// fatter than the chat budget. Override via env if needed.
-const IDEATION_THINKING_BUDGET: number = (() => {
-  const raw = Number(process.env.ANTHROPIC_THINKING_BUDGET_IDEATION);
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 6000;
-})();
-// Retries do less work (a handful of titles, not the whole slate) — half
-// budget keeps cost in check across up to MAX_RETRY_PASSES passes.
-const IDEATION_RETRY_THINKING_BUDGET = Math.max(
-  1024,
-  Math.floor(IDEATION_THINKING_BUDGET / 2)
-);
-
-import {
-  performanceBandFor,
-  type PerformanceBand,
-} from "./validate-idea";
+export type SourceVideo = {
+  videoId: string;
+  title: string;
+  youtubeUrl: string;
+  thumbnailUrl: string | null;
+  competitorTitle: string | null;
+  competitorHandle: string | null;
+  competitorSubscriberCount: number | null;
+  views: number;
+  channelMedian: number;
+  multiplier: number;
+  performanceBand: PerformanceBand;
+  publishedAt: number | null;
+};
 
 export type ProposedIdea = {
-  // Compatibility hedge: keep the singular sourceOutlierVideoId field
-  // populated to the first entry of sourceTopicOutliers. Anything still
-  // reading the old shape keeps working until we clean up.
-  sourceOutlierVideoId: string;
-  // Soften pass (T2 of follow-up PR): sourceFormat is now nullable. The
-  // new outliers-primary pipeline asks the LLM to remix with a format
-  // template for ~40% of titles and leave the rest as free-form
-  // compositions in the channel's voice; free-form ideas ship with
-  // sourceFormat === null and the agent's structured markdown omits
-  // the "Format:" line for them.
-  sourceFormat: {
-    id: number;
-    template: string;
-    risingRate: number | null;
-    exampleCount: number;
-  } | null;
-  sourceTopicOutliers: Array<{
-    videoId: string;
-    title: string;
-    // T4 forensic-evidence fields. Every outlier surfaces verifiable
-    // numbers so the agent's output renders "224K views vs channel
-    // median 4K", not just "52×".
-    views: number;
-    channelMedian: number;
-    multiplier: number;
-    thumbnailUrl: string | null;
-    publishedAt: number | null;
-    competitorTitle: string | null;
-    competitorHandle: string | null;
-    competitorSubscriberCount: number | null;
-    performanceBand: PerformanceBand;
-  }>;
-  // Up to 3 OTHER competitor outliers covering the SAME TOPIC (token
-  // overlap on the topicLabel), excluding any id in sourceTopicOutliers.
-  // Replaces the prior otherFormatExamples block, which showed format
-  // siblings — useful for proving the SHAPE but irrelevant when the
-  // user wants to see who else covered the SAME TOPIC and how hard it
-  // hit. Falls back to [] when no cross-channel topic siblings exist.
-  topicSimilarOutliers: TopicSimilarMatch[];
-  // T5: 0-3 of the user's OWN videos that share content nouns with the
-  // topic. Surfaces the "Your catalog comparison" block inline in the
-  // agent's forensic markdown so HAmo sees instantly whether the channel
-  // has touched the topic and how it performed.
-  ownCatalogMatches: OwnCatalogMatch[];
   topicLabel: string;
   proposedTitle: string;
-  angle: string;
-  confidence: number;
-  originalityScore: number;
-  validation: ValidateResult;
-  // T1: which length band this title sits in. Both "ideal" and "acceptable"
-  // ship; "rejected" is filtered out of the surviving slate (kept on the
-  // dropped-ideas accumulator so the agent's Skipped section can report it).
-  titleLengthBand: "ideal" | "acceptable" | "rejected";
-  // T4: own-catalog frequency check. matches=N means the topic overlaps
-  // N of the channel's last 20 uploads. overused=true (≥2 matches)
-  // drops the slot; surviving ideas always have overused=false.
-  topicFrequencyCheck: {
-    matches: number;
-    matchedVideos: TopicFrequencyResult["matchedVideos"];
+  // One-sentence rationale from the composer — surfaces in the "Why this
+  // mix works" line under each idea. NEVER empty post-validator.
+  coherenceRationale: string;
+  // Logical-fit validator verdict + reason. logicallyCoherent=true is the
+  // ship gate; fits where the retry-compose call swapped formats end up
+  // here too (we trust the retry output rather than burn a 4th Claude
+  // call re-validating).
+  logicallyCoherent: boolean;
+  logicalFitReason: string;
+  // True when the slot's first compose hit a fit failure and a
+  // different format from the pool produced the surviving title.
+  // Drives the "🔁 Format swapped for fit" prefix in the chat output.
+  formatSwapped: boolean;
+
+  // SUBJECT source — same shape used by topicConfirmationVideos so the
+  // chat agent's markdown can reuse the same rendering helper.
+  topicSource: SourceVideo;
+  // STRUCTURE source — same shape. videoId differs from topicSource.videoId
+  // by construction (post-LLM check + retry).
+  formatSource: SourceVideo;
+
+  format: {
+    id: number;
+    template: string;
+    exampleCount: number;
+    distinctChannels: number;
+    risingRate: number | null;
+    isSingleChannel: boolean;
   };
+
+  // ≥2 cross-channel videos covering the SAME topic (different competitors
+  // from topicSource). Server guarantees ≥2 — single-channel clusters
+  // never become TopicCandidates.
+  topicConfirmationVideos: SourceVideo[];
+
+  // Own-catalog hydration so the chat agent can render the catalog
+  // verdict line inline without a second tool call.
+  validation: ValidateResult;
+  ownCatalogMatches: OwnCatalogMatch[];
+
+  // Optional supplementary cross-channel siblings outside the cluster —
+  // used by the chat agent when topicConfirmationVideos is sparse.
+  topicSimilarOutliers: TopicSimilarMatch[];
 };
+
+export type Idea = ProposedIdea;
 
 export type GenerateIdeasResult =
   | {
       ok: true;
       ideas: ProposedIdea[];
-      // What was filtered out and why. The chat agent surfaces this in
-      // the pre-ideation research block's "Skipped" line so the user
-      // sees the cost of the guardrails (not just the survivors).
       dropped: DroppedIdea[];
-      // The per-channel banned-topics list as parsed from channel_memory.
-      // Drives the "Skipped" line's banned-topic explanation.
       bannedTopics: string[];
       generatedAt: number;
       model: string;
+      claudeCallCount: number;
     }
-  | {
-      ok: false;
-      status: number;
-      error: string;
-      retryAfterSec?: number;
-    };
+  | { ok: false; status: number; error: string; retryAfterSec?: number };
 
-// Legacy alias — some external callers (if any) imported Idea by name.
-export type Idea = ProposedIdea;
+// ---------------------------------------------------------------------------
+// Public entrypoint
+// ---------------------------------------------------------------------------
 
-// Channel context the compose stage actually USES. Description is the
-// resolved single-paragraph string (legacy-fallback handled by
-// resolveChannelDescription); ideation_rules ships verbatim.
-type ChannelCtx = {
-  description: string;
-  ideation_rules?: string;
-};
-
-type FormatLite = {
-  id: number;
-  template: string;
-  examples: number;
-  risingRate: number | null;
-  avgMultiplier: number | null;
-};
-
-type OutlierLite = {
-  videoId: string;
-  title: string;
-  views: number;
-  // T4: surfaced through to ProposedIdea.sourceTopicOutliers so the
-  // forensic markup can render "views vs median" rather than naked
-  // multipliers.
-  channelMedian: number;
-  multiplier: number;
-  thumbnailUrl: string | null;
-  competitorTitle: string | null;
-  competitorHandle: string | null;
-  competitorSubscriberCount: number | null;
-  // Carried through from listOutliersForActiveChannel so the defense-in-
-  // depth own-channel filter below can compare against the active
-  // userChannelId. The SQL already excludes self-tracked competitors;
-  // this is a belt-and-braces guard per DEF-I1.
-  competitorChannelId: string | null;
-  tier: string;
-  publishedAt: number | null;
-};
-
-/**
- * Outliers-primary ideation. Pipeline (post-soften redesign):
- *   1. Pull the source pool: top 30 competitor outliers ≥1.5× channel
- *      median in the last 28 days, sorted (multiplier DESC, publishedAt
- *      DESC). Already-hidden videos + self-tracked-as-competitor rows
- *      are filtered at the SQL layer. Banned-topic substring filter is
- *      applied in JS before the LLM sees the pool.
- *   2. Pull the OPTIONAL format pool: top 5 trending formats by rising
- *      rate (≥2 examples, non-banned). May be empty — that's fine; the
- *      LLM is told formats are optional flavor, not a requirement.
- *   3. One Claude call: 1 idea per outlier (~16 outputs over-fetched).
- *      For each, the LLM may either remix with a format template
- *      (sourceFormatId set) or compose a free-form title in the
- *      channel's voice (sourceFormatId null). Target mix: ~40% format,
- *      ~60% free-form, but the model is told to drop the format entirely
- *      when none fit naturally.
- *   4. Standard post-LLM drop cascade: title length, banned words,
- *      banned topics (re-check post-compose), topic frequency (≥1 hit in
- *      last 20 own uploads), originality. Up to MAX_RETRY_PASSES focused
- *      regenerate passes per flagged slot.
- *   5. Topic-cluster dedup: if ≥2 surviving ideas share a topicLabel,
- *      keep the highest-scoring, drop the rest. Replaces the prior
- *      format-cluster dedup — variety is now measured by topic diversity.
- *   6. validateIdeaAgainstOwnCatalog + findTopicSimilarOutliers per idea.
- *
- * No rate limit. The whole point of the new flow is iterating until the
- * user likes the slate.
- *
- * Caller knobs:
- *   - outlierVideoIds: bypass auto-pick. Trust the caller's curation.
- *   - windowDays / minMultiplier: override the source pool gates.
- *     The chat agent should only set these when the USER explicitly asks
- *     to widen — operating rule 11 enforces that.
- *   - mode: "mixed" (default — ~40% format, ~60% free-form) or
- *     "free-form" (skip format pool entirely; every idea ships
- *     sourceFormat:null). HAmo can request "no format templates" in chat
- *     and the agent passes mode:"free-form".
- */
 export async function generateIdeasForChannel(opts: {
   userChannelId: string;
   outlierVideoIds?: string[];
   windowDays?: number;
   minMultiplier?: number;
+  // Legacy knob — retained for chat-tools compatibility, ignored: the
+  // Topic × Format mix pipeline always pairs every idea with a format
+  // source. "free-form" no longer skips the format pool.
   mode?: "mixed" | "free-form";
 }): Promise<GenerateIdeasResult> {
   const userChannelId = opts.userChannelId?.trim();
   if (!userChannelId) {
     return { ok: false, status: 400, error: "userChannelId required" };
   }
-  const all = listAllChannels();
-  const channel = all.find((c) => c.id === userChannelId);
+  const channel = listAllChannels().find((c) => c.id === userChannelId);
   if (!channel) {
     return {
       ok: false,
@@ -321,8 +233,6 @@ export async function generateIdeasForChannel(opts: {
       error: `Unknown userChannelId: ${userChannelId}`,
     };
   }
-
-  const now = Math.floor(Date.now() / 1000);
   const apiKey = getIntegration("claude")?.api_key;
   if (!apiKey) {
     return {
@@ -332,726 +242,541 @@ export async function generateIdeasForChannel(opts: {
     };
   }
 
-  // --- 1. Source pool: outliers ARE the primary inspiration ----------------
+  const now = Math.floor(Date.now() / 1000);
+  const bannedTopics = readBannedTopics(userChannelId);
+  const dropped: DroppedIdea[] = [];
+
+  // 1. Source pool ----------------------------------------------------------
   const outlierWindow = opts.windowDays ?? OUTLIER_WINDOW_DAYS;
   const outlierMult = opts.minMultiplier ?? OUTLIER_MIN_MULTIPLIER;
-  let outlierLites: OutlierLite[] = [];
-  let supplied = false;
-  if (opts.outlierVideoIds && opts.outlierVideoIds.length > 0) {
-    supplied = true;
-    const rows = getCompetitorVideosByIds(opts.outlierVideoIds.slice(0, OUTLIER_LIMIT));
-    // Hydrate multiplier per row using all-time competitor median (the
-    // bookkeeping table used by the alert generator). Caller-supplied
-    // IDs bypass the multiplier filter — we trust the caller's curation.
-    const medians = new Map<number, number>();
-    for (const cid of new Set(rows.map((r) => r.competitorId))) {
-      medians.set(cid, competitorMedianViews(cid));
-    }
-    outlierLites = rows.map((r) => {
-      const med = medians.get(r.competitorId) ?? 0;
-      return {
-        videoId: r.videoId,
-        title: r.title,
-        views: r.views,
-        channelMedian: med,
-        multiplier: med > 0 ? r.views / med : 0,
-        thumbnailUrl: ytThumbnail(r.videoId),
-        competitorTitle: r.competitorTitle,
-        competitorHandle: r.competitorHandle ?? null,
-        // The bulk-fetch helper doesn't carry subscriber_count; users
-        // who pass curated outlierVideoIds get null here, which the
-        // markup renders as "(unknown subs)". Acceptable for the
-        // power-user override path.
-        competitorSubscriberCount: null,
-        competitorChannelId: r.competitorChannelId ?? null,
-        tier: r.tier,
-        publishedAt: r.publishedAt,
-      };
-    });
-  } else {
-    const { outliers } = listOutliersForActiveChannel({
-      userChannelId,
-      windowDays: outlierWindow,
-      minMultiplier: outlierMult,
-      limit: OUTLIER_LIMIT,
-    });
-    outlierLites = outliers.map((o) => ({
-      videoId: o.videoId,
-      title: o.title,
-      views: o.views,
-      channelMedian: o.channelMedian,
-      multiplier: o.multiplier,
-      thumbnailUrl: o.thumbnailUrl ?? ytThumbnail(o.videoId),
-      competitorTitle: o.competitorTitle,
-      competitorHandle: o.competitorHandle ?? null,
-      competitorSubscriberCount: o.competitorSubscriberCount,
-      competitorChannelId: o.competitorChannelId ?? null,
-      tier: o.tier,
-      publishedAt: o.publishedAt,
-    }));
-    if (outlierLites.length < MIN_OUTLIER_CANDIDATES) {
-      return {
-        ok: false,
-        status: 409,
-        error: `Only ${outlierLites.length} outlier${outlierLites.length === 1 ? "" : "s"} ≥${outlierMult}× in the last ${outlierWindow} days — need ≥${MIN_OUTLIER_CANDIDATES}. Ask the user whether to widen the window or lower the multiplier; do NOT silently lower these thresholds.`,
-      };
-    }
-  }
-  // DEF-I1 defense-in-depth: strip any outlier whose competitor channel
-  // matches the active user channel. The SQL in listOutliersForActiveChannel
-  // already excludes self-tracked-as-competitor rows; this is the second
-  // belt in case (a) a caller bypasses that helper, or (b) a future SQL
-  // refactor regresses the filter. Drops here are silent — they're a
-  // data-hygiene issue, not user-facing.
-  const ownChannelDrops = outlierLites.filter(
-    (o) => o.competitorChannelId !== null && o.competitorChannelId === userChannelId
-  );
-  if (ownChannelDrops.length > 0) {
-    outlierLites = outlierLites.filter(
-      (o) => !(o.competitorChannelId !== null && o.competitorChannelId === userChannelId)
-    );
-    log.warn(
-      "claude",
-      `Outlier-ideas ${userChannelId}: stripped ${ownChannelDrops.length} own-channel rows from inspiration pool (self-tracked-as-competitor leak — investigate competitors table)`
-    );
-  }
-  // Soften pass: pre-LLM banned-topic filter. The agent's banned_topics
-  // list (channel_memory) used to be applied post-LLM only, after the
-  // compose call had already paid for tokens on banned-topic ideas;
-  // moving the FIRST pass forward saves cost + keeps the source pool
-  // clean. A second pass on (topicLabel, proposedTitle) still runs
-  // post-compose below — the LLM can still drift to a banned topic from
-  // a clean source.
-  const bannedTopics = readBannedTopics(userChannelId);
-  if (bannedTopics.length > 0) {
-    const beforeBanned = outlierLites.length;
-    outlierLites = outlierLites.filter((o) => {
-      const haystack = (o.title ?? "").toLowerCase();
-      for (const term of bannedTopics) {
-        if (term && haystack.includes(term)) return false;
-      }
-      return true;
-    });
-    const removed = beforeBanned - outlierLites.length;
-    if (removed > 0) {
-      log.info(
-        "claude",
-        `Outlier-ideas ${userChannelId}: pre-LLM banned-topic filter removed ${removed} of ${beforeBanned} outliers`
-      );
-    }
-  }
-  if (outlierLites.length === 0) {
+  const outliers = loadOutlierPool({
+    userChannelId,
+    outlierVideoIds: opts.outlierVideoIds,
+    windowDays: outlierWindow,
+    minMultiplier: outlierMult,
+    bannedTopics,
+  });
+  if (outliers.length === 0) {
     return {
       ok: false,
       status: 400,
       error: "No outliers available for this channel. Add competitors and sync first.",
     };
   }
-
-  // --- 2. Optional format pool (OK to be empty) ----------------------------
-  // Free-form mode skips the format pool entirely so every idea ships
-  // with sourceFormatId:null. Use when HAmo explicitly asks "no format
-  // templates" — operating rule 11 governs threshold widening, not
-  // mode-flipping, so this is a normal pass-through.
-  const mode: "mixed" | "free-form" = opts.mode === "free-form" ? "free-form" : "mixed";
-  const formats: FormatLite[] =
-    mode === "free-form"
-      ? []
-      : getFormatsForChannel(userChannelId, 30)
-          .filter((f) => f.examples.length >= FORMAT_MIN_EXAMPLES)
-          .sort((a, b) => (b.risingRate ?? 0) - (a.risingRate ?? 0))
-          .slice(0, FORMAT_LIMIT)
-          .map((f) => ({
-            id: f.id,
-            template: f.template,
-            examples: f.examples.length,
-            risingRate: f.risingRate,
-            avgMultiplier: f.avgMultiplier,
-          }));
-
-  // --- 3. Claude call: compose 1 idea per outlier (~16 over-fetch) --------
-  const md = loadMentorMethod();
-  const sec1 = extractSection(md, 1);
-  const sec4 = extractSection(md, 4);
-  const sec7 = extractSection(md, 7);
-  const sec9 = extractSection(md, 9);
-  // Resolve channel description via the legacy-fallback helper so old
-  // channels without the new column still surface concatenated context.
-  const ctx: ChannelCtx = {
-    description: resolveChannelDescription(channel as unknown as Channel),
-    ideation_rules: (channel as unknown as Channel).ideation_rules,
-  };
-
-  const systemPrompt = buildSystemPromptForCompose({
-    sec1,
-    sec4,
-    sec7,
-    sec9,
-    bannedTopics,
-    ideationRules: (ctx.ideation_rules ?? "").trim(),
-    mode,
-    formatPoolEmpty: formats.length === 0,
-  });
-
-  const userBody = buildUserBodyForCompose({
-    ctx,
-    formats,
-    outliers: outlierLites,
-    supplied,
-    bannedTopics,
-    mode,
-  });
-
-  const model = providerModelId("claude");
-  let rawIdeas: RawComposedIdea[] = [];
-  try {
-    const client = new Anthropic({ apiKey });
-    const resp = await client.messages.create({
-      model,
-      // 12k = 6k thinking + ~6k for the JSON output. Bumped from 8000
-      // when the default slate grew to 10 ideas (T3) + 12-cluster
-      // over-fetch — at ~300 output tokens per cluster the previous
-      // 2k headroom over thinking would overflow.
-      max_tokens: 12000,
-      // Extended thinking REQUIRES temperature=1 (the default). Setting
-      // any other value returns 400 "thinking.* requires temperature=1".
-      // We previously ran at 0.8 for tighter outputs; we trade that off
-      // for the reasoning quality thinking delivers.
-      system: systemPrompt,
-      messages: [{ role: "user", content: userBody }],
-      thinking: {
-        type: "enabled",
-        budget_tokens: IDEATION_THINKING_BUDGET,
-      },
-    });
-    const text = resp.content
-      .filter((b) => b.type === "text")
-      .map((b) => (b as { text: string }).text)
-      .join("\n")
-      .trim();
-    const parsed = parseComposedIdeas(
-      text,
-      // The id set is passed so parseComposedIdeas can null out any
-      // sourceFormatId the LLM made up. An empty set means every
-      // sourceFormatId becomes null — exactly the free-form case.
-      new Set(formats.map((f) => f.id)),
-      new Set(outlierLites.map((o) => o.videoId))
-    );
-    if (!parsed || parsed.length === 0) {
-      log.warn(
-        "claude",
-        `Outlier-ideas ${userChannelId}: could not parse ideas. Raw: ${text.slice(0, 240)}`
-      );
-      return {
-        ok: false,
-        status: 502,
-        error: "AI returned malformed JSON. Try again.",
-      };
-    }
-    rawIdeas = parsed;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : "Claude call failed";
-    log.error("claude", `Outlier-ideas ${userChannelId}: ${msg}`, err);
-    return { ok: false, status: 502, error: msg };
+  if (!opts.outlierVideoIds && outliers.length < 4) {
+    return {
+      ok: false,
+      status: 409,
+      error: `Only ${outliers.length} outlier${outliers.length === 1 ? "" : "s"} ≥${outlierMult}× in the last ${outlierWindow} days — need ≥4 for topic clustering. Ask the user whether to widen the window or lower the multiplier; do NOT silently lower these thresholds.`,
+    };
   }
 
-  // --- 4. Originality guard + regenerate passes ---------------------------
-  const outlierByVideoId = new Map(outlierLites.map((o) => [o.videoId, o]));
-  const formatById = new Map(formats.map((f) => [f.id, f]));
-
-  type Annotated = RawComposedIdea & {
-    sources: OutlierLite[];
-    originalityScore: number;
-    maxOverlap: number;
-    sharedNouns: number;
-    longestSharedRun: number;
-    worstSourceTitle: string | null;
-    flagged: boolean;
-    flagReason: string | null;
-  };
-  const score = (idea: RawComposedIdea): Annotated => {
-    const sources = idea.sourceTopicOutlierIds
-      .map((id) => outlierByVideoId.get(id))
-      .filter((x): x is OutlierLite => x !== undefined);
-    const verdict = scoreOriginality(
-      idea.proposedTitle,
-      sources.map((s) => s.title)
-    );
+  // 2. Topic clustering -----------------------------------------------------
+  const topicCandidates = clusterTopics(outliers).slice(0, TOPIC_CANDIDATE_LIMIT);
+  log.info(
+    "claude",
+    `[diag] ideation_clusters channel=${userChannelId} outliers=${outliers.length} clusters=${topicCandidates.length}`
+  );
+  if (topicCandidates.length === 0) {
     return {
-      ...idea,
-      sources,
-      originalityScore: verdict.originalityScore,
-      maxOverlap: verdict.maxOverlap,
-      sharedNouns: verdict.sharedNouns,
-      longestSharedRun: verdict.longestSharedRun,
-      worstSourceTitle:
-        verdict.worstSourceIndex >= 0
-          ? sources[verdict.worstSourceIndex]?.title ?? null
-          : null,
-      flagged: verdict.flagged,
-      flagReason: verdict.reason,
+      ok: false,
+      status: 409,
+      error: `No cross-channel topic clusters survived (need ≥${TOPIC_CLUSTER_MIN_DISTINCT_CHANNELS} distinct channels per topic). Sync more competitors or widen the outlier window.`,
     };
+  }
+
+  // 3. Format pool ----------------------------------------------------------
+  const formatCandidates = buildFormatPool(userChannelId).slice(
+    0,
+    FORMAT_CANDIDATE_LIMIT
+  );
+  if (formatCandidates.length === 0) {
+    return {
+      ok: false,
+      status: 409,
+      error: "No format templates available for this channel. Run 'Re-extract trending formats' on /outliers Trending Formats tab first.",
+    };
+  }
+
+  // 4. Compose call ---------------------------------------------------------
+  const ctx = {
+    description: resolveChannelDescription(channel as unknown as Channel),
+    ideationRules: ((channel as unknown as Channel).ideation_rules ?? "").trim(),
+  };
+  const model = providerModelId("claude");
+
+  let claudeCallCount = 0;
+  const composeResult = await runComposeCall({
+    apiKey,
+    model,
+    topicCandidates,
+    formatCandidates,
+    ctx,
+    bannedTopics,
+  });
+  claudeCallCount++;
+  if (!composeResult.ok) {
+    log.error("claude", `[diag] ideation_compose failed: ${composeResult.error}`);
+    return { ok: false, status: 502, error: composeResult.error };
+  }
+  log.info(
+    "claude",
+    `[diag] ideation_call_1_compose ok=true ideas_raw=${composeResult.ideas.length}/${topicCandidates.length}`
+  );
+
+  // 5. Post-LLM JS filters --------------------------------------------------
+  const topicByLabel = new Map(topicCandidates.map((t) => [t.topicLabel, t]));
+  const formatById = new Map(formatCandidates.map((f) => [f.formatId, f]));
+
+  type ComposedSlot = {
+    topicLabel: string;
+    proposedTitle: string;
+    coherenceRationale: string;
+    topicSourceVideoId: string;
+    formatId: number;
+    formatSourceVideoId: string;
+    formatSwapped: boolean;
   };
 
-  // Accumulator for every slot the post-LLM pass drops. The chat agent
-  // surfaces this in the "Skipped" line of the pre-ideation research
-  // block so the user sees the guardrails' cost, not just survivors.
-  const dropped: DroppedIdea[] = [];
+  const prelim: ComposedSlot[] = [];
+  for (const idea of composeResult.ideas) {
+    const topic = topicByLabel.get(idea.topicLabel);
+    const format = formatById.get(idea.formatId);
+    if (!topic || !format) continue;
 
-  // --- Pre-originality filters (T1 length, T2 banned words, T5 banned
-  //     topics, T4 topic frequency). Banned-topic + topic-frequency are
-  //     hard drops; length + banned-words allow one regenerate pass via
-  //     the existing originality retry loop (flagReason markers).
-  type PreFilterResult = {
-    surviving: RawComposedIdea[];
-    titleRetry: Array<RawComposedIdea & { reason: "title_too_long" | "banned_word"; detail: string }>;
-    topicFrequency: Map<string, TopicFrequencyResult>;
-  };
-  const prefilter = ((): PreFilterResult => {
-    const surviving: RawComposedIdea[] = [];
-    const titleRetry: PreFilterResult["titleRetry"] = [];
-    const topicFrequency = new Map<string, TopicFrequencyResult>();
+    // Re-anchor to a known source pair. Trust the model's choice when
+    // it matches the candidate pool; otherwise pin to the candidate's
+    // declared sources.
+    const topicSourceVideoId =
+      idea.topicSourceVideoId === topic.topicSourceVideo.videoId ||
+      topic.topicConfirmationVideos.some(
+        (v) => v.videoId === idea.topicSourceVideoId
+      )
+        ? idea.topicSourceVideoId
+        : topic.topicSourceVideo.videoId;
+    const formatSourceVideoId =
+      idea.formatSourceVideoId === format.formatSourceVideo.videoId ||
+      format.formatConfirmationVideos.some(
+        (v) => v.videoId === idea.formatSourceVideoId
+      )
+        ? idea.formatSourceVideoId
+        : format.formatSourceVideo.videoId;
 
-    for (const idea of rawIdeas) {
-      // T5: banned topics (substring match on topicLabel + proposedTitle).
-      const bannedHit = bannedTopicMatch(
-        idea.topicLabel,
-        idea.proposedTitle,
-        bannedTopics
-      );
-      if (bannedHit) {
-        dropped.push({
-          topicLabel: idea.topicLabel,
-          proposedTitle: idea.proposedTitle,
-          reason: "banned_topic",
-          detail: `matched banned term "${bannedHit}"`,
-        });
-        continue;
-      }
-
-      // T4: topic frequency (≥2 matching titles in last 20 own-channel
-      // uploads). Cache the result so survivors can carry it through.
-      const freq = checkTopicFrequency(idea.topicLabel, userChannelId, 20);
-      topicFrequency.set(idea.topicLabel, freq);
-      if (freq.overused) {
-        dropped.push({
-          topicLabel: idea.topicLabel,
-          proposedTitle: idea.proposedTitle,
-          reason: "topic_overused",
-          detail: `${freq.matches} of your last 20 uploads cover this`,
-        });
-        continue;
-      }
-
-      // T1: title length. Reject < floor or > retry-max outright;
-      // 81-100 chars → one regenerate via the existing retry loop;
-      // 50-80 chars → ship.
-      const band = titleLengthBandFor(idea.proposedTitle);
-      if (band === "rejected") {
-        dropped.push({
-          topicLabel: idea.topicLabel,
-          proposedTitle: idea.proposedTitle,
-          reason:
-            idea.proposedTitle.length < TITLE_LEN_DROP_FLOOR
-              ? "title_too_short"
-              : "title_too_long",
-          detail: `${idea.proposedTitle.length} chars`,
-        });
-        continue;
-      }
-      if (band === "too_long") {
-        titleRetry.push({
-          ...idea,
-          reason: "title_too_long",
-          detail: `${idea.proposedTitle.length} chars > ${TITLE_LEN_HARD_MAX} hard ceiling`,
-        });
-        continue;
-      }
-
-      // T2: banned words. Single regen attempt — if it sneaks back, drop.
-      const bannedWord = bannedWordMatch(idea.proposedTitle);
-      if (bannedWord) {
-        titleRetry.push({
-          ...idea,
-          reason: "banned_word",
-          detail: `contains banned term "${bannedWord}"`,
-        });
-        continue;
-      }
-
-      surviving.push(idea);
-    }
-    return { surviving, titleRetry, topicFrequency };
-  })();
-
-  let annotated: Annotated[] = prefilter.surviving.map(score);
-
-  // Run the title-length / banned-word regenerate pass through the same
-  // originality retry plumbing — mark slots flagged with the appropriate
-  // reason so buildRegenerateBody can emit a custom remix instruction.
-  // After this single forced retry, anything still failing length or
-  // banned-words is moved to `dropped` and not retried again.
-  if (prefilter.titleRetry.length > 0) {
-    log.debug(
-      "claude",
-      `Outlier-ideas ${userChannelId}: title/banned-word regenerate — ${prefilter.titleRetry.length} slots`
-    );
-    const titleRegenBody = buildTitleRetryBody(prefilter.titleRetry, formats);
-    try {
-      const client = new Anthropic({ apiKey });
-      const resp = await client.messages.create({
-        model,
-        max_tokens: 4000,
-        system: systemPrompt,
-        messages: [{ role: "user", content: titleRegenBody }],
-        thinking: {
-          type: "enabled",
-          budget_tokens: IDEATION_RETRY_THINKING_BUDGET,
-        },
+    if (topicSourceVideoId === formatSourceVideoId) {
+      dropped.push({
+        topicLabel: idea.topicLabel,
+        proposedTitle: idea.proposedTitle,
+        reason: "logical_fit",
+        detail: "topic source and format source resolved to the same video — discarded",
       });
-      const text = resp.content
-        .filter((b) => b.type === "text")
-        .map((b) => (b as { text: string }).text)
-        .join("\n")
-        .trim();
-      const parsedRetry = parseRegenerated(text);
-      if (parsedRetry) {
-        const retryByLabel = new Map(parsedRetry.map((r) => [r.topicLabel, r]));
-        for (const f of prefilter.titleRetry) {
-          const replacement = retryByLabel.get(f.topicLabel);
-          if (!replacement) {
+      continue;
+    }
+
+    // Length + banned-word + banned-topic + frequency drops (no retry).
+    const lenBand = titleLengthBandFor(idea.proposedTitle);
+    if (lenBand === "rejected" || lenBand === "too_long") {
+      dropped.push({
+        topicLabel: idea.topicLabel,
+        proposedTitle: idea.proposedTitle,
+        reason:
+          idea.proposedTitle.length < TITLE_LEN_DROP_FLOOR
+            ? "title_too_short"
+            : "title_too_long",
+        detail: `${idea.proposedTitle.length} chars`,
+      });
+      continue;
+    }
+    const bannedWord = bannedWordMatch(idea.proposedTitle);
+    if (bannedWord) {
+      dropped.push({
+        topicLabel: idea.topicLabel,
+        proposedTitle: idea.proposedTitle,
+        reason: "banned_word",
+        detail: `contains banned term "${bannedWord}"`,
+      });
+      continue;
+    }
+    const bannedHit = bannedTopicMatch(
+      idea.topicLabel,
+      idea.proposedTitle,
+      bannedTopics
+    );
+    if (bannedHit) {
+      dropped.push({
+        topicLabel: idea.topicLabel,
+        proposedTitle: idea.proposedTitle,
+        reason: "banned_topic",
+        detail: `matched banned term "${bannedHit}"`,
+      });
+      continue;
+    }
+    const freq = checkTopicFrequency(idea.topicLabel, userChannelId, 20);
+    if (freq.overused) {
+      dropped.push({
+        topicLabel: idea.topicLabel,
+        proposedTitle: idea.proposedTitle,
+        reason: "topic_overused",
+        detail: `${freq.matches} of your last 20 uploads cover this`,
+      });
+      continue;
+    }
+
+    prelim.push({
+      topicLabel: idea.topicLabel,
+      proposedTitle: idea.proposedTitle,
+      coherenceRationale: idea.coherenceRationale,
+      topicSourceVideoId,
+      formatId: idea.formatId,
+      formatSourceVideoId,
+      formatSwapped: false,
+    });
+  }
+
+  // 6. Logical-fit validator -----------------------------------------------
+  const validatorInputs: LogicalFitInput[] = prelim.map((slot, idx) => {
+    const topic = topicByLabel.get(slot.topicLabel)!;
+    const format = formatById.get(slot.formatId)!;
+    const topicSource =
+      topic.topicSourceVideo.videoId === slot.topicSourceVideoId
+        ? topic.topicSourceVideo
+        : topic.topicConfirmationVideos.find(
+            (v) => v.videoId === slot.topicSourceVideoId
+          ) ?? topic.topicSourceVideo;
+    const formatSource =
+      format.formatSourceVideo.videoId === slot.formatSourceVideoId
+        ? format.formatSourceVideo
+        : format.formatConfirmationVideos.find(
+            (v) => v.videoId === slot.formatSourceVideoId
+          ) ?? format.formatSourceVideo;
+    return {
+      ideaIndex: idx,
+      topicSourceTitle: topicSource.title,
+      formatSourceTitle: formatSource.title,
+      proposedTitle: slot.proposedTitle,
+      coherenceRationale: slot.coherenceRationale,
+    };
+  });
+
+  const verdicts = new Map<number, { logicallyCoherent: boolean; reason: string }>();
+  if (validatorInputs.length > 0 && claudeCallCount < MAX_CLAUDE_CALLS) {
+    const fit = await checkLogicalFit(validatorInputs);
+    claudeCallCount++;
+    if (!fit.ok) {
+      // Validator failure → ship all prelim slots with logicallyCoherent=true
+      // (better than no ideas at all). Diagnostic already logged.
+      for (const i of validatorInputs) {
+        verdicts.set(i.ideaIndex, {
+          logicallyCoherent: true,
+          reason: "validator unavailable",
+        });
+      }
+      log.warn(
+        "claude",
+        `[diag] ideation_call_2_validator failed; defaulting all=pass: ${fit.error}`
+      );
+    } else {
+      for (const v of fit.verdicts) {
+        verdicts.set(v.ideaIndex, {
+          logicallyCoherent: v.logicallyCoherent,
+          reason: v.reason,
+        });
+      }
+      const passes = fit.verdicts.filter((v) => v.logicallyCoherent).length;
+      log.info(
+        "claude",
+        `[diag] ideation_call_2_validator total=${fit.verdicts.length} pass=${passes} fail=${fit.verdicts.length - passes}`
+      );
+    }
+  }
+
+  // Slots that passed validation flow straight to surviving; slots that
+  // failed enter the retry queue (with their current format banned so the
+  // retry picks a different one).
+  const survivors: ComposedSlot[] = [];
+  const failedSlots: Array<{ slot: ComposedSlot; failedFormatIds: Set<number>; reason: string }> = [];
+  for (let i = 0; i < prelim.length; i++) {
+    const slot = prelim[i];
+    const v = verdicts.get(i);
+    if (!v) {
+      // Validator wasn't called (call cap or empty input) — trust compose.
+      survivors.push({ ...slot, formatSwapped: false });
+      continue;
+    }
+    if (v.logicallyCoherent) {
+      survivors.push({ ...slot, formatSwapped: false });
+    } else {
+      failedSlots.push({
+        slot,
+        failedFormatIds: new Set([slot.formatId]),
+        reason: v.reason,
+      });
+    }
+  }
+
+  // 7. Format-swap retry compose -------------------------------------------
+  if (failedSlots.length > 0 && claudeCallCount < MAX_CLAUDE_CALLS) {
+    const retryPayload = failedSlots
+      .map(({ slot, failedFormatIds, reason }) => {
+        const topic = topicByLabel.get(slot.topicLabel);
+        if (!topic) return null;
+        const alternatives = formatCandidates
+          .filter((f) => !failedFormatIds.has(f.formatId))
+          .slice(0, MAX_FORMAT_SWAPS_PER_SLOT);
+        if (alternatives.length === 0) return null;
+        return {
+          slot,
+          topic,
+          alternatives,
+          reason,
+        };
+      })
+      .filter((p): p is NonNullable<typeof p> => p !== null);
+
+    if (retryPayload.length > 0) {
+      const retry = await runRetryComposeCall({
+        apiKey,
+        model,
+        payload: retryPayload,
+        ctx,
+      });
+      claudeCallCount++;
+      if (retry.ok) {
+        log.info(
+          "claude",
+          `[diag] ideation_call_3_retry returned=${retry.ideas.length}/${retryPayload.length}`
+        );
+        const retryByLabel = new Map(retry.ideas.map((r) => [r.topicLabel, r]));
+        for (const { slot, failedFormatIds } of failedSlots) {
+          const r = retryByLabel.get(slot.topicLabel);
+          if (!r) {
             dropped.push({
-              topicLabel: f.topicLabel,
-              proposedTitle: f.proposedTitle,
-              reason: f.reason,
-              detail: `${f.detail}; retry produced no replacement`,
+              topicLabel: slot.topicLabel,
+              proposedTitle: slot.proposedTitle,
+              reason: "logical_fit",
+              detail: "retry produced no replacement",
             });
             continue;
           }
-          const merged: RawComposedIdea = {
-            ...f,
-            proposedTitle: replacement.proposedTitle,
-            angle: replacement.angle || f.angle,
-            confidence: replacement.confidence ?? f.confidence,
-          };
-          // Re-check: length, banned-word, banned-topic on the new title.
-          const reBanned = bannedTopicMatch(
-            merged.topicLabel,
-            merged.proposedTitle,
+          if (failedFormatIds.has(r.formatId)) {
+            dropped.push({
+              topicLabel: slot.topicLabel,
+              proposedTitle: slot.proposedTitle,
+              reason: "no_format_alternative",
+              detail: "retry returned the same banned format id",
+            });
+            continue;
+          }
+          const format = formatById.get(r.formatId);
+          const topic = topicByLabel.get(slot.topicLabel);
+          if (!format || !topic) continue;
+          // Re-validate JS-side filters on the retry title.
+          const lenBand = titleLengthBandFor(r.proposedTitle);
+          if (lenBand === "rejected" || lenBand === "too_long") {
+            dropped.push({
+              topicLabel: slot.topicLabel,
+              proposedTitle: r.proposedTitle,
+              reason: "title_too_long",
+              detail: `retry ${r.proposedTitle.length} chars`,
+            });
+            continue;
+          }
+          if (bannedWordMatch(r.proposedTitle)) {
+            dropped.push({
+              topicLabel: slot.topicLabel,
+              proposedTitle: r.proposedTitle,
+              reason: "banned_word",
+              detail: "retry contained banned term",
+            });
+            continue;
+          }
+          const bannedHit = bannedTopicMatch(
+            slot.topicLabel,
+            r.proposedTitle,
             bannedTopics
           );
-          if (reBanned) {
+          if (bannedHit) {
             dropped.push({
-              topicLabel: merged.topicLabel,
-              proposedTitle: merged.proposedTitle,
+              topicLabel: slot.topicLabel,
+              proposedTitle: r.proposedTitle,
               reason: "banned_topic",
-              detail: `regen drifted into banned term "${reBanned}"`,
+              detail: `retry matched banned term "${bannedHit}"`,
             });
             continue;
           }
-          const reBand = titleLengthBandFor(merged.proposedTitle);
-          if (reBand === "rejected" || reBand === "too_long") {
+          // Resolve source ids on the retry. topic source stays the
+          // cluster's primary; format source resolves to the new format's
+          // primary example. We do NOT re-call the validator on retry
+          // output (would exceed the 3-call cap).
+          const topicSourceVideoId =
+            r.topicSourceVideoId === topic.topicSourceVideo.videoId ||
+            topic.topicConfirmationVideos.some(
+              (v) => v.videoId === r.topicSourceVideoId
+            )
+              ? r.topicSourceVideoId
+              : topic.topicSourceVideo.videoId;
+          const formatSourceVideoId =
+            r.formatSourceVideoId === format.formatSourceVideo.videoId ||
+            format.formatConfirmationVideos.some(
+              (v) => v.videoId === r.formatSourceVideoId
+            )
+              ? r.formatSourceVideoId
+              : format.formatSourceVideo.videoId;
+          if (topicSourceVideoId === formatSourceVideoId) {
             dropped.push({
-              topicLabel: merged.topicLabel,
-              proposedTitle: merged.proposedTitle,
-              reason: "title_too_long",
-              detail: `${merged.proposedTitle.length} chars after retry`,
+              topicLabel: slot.topicLabel,
+              proposedTitle: r.proposedTitle,
+              reason: "logical_fit",
+              detail: "retry pair resolved to same video",
             });
             continue;
           }
-          const reBannedWord = bannedWordMatch(merged.proposedTitle);
-          if (reBannedWord) {
-            dropped.push({
-              topicLabel: merged.topicLabel,
-              proposedTitle: merged.proposedTitle,
-              reason: "banned_word",
-              detail: `regen still contains "${reBannedWord}"`,
-            });
-            continue;
-          }
-          annotated.push(score(merged));
+          survivors.push({
+            topicLabel: slot.topicLabel,
+            proposedTitle: r.proposedTitle,
+            coherenceRationale: r.coherenceRationale,
+            topicSourceVideoId,
+            formatId: r.formatId,
+            formatSourceVideoId,
+            formatSwapped: true,
+          });
         }
       } else {
         log.warn(
           "claude",
-          `Outlier-ideas ${userChannelId}: title-retry returned malformed JSON; dropping ${prefilter.titleRetry.length} slots`
+          `[diag] ideation_call_3_retry failed: ${retry.error}; dropping ${failedSlots.length} slots`
         );
-        for (const f of prefilter.titleRetry) {
+        for (const { slot, reason } of failedSlots) {
           dropped.push({
-            topicLabel: f.topicLabel,
-            proposedTitle: f.proposedTitle,
-            reason: f.reason,
-            detail: `${f.detail}; retry parse failed`,
+            topicLabel: slot.topicLabel,
+            proposedTitle: slot.proposedTitle,
+            reason: "logical_fit",
+            detail: `retry call errored — original fail reason: ${reason}`,
           });
         }
       }
-    } catch (err) {
-      log.warn(
-        "claude",
-        `Outlier-ideas ${userChannelId}: title-retry call failed: ${err instanceof Error ? err.message : "?"}`
-      );
-      for (const f of prefilter.titleRetry) {
+    } else {
+      // No alternatives available — drop without burning the call.
+      for (const { slot, reason } of failedSlots) {
         dropped.push({
-          topicLabel: f.topicLabel,
-          proposedTitle: f.proposedTitle,
-          reason: f.reason,
-          detail: `${f.detail}; retry call errored`,
+          topicLabel: slot.topicLabel,
+          proposedTitle: slot.proposedTitle,
+          reason: "no_format_alternative",
+          detail: `no alternative format in pool — fit fail: ${reason}`,
         });
       }
     }
-  }
-
-  for (let pass = 0; pass < MAX_RETRY_PASSES; pass++) {
-    const flagged = annotated.filter((a) => a.flagged);
-    if (flagged.length === 0) break;
-    log.debug(
-      "claude",
-      `Outlier-ideas ${userChannelId}: regenerate pass ${pass + 1} — ${flagged.length} flagged (${flagged.map((f) => f.flagReason).join(",")})`
-    );
-    const regenBody = buildRegenerateBody(
-      flagged.map((f) => ({
-        topicLabel: f.topicLabel,
-        sourceTopicOutlierIds: f.sourceTopicOutlierIds,
-        sourceFormatId: f.sourceFormatId,
-        proposedTitle: f.proposedTitle,
-        originalityScore: f.originalityScore,
-        maxOverlap: f.maxOverlap,
-        sharedNouns: f.sharedNouns,
-        longestSharedRun: f.longestSharedRun,
-        worstSourceTitle: f.worstSourceTitle,
-        flagReason: f.flagReason,
-      })),
-      formats
-    );
-    try {
-      const client = new Anthropic({ apiKey });
-      const resp = await client.messages.create({
-        model,
-        // Bumped from 1500 → 5000 to fit the retry thinking budget plus a
-        // few hundred tokens for the regenerated JSON. Temperature MUST be
-        // 1 (the default) when thinking is enabled — we previously ran at
-        // 0.9 for retry novelty; thinking compensates by reasoning through
-        // the remix instructions explicitly.
-        max_tokens: 5000,
-        system: systemPrompt,
-        messages: [{ role: "user", content: regenBody }],
-        thinking: {
-          type: "enabled",
-          budget_tokens: IDEATION_RETRY_THINKING_BUDGET,
-        },
+  } else if (failedSlots.length > 0) {
+    // Call cap reached — drop all failures.
+    for (const { slot, reason } of failedSlots) {
+      dropped.push({
+        topicLabel: slot.topicLabel,
+        proposedTitle: slot.proposedTitle,
+        reason: "logical_fit",
+        detail: `call cap reached — fail reason: ${reason}`,
       });
-      const text = resp.content
-        .filter((b) => b.type === "text")
-        .map((b) => (b as { text: string }).text)
-        .join("\n")
-        .trim();
-      const parsedRetry = parseRegenerated(text);
-      if (!parsedRetry) {
-        log.warn(
-          "claude",
-          `Outlier-ideas ${userChannelId}: regenerate pass ${pass + 1} returned malformed JSON; dropping flagged slots`
-        );
-        break;
-      }
-      // Replace flagged slots in-place by topicLabel match.
-      const retryByLabel = new Map(parsedRetry.map((r) => [r.topicLabel, r]));
-      annotated = annotated.map((a) => {
-        if (!a.flagged) return a;
-        const replacement = retryByLabel.get(a.topicLabel);
-        if (!replacement) return a;
-        const merged: RawComposedIdea = {
-          ...a,
-          proposedTitle: replacement.proposedTitle,
-          angle: replacement.angle || a.angle,
-          confidence: replacement.confidence ?? a.confidence,
-        };
-        return score(merged);
-      });
-    } catch (err) {
-      log.warn(
-        "claude",
-        `Outlier-ideas ${userChannelId}: regenerate pass ${pass + 1} failed: ${err instanceof Error ? err.message : "?"}`
-      );
-      break;
     }
   }
 
-  // Drop slots that still overlap too much after retries. Accumulate the
-  // dropped originality slots for the Skipped research-block line.
-  for (const a of annotated.filter((x) => x.flagged)) {
-    dropped.push({
-      topicLabel: a.topicLabel,
-      proposedTitle: a.proposedTitle,
-      reason: "originality",
-      detail: a.flagReason ?? `overlap=${a.maxOverlap.toFixed(2)}`,
-    });
-  }
-  // Pre-sort survivors by a combined "ship value": confidence weights
-  // intent, originalityScore weights novelty. Higher wins.
-  const preDedup = annotated
-    .filter((a) => !a.flagged)
-    .sort(
-      (a, b) =>
-        (b.confidence ?? 0) * 10 + (b.originalityScore ?? 0)
-        - ((a.confidence ?? 0) * 10 + (a.originalityScore ?? 0))
-    );
-
-  // Topic-cluster dedup (replaces the prior format-cluster dedup). The
-  // outliers-primary pipeline composes 1 idea per outlier, so the LLM
-  // can drift into clustering around the same hot topic. We collapse by
-  // a normalised topicLabel — keep the highest-scoring, drop the rest.
-  // Goal: 10 distinct topics across 10 ideas.
-  const normaliseTopic = (t: string): string =>
-    t.toLowerCase().replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ").trim().replace(/\s+/g, " ");
-  const seenTopics = new Set<string>();
-  const afterTopicDedup: typeof preDedup = [];
-  for (const a of preDedup) {
-    const key = normaliseTopic(a.topicLabel);
-    if (seenTopics.has(key)) {
+  // Topic-cluster dedup: keep one survivor per topicLabel.
+  const seen = new Set<string>();
+  const deduped: ComposedSlot[] = [];
+  for (const s of survivors) {
+    const key = s.topicLabel.toLowerCase().trim();
+    if (seen.has(key)) {
       dropped.push({
-        topicLabel: a.topicLabel,
-        proposedTitle: a.proposedTitle,
+        topicLabel: s.topicLabel,
+        proposedTitle: s.proposedTitle,
         reason: "topic_dup",
-        detail: `topic "${a.topicLabel}" already covered by a higher-scoring idea`,
+        detail: `topic "${s.topicLabel}" already shipped`,
       });
       continue;
     }
-    seenTopics.add(key);
-    afterTopicDedup.push(a);
+    seen.add(key);
+    deduped.push(s);
   }
-  // Cap surviving slate at MAX_IDEAS.
-  const surviving = afterTopicDedup.slice(0, MAX_IDEAS);
 
-  // DEF-I4: per-reason attrition logging. Drives the agent's "Skipped"
-  // research-block line and helps HAmo see where the cascade lost ideas.
+  // 8. Hydrate per-idea -----------------------------------------------------
+  const ideas: ProposedIdea[] = [];
+  for (const slot of deduped) {
+    const topic = topicByLabel.get(slot.topicLabel);
+    const format = formatById.get(slot.formatId);
+    if (!topic || !format) continue;
+    const topicSource =
+      topic.topicSourceVideo.videoId === slot.topicSourceVideoId
+        ? topic.topicSourceVideo
+        : topic.topicConfirmationVideos.find(
+            (v) => v.videoId === slot.topicSourceVideoId
+          ) ?? topic.topicSourceVideo;
+    const formatSource =
+      format.formatSourceVideo.videoId === slot.formatSourceVideoId
+        ? format.formatSourceVideo
+        : format.formatConfirmationVideos.find(
+            (v) => v.videoId === slot.formatSourceVideoId
+          ) ?? format.formatSourceVideo;
+
+    // Topic confirmation = all cluster siblings EXCEPT topicSource,
+    // capped at TOPIC_CONFIRMATION_MAX. Spec requires ≥2 cross-channel
+    // proofs; the cluster filter already guarantees ≥2 distinct
+    // channels in the cluster, so this is non-empty.
+    const topicConfirmationVideos = topic.topicConfirmationVideos
+      .filter((v) => v.videoId !== topicSource.videoId)
+      .slice(0, TOPIC_CONFIRMATION_MAX);
+
+    const validation = validateIdeaAgainstOwnCatalog({
+      topic: slot.topicLabel,
+      userChannelId,
+    });
+    const ownCatalogMatches = findOwnCatalogTopicMatches(
+      slot.topicLabel,
+      userChannelId,
+      { limit: 3 }
+    );
+    const topicSimilarOutliers = findTopicSimilarOutliers(
+      slot.topicLabel,
+      userChannelId,
+      {
+        limit: 3,
+        excludeVideoIds: [topicSource.videoId, formatSource.videoId],
+      }
+    );
+
+    const verdict = verdicts.get(
+      prelim.findIndex((p) => p.topicLabel === slot.topicLabel)
+    );
+    const idea: ProposedIdea = {
+      topicLabel: slot.topicLabel,
+      proposedTitle: slot.proposedTitle,
+      coherenceRationale: slot.coherenceRationale,
+      logicallyCoherent: true,
+      logicalFitReason: slot.formatSwapped
+        ? "swapped format after first compose failed fit"
+        : verdict?.reason ?? "passed logical fit on first compose",
+      formatSwapped: slot.formatSwapped,
+      topicSource,
+      formatSource,
+      format: {
+        id: format.formatId,
+        template: format.template,
+        exampleCount: format.exampleCount,
+        distinctChannels: format.distinctChannels,
+        risingRate: format.risingRate,
+        isSingleChannel: format.isSingleChannel,
+      },
+      topicConfirmationVideos,
+      validation,
+      ownCatalogMatches,
+      topicSimilarOutliers,
+    };
+    ideas.push(idea);
+  }
+
   const dropCounts: Record<string, number> = {};
   for (const d of dropped) {
     dropCounts[d.reason] = (dropCounts[d.reason] ?? 0) + 1;
   }
   log.info(
     "claude",
-    `Outlier-ideas ${userChannelId}: attrition — LLM raw=${rawIdeas.length}, prefilter survived=${prefilter.surviving.length}, post-originality=${annotated.filter((x) => !x.flagged).length}, post-topic-dedup=${afterTopicDedup.length}, shipped=${Math.min(surviving.length, MAX_IDEAS)}; drops=${JSON.stringify(dropCounts)}`
-  );
-
-  // --- 5. Validate each surviving idea against own catalog + hydrate
-  //        the "Same topic across competitors" block. Replaces the prior
-  //        otherFormatExamples (format siblings) — users want to see
-  //        who else covered the SAME TOPIC and how hard it hit, not
-  //        more videos using the same shape.
-  // First map every survivor to its ProposedIdea shape so we can inspect
-  // both anchors (sourceFormat + topicSimilarOutliers) in one pass.
-  const mapped = surviving.map((a) => {
-    const fmt =
-      a.sourceFormatId !== null ? formatById.get(a.sourceFormatId) : null;
-    const validation = validateIdeaAgainstOwnCatalog({
-      topic: a.topicLabel,
-      userChannelId,
-    });
-    const sourceIds = new Set(a.sources.map((s) => s.videoId));
-    const topicSimilarOutliers = findTopicSimilarOutliers(
-      a.topicLabel,
-      userChannelId,
-      { limit: 3, excludeVideoIds: [...sourceIds] }
-    );
-    // T5 — own-channel catalog matches for the forensic "Your catalog
-    // comparison" block. Up to 3 of the user's videos that share content
-    // nouns with the proposed topic, with full views/median/date so the
-    // agent's markdown shows verifiable evidence inline.
-    const ownCatalogMatches = findOwnCatalogTopicMatches(
-      a.topicLabel,
-      userChannelId,
-      { limit: 3 }
-    );
-    return {
-      raw: a,
-      shaped: {
-        sourceOutlierVideoId: a.sources[0]?.videoId ?? "",
-        sourceFormat:
-          fmt && a.sourceFormatId !== null
-            ? {
-                id: a.sourceFormatId,
-                template: fmt.template,
-                risingRate: fmt.risingRate,
-                exampleCount: fmt.examples,
-              }
-            : null,
-        sourceTopicOutliers: a.sources.map((s) => {
-          const m = Math.round(s.multiplier * 10) / 10;
-          // OutlierLite carries views; channelMedian + subs were added
-          // to OutlierRow in T4 and now flow through OutlierLite as
-          // additional fields.
-          return {
-            videoId: s.videoId,
-            title: s.title,
-            views: s.views,
-            channelMedian: s.channelMedian,
-            multiplier: m,
-            thumbnailUrl: s.thumbnailUrl,
-            publishedAt: s.publishedAt,
-            competitorTitle: s.competitorTitle,
-            competitorHandle: s.competitorHandle,
-            competitorSubscriberCount: s.competitorSubscriberCount,
-            performanceBand: performanceBandFor(m),
-          };
-        }),
-        topicSimilarOutliers,
-        ownCatalogMatches,
-        topicLabel: a.topicLabel,
-        proposedTitle: a.proposedTitle,
-        angle: a.angle,
-        confidence: a.confidence,
-        originalityScore: Math.round(a.originalityScore * 100) / 100,
-        validation,
-        titleLengthBand:
-          titleLengthBandFor(a.proposedTitle) === "ideal" ? "ideal" : "acceptable" as "ideal" | "acceptable",
-        topicFrequencyCheck: {
-          matches: prefilter.topicFrequency.get(a.topicLabel)?.matches ?? 0,
-          matchedVideos:
-            prefilter.topicFrequency.get(a.topicLabel)?.matchedVideos ?? [],
-        },
-      } satisfies ProposedIdea,
-    };
-  });
-
-  // T5: viral_format × viral_topic enforcement. Every idea must anchor
-  // in EITHER a trending format (sourceFormat !== null) OR a cross-
-  // channel viral topic (≥2 topicSimilarOutliers from DIFFERENT
-  // competitors, each with multiplier ≥3). Drops surface as
-  // reason:"no_anchor" so HAmo can see why the slate shrank.
-  const hasViralTopicAnchor = (
-    sims: ProposedIdea["topicSimilarOutliers"]
-  ): boolean => {
-    const strong = sims.filter(
-      (s) =>
-        s.multiplier >= ANCHOR_TOPIC_MIN_MULTIPLIER && !!s.competitorTitle
-    );
-    if (strong.length < ANCHOR_TOPIC_MIN_DISTINCT_COMPETITORS) return false;
-    const distinctChannels = new Set(strong.map((s) => s.competitorTitle));
-    return distinctChannels.size >= ANCHOR_TOPIC_MIN_DISTINCT_COMPETITORS;
-  };
-  const ideas: ProposedIdea[] = [];
-  for (const { shaped } of mapped) {
-    const hasFormatAnchor = shaped.sourceFormat !== null;
-    const hasTopicAnchor = hasViralTopicAnchor(shaped.topicSimilarOutliers);
-    if (!hasFormatAnchor && !hasTopicAnchor) {
-      dropped.push({
-        topicLabel: shaped.topicLabel,
-        proposedTitle: shaped.proposedTitle,
-        reason: "no_anchor",
-        detail: `no trending format AND no cross-channel viral topic (≥2 competitors at ≥${ANCHOR_TOPIC_MIN_MULTIPLIER}×)`,
-      });
-      continue;
-    }
-    ideas.push(shaped);
-  }
-
-  // The attrition log already fired before mapping survivors — see
-  // dropCounts log above. This second info-line just summarises the
-  // shipped slate.
-  const withFormat = ideas.filter((i) => i.sourceFormat !== null).length;
-  log.info(
-    "claude",
-    `Outlier-ideas ${userChannelId}: shipped ${ideas.length}/${MAX_IDEAS} ideas (${dropped.length} total drops); formats-available=${formats.length}, mode=${mode}, ideas-using-format=${withFormat}/${ideas.length}, outliers-in-pool=${outlierLites.length}`
+    `[diag] ideation_done channel=${userChannelId} shipped=${ideas.length} dropped=${dropped.length} drops=${JSON.stringify(dropCounts)} calls=${claudeCallCount}/${MAX_CLAUDE_CALLS}`
   );
 
   return {
@@ -1061,317 +786,739 @@ export async function generateIdeasForChannel(opts: {
     bannedTopics,
     generatedAt: now,
     model,
+    claudeCallCount,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Prompt builders
+// Source pool
 // ---------------------------------------------------------------------------
 
-function buildSystemPromptForCompose(opts: {
-  sec1: string;
-  sec4: string;
-  sec7: string;
-  sec9: string;
+type OutlierLite = {
+  videoId: string;
+  title: string;
+  thumbnailUrl: string | null;
+  views: number;
+  channelMedian: number;
+  multiplier: number;
+  publishedAt: number | null;
+  competitorId: number | null;
+  competitorTitle: string | null;
+  competitorHandle: string | null;
+  competitorChannelId: string | null;
+  competitorSubscriberCount: number | null;
+  performanceBand: PerformanceBand;
+};
+
+function loadOutlierPool(opts: {
+  userChannelId: string;
+  outlierVideoIds?: string[];
+  windowDays: number;
+  minMultiplier: number;
   bannedTopics: string[];
+}): OutlierLite[] {
+  const { userChannelId, outlierVideoIds, windowDays, minMultiplier, bannedTopics } = opts;
+  let rows: OutlierLite[] = [];
+  if (outlierVideoIds && outlierVideoIds.length > 0) {
+    const fetched = getCompetitorVideosByIds(
+      outlierVideoIds.slice(0, OUTLIER_SOURCE_LIMIT)
+    );
+    const medians = new Map<number, number>();
+    for (const cid of new Set(fetched.map((r) => r.competitorId))) {
+      medians.set(cid, competitorMedianViews(cid));
+    }
+    rows = fetched.map((r) => {
+      const median = medians.get(r.competitorId) ?? 0;
+      const mult = median > 0 ? r.views / median : 0;
+      return {
+        videoId: r.videoId,
+        title: r.title,
+        thumbnailUrl: ytThumbnail(r.videoId),
+        views: r.views,
+        channelMedian: median,
+        multiplier: Math.round(mult * 10) / 10,
+        publishedAt: r.publishedAt,
+        competitorId: r.competitorId,
+        competitorTitle: r.competitorTitle,
+        competitorHandle: r.competitorHandle ?? null,
+        competitorChannelId: r.competitorChannelId ?? null,
+        competitorSubscriberCount: null,
+        performanceBand: performanceBandFor(mult),
+      };
+    });
+  } else {
+    const { outliers } = listOutliersForActiveChannel({
+      userChannelId,
+      windowDays,
+      minMultiplier,
+      limit: OUTLIER_SOURCE_LIMIT,
+    });
+    rows = outliers.map((o) => ({
+      videoId: o.videoId,
+      title: o.title,
+      thumbnailUrl: o.thumbnailUrl ?? ytThumbnail(o.videoId),
+      views: o.views,
+      channelMedian: o.channelMedian,
+      multiplier: o.multiplier,
+      publishedAt: o.publishedAt,
+      competitorId: o.competitorId,
+      competitorTitle: o.competitorTitle,
+      competitorHandle: o.competitorHandle ?? null,
+      competitorChannelId: o.competitorChannelId ?? null,
+      competitorSubscriberCount: o.competitorSubscriberCount,
+      performanceBand: performanceBandFor(o.multiplier),
+    }));
+  }
+
+  // Defense-in-depth: strip own-channel rows and banned-topic rows.
+  rows = rows.filter(
+    (r) =>
+      !(r.competitorChannelId !== null && r.competitorChannelId === userChannelId)
+  );
+  if (bannedTopics.length > 0) {
+    rows = rows.filter((r) => {
+      const haystack = (r.title ?? "").toLowerCase();
+      for (const term of bannedTopics) {
+        if (term && haystack.includes(term)) return false;
+      }
+      return true;
+    });
+  }
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Topic clustering — JS-only
+// ---------------------------------------------------------------------------
+
+type TopicCandidate = {
+  topicLabel: string;
+  // Highest-multiplier video in the cluster.
+  topicSourceVideo: SourceVideo;
+  // Remaining cluster members from different competitors. Always ≥2 by
+  // construction (cluster wouldn't survive otherwise).
+  topicConfirmationVideos: SourceVideo[];
+  distinctChannels: number;
+  maxMultiplier: number;
+  mostRecent: number;
+  sharedNouns: string[];
+};
+
+function tokenize(s: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of s
+    .toLowerCase()
+    .replace(/[^a-zа-яёіїєґ0-9 ]+/giu, " ")
+    .split(/\s+/)) {
+    if (!raw || raw.length < 4) continue;
+    if (STOPWORDS.has(raw)) continue;
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    out.push(raw);
+  }
+  return out;
+}
+
+function clusterTopics(outliers: OutlierLite[]): TopicCandidate[] {
+  if (outliers.length === 0) return [];
+  const tokens = outliers.map((o) => new Set(tokenize(o.title)));
+
+  // Union-find: edge when two videos share ≥TOPIC_CLUSTER_MIN_SHARED_NOUNS.
+  const parent = outliers.map((_, i) => i);
+  const find = (i: number): number => {
+    while (parent[i] !== i) {
+      parent[i] = parent[parent[i]];
+      i = parent[i];
+    }
+    return i;
+  };
+  const union = (a: number, b: number) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent[ra] = rb;
+  };
+
+  for (let i = 0; i < outliers.length; i++) {
+    for (let j = i + 1; j < outliers.length; j++) {
+      let shared = 0;
+      for (const t of tokens[i]) {
+        if (tokens[j].has(t)) shared++;
+        if (shared >= TOPIC_CLUSTER_MIN_SHARED_NOUNS) break;
+      }
+      if (shared >= TOPIC_CLUSTER_MIN_SHARED_NOUNS) union(i, j);
+    }
+  }
+
+  const groups = new Map<number, number[]>();
+  for (let i = 0; i < outliers.length; i++) {
+    const root = find(i);
+    const g = groups.get(root) ?? [];
+    g.push(i);
+    groups.set(root, g);
+  }
+
+  const candidates: TopicCandidate[] = [];
+  for (const [, indices] of groups) {
+    if (indices.length < 2) continue;
+    const members = indices.map((i) => outliers[i]);
+    // distinct_channels — use competitorChannelId when present, else
+    // competitor_id (numeric). Both keyed on the competitor row.
+    const channelKey = (m: OutlierLite) =>
+      m.competitorChannelId ?? `cid:${m.competitorId ?? "?"}`;
+    const distinctChannels = new Set(members.map(channelKey)).size;
+    if (distinctChannels < TOPIC_CLUSTER_MIN_DISTINCT_CHANNELS) continue;
+
+    // Shared nouns across ≥2 cluster members → topicLabel.
+    const tokenCounts = new Map<string, number>();
+    for (const idx of indices) {
+      for (const t of tokens[idx]) {
+        tokenCounts.set(t, (tokenCounts.get(t) ?? 0) + 1);
+      }
+    }
+    const sharedNouns = [...tokenCounts.entries()]
+      .filter(([, n]) => n >= 2)
+      .sort((a, b) => b[1] - a[1])
+      .map(([t]) => t)
+      .slice(0, 5);
+    if (sharedNouns.length === 0) continue;
+    const topicLabel = sharedNouns.slice(0, 3).join(" ");
+
+    members.sort((a, b) => b.multiplier - a.multiplier);
+    const topicSourceLite = members[0];
+    const topicSourceVideo = toSourceVideo(topicSourceLite);
+    const remainingByChannel = new Map<string, SourceVideo[]>();
+    for (const m of members.slice(1)) {
+      const key = channelKey(m);
+      if (key === channelKey(topicSourceLite)) continue;
+      const arr = remainingByChannel.get(key) ?? [];
+      arr.push(toSourceVideo(m));
+      remainingByChannel.set(key, arr);
+    }
+    const topicConfirmationVideos: SourceVideo[] = [];
+    for (const arr of remainingByChannel.values()) {
+      if (topicConfirmationVideos.length >= TOPIC_CONFIRMATION_MAX) break;
+      topicConfirmationVideos.push(arr[0]);
+    }
+    if (topicConfirmationVideos.length < TOPIC_CONFIRMATION_MIN) continue;
+
+    const maxMultiplier = members.reduce(
+      (acc, m) => (m.multiplier > acc ? m.multiplier : acc),
+      0
+    );
+    const mostRecent = members.reduce(
+      (acc, m) => Math.max(acc, m.publishedAt ?? 0),
+      0
+    );
+
+    candidates.push({
+      topicLabel,
+      topicSourceVideo,
+      topicConfirmationVideos,
+      distinctChannels,
+      maxMultiplier,
+      mostRecent,
+      sharedNouns,
+    });
+  }
+
+  candidates.sort((a, b) => {
+    if (b.distinctChannels !== a.distinctChannels)
+      return b.distinctChannels - a.distinctChannels;
+    if (b.maxMultiplier !== a.maxMultiplier)
+      return b.maxMultiplier - a.maxMultiplier;
+    return b.mostRecent - a.mostRecent;
+  });
+  return candidates;
+}
+
+function toSourceVideo(o: OutlierLite): SourceVideo {
+  return {
+    videoId: o.videoId,
+    title: o.title,
+    youtubeUrl: `https://www.youtube.com/watch?v=${o.videoId}`,
+    thumbnailUrl: o.thumbnailUrl,
+    competitorTitle: o.competitorTitle,
+    competitorHandle: o.competitorHandle,
+    competitorSubscriberCount: o.competitorSubscriberCount,
+    views: o.views,
+    channelMedian: o.channelMedian,
+    multiplier: o.multiplier,
+    performanceBand: o.performanceBand,
+    publishedAt: o.publishedAt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Format pool
+// ---------------------------------------------------------------------------
+
+type FormatCandidate = {
+  formatId: number;
+  template: string;
+  exampleCount: number;
+  distinctChannels: number;
+  risingRate: number | null;
+  avgMultiplier: number | null;
+  isSingleChannel: boolean;
+  formatSourceVideo: SourceVideo;
+  formatConfirmationVideos: SourceVideo[];
+};
+
+function buildFormatPool(userChannelId: string): FormatCandidate[] {
+  const formats = getFormatsForChannel(userChannelId, 50);
+  const out: FormatCandidate[] = [];
+  for (const f of formats) {
+    if (f.examples.length < FORMAT_MIN_EXAMPLES) continue;
+    const sorted = [...f.examples].sort(
+      (a, b) => (b.multiplierAtExtract || 0) - (a.multiplierAtExtract || 0)
+    );
+    const formatSourceLite = sorted[0];
+    const formatSourceVideo = formatExampleToSource(formatSourceLite);
+    const confirmations: SourceVideo[] = sorted
+      .slice(1, 1 + FORMAT_CONFIRMATION_TARGET)
+      .map(formatExampleToSource);
+    const distinctChannels = new Set(
+      f.examples.map((e) => e.competitorTitle ?? `cid:${e.competitorId}`)
+    ).size;
+    out.push({
+      formatId: f.id,
+      template: f.template,
+      exampleCount: f.examples.length,
+      distinctChannels,
+      risingRate: f.risingRate,
+      avgMultiplier: f.avgMultiplier,
+      isSingleChannel: f.isSingleChannel,
+      formatSourceVideo,
+      formatConfirmationVideos: confirmations,
+    });
+  }
+  out.sort((a, b) => {
+    if ((b.risingRate ?? 0) !== (a.risingRate ?? 0))
+      return (b.risingRate ?? 0) - (a.risingRate ?? 0);
+    if (b.exampleCount !== a.exampleCount)
+      return b.exampleCount - a.exampleCount;
+    return (b.avgMultiplier ?? 0) - (a.avgMultiplier ?? 0);
+  });
+  return out;
+}
+
+function formatExampleToSource(
+  e: ReturnType<typeof getFormatsForChannel>[number]["examples"][number]
+): SourceVideo {
+  const mult = e.multiplierAtExtract ?? 0;
+  return {
+    videoId: e.videoId,
+    title: e.title,
+    youtubeUrl: `https://www.youtube.com/watch?v=${e.videoId}`,
+    thumbnailUrl: e.thumbnailUrl ?? ytThumbnail(e.videoId),
+    competitorTitle: e.competitorTitle,
+    competitorHandle: e.competitorHandle,
+    competitorSubscriberCount: e.competitorSubs,
+    views: e.views,
+    // The format-example row doesn't carry the competitor's own median;
+    // best-effort fallback is to back-compute median = views / multiplier
+    // when multiplier > 0. Renders close enough for the markdown — when
+    // multiplier is 0 we leave channelMedian at 0 and the chat agent
+    // renders "(unknown)".
+    channelMedian: mult > 0 ? Math.round(e.views / mult) : 0,
+    multiplier: Math.round(mult * 10) / 10,
+    performanceBand: performanceBandFor(mult),
+    publishedAt: e.publishedAt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Claude #1 — compose
+// ---------------------------------------------------------------------------
+
+type ComposeOutput = {
+  topicLabel: string;
+  topicSourceVideoId: string;
+  formatId: number;
+  formatSourceVideoId: string;
+  proposedTitle: string;
+  coherenceRationale: string;
+};
+
+type ComposeResult =
+  | { ok: true; ideas: ComposeOutput[] }
+  | { ok: false; error: string };
+
+async function runComposeCall(opts: {
+  apiKey: string;
+  model: string;
+  topicCandidates: TopicCandidate[];
+  formatCandidates: FormatCandidate[];
+  ctx: { description: string; ideationRules: string };
+  bannedTopics: string[];
+}): Promise<ComposeResult> {
+  const { apiKey, model, topicCandidates, formatCandidates, ctx, bannedTopics } = opts;
+  const systemPrompt = buildComposeSystemPrompt({
+    ideationRules: ctx.ideationRules,
+    bannedTopics,
+  });
+  const userBody = buildComposeUserBody({
+    ctx,
+    topicCandidates,
+    formatCandidates,
+  });
+  try {
+    const client = new Anthropic({ apiKey });
+    const resp = await client.messages.create({
+      model,
+      max_tokens: 10000,
+      temperature: 1,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userBody }],
+      thinking: { type: "enabled", budget_tokens: IDEATION_THINKING_BUDGET },
+    });
+    const text = resp.content
+      .filter((b) => b.type === "text")
+      .map((b) => (b as { text: string }).text)
+      .join("\n")
+      .trim();
+    const parsed = parseComposeOutput(
+      text,
+      new Set(topicCandidates.map((t) => t.topicLabel)),
+      new Set(formatCandidates.map((f) => f.formatId))
+    );
+    if (!parsed) {
+      return { ok: false, error: "compose returned malformed JSON" };
+    }
+    return { ok: true, ideas: parsed };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "compose call failed",
+    };
+  }
+}
+
+function buildComposeSystemPrompt(opts: {
   ideationRules: string;
-  mode: "mixed" | "free-form";
-  formatPoolEmpty: boolean;
+  bannedTopics: string[];
 }): string {
-  const bannedBlock =
-    opts.bannedTopics.length > 0
-      ? [
-          "# BANNED TOPICS (per channel_memory)",
-          "NEVER propose ideas touching the following. If a recent outlier mentions any banned term as a substring (case-insensitive), skip that outlier entirely — do NOT compose a title for it.",
-          ...opts.bannedTopics.map((t) => `- ${t}`),
-          "",
-        ]
-      : [];
   const ideationRulesBlock = opts.ideationRules
     ? [
-        "# PER-CHANNEL IDEATION RULES (HAmo-authored, HARD enforcement)",
-        "The creator has set these rules for THIS channel. They override every other compose heuristic. A title that violates any rule below MUST be regenerated or dropped — do NOT compromise the rule to ship the title.",
+        "# PER-CHANNEL IDEATION RULES (HARD enforcement)",
         opts.ideationRules,
         "",
       ]
     : [];
-
-  // The mix-mode guidance differs sharply by mode. "free-form" means
-  // sourceFormatId MUST be null on every idea; "mixed" leaves the
-  // decision to the model, with the explicit target ratio and the
-  // freedom to skip the format entirely when no format fits.
-  const mixGuidance =
-    opts.mode === "free-form" || opts.formatPoolEmpty
+  const bannedBlock =
+    opts.bannedTopics.length > 0
       ? [
-          "# COMPOSE MODE — FREE-FORM ONLY",
-          opts.mode === "free-form"
-            ? "The caller has asked for free-form titles only. The TRENDING FORMATS block below is intentionally empty. Every idea MUST set sourceFormatId to null. Compose every title in the channel's voice as a fresh free-form composition — DO NOT invent format ids."
-            : "No trending formats are available for this channel right now. Every idea MUST set sourceFormatId to null. Compose every title in the channel's voice as a fresh free-form composition.",
+          "# BANNED TOPICS",
+          "NEVER propose a title touching any term below as a substring (case-insensitive). Skip the slot rather than ship a banned-topic title.",
+          ...opts.bannedTopics.map((t) => `- ${t}`),
           "",
         ]
-      : [
-          "# COMPOSE MODE — MIXED (formats are OPTIONAL flavor)",
-          "Outliers are the PRIMARY inspiration. Trending formats are AVAILABLE remix templates the model MAY use, but is NOT required to.",
-          `Aim for roughly 40% of titles using a format template (sourceFormatId set to that template's id) and 60% as free-form titles in the channel's voice (sourceFormatId null). If no format fits a particular outlier naturally, set sourceFormatId to null and compose free-form — a forced fit is worse than no template.`,
-          "Variety is the goal: do NOT pick the same format twice in a row, and prefer using EVERY listed format at least once rather than stacking the most-rising one.",
-          "",
-        ];
-  const outputShape =
-    opts.mode === "free-form" || opts.formatPoolEmpty
-      ? '      "sourceFormatId": null,'
-      : '      "sourceFormatId": number | null,    // a format id from TRENDING FORMATS, OR null for a free-form composition';
-
+      : [];
   return [
-    "You propose NEW YouTube video title ideas. PRIMARY inspiration: the recent viral OUTLIERS below — competitor videos that beat their own channel's median in the last 4 weeks. Each idea MUST be inspired by exactly ONE source outlier (cite its videoId in sourceTopicOutlierIds[0]).",
+    "You compose NEW YouTube video title ideas by MIXING a TOPIC from one viral video with a FORMAT (title-shape template) from a DIFFERENT viral video.",
     "",
-    "Workflow:",
-    "1. Pick ~16 of the strongest outliers (multiplier × age × topic fit for the channel). One idea per outlier.",
-    "2. For each outlier, propose ONE new title in the channel's voice. The new title must NOT share significant phrasing with the source outlier — apply the IDEA, not the phrasing.",
-    "3. Use the COMPOSE MODE guidance below to decide whether to remix with a format template or compose free-form.",
-    "4. Match the channel's voice — terse vs poetic, tabloid vs measured. Voice trumps style ties.",
+    "# THE NON-NEGOTIABLE RULE",
+    "Topic provides SUBJECT. Format provides STRUCTURE. They cannot create FABRICATED facts together. A title that says \"James Webb Found a Black Hole\" when the topic source is Webb biosignatures and the format source is a Sagittarius A* video is INCOHERENT — Webb did not find a black hole. The mix must describe a video a viewer could plausibly watch on the topic source's subject.",
     "",
-    "# TITLE LANGUAGE — plain words only",
-    "Every proposedTitle MUST be readable by a 14-year-old in under 2 seconds. Mirror the lexical register of competitor outliers (\"huge\", \"hiding\", \"hard\", \"real\", \"big\", \"found\", \"moved\"). Prefer Anglo-Saxon over Latinate. NEVER use any of these words/phrases: cinematic, sensory, visceral, profound, desolate expanse, humanity has ever charted, humanity has ever mapped, inexorable, vastest, the most absolute, physically impossible. Server-side regex enforces this — titles containing any banned term will be regenerated or dropped.",
+    "# WORKFLOW",
+    "1. For EACH topic candidate listed below, compose EXACTLY ONE new title.",
+    "2. Pick the BEST-FITTING format from the trending-formats pool. The topic source video and the format source video MUST BE DIFFERENT videos — your output's topicSourceVideoId and formatSourceVideoId cannot match.",
+    "3. Apply the format's structure to the topic's subject. Do NOT copy the topic source's phrasing. Do NOT invent facts the topic source doesn't support.",
+    "4. Produce a one-sentence coherenceRationale explaining WHY the mix works — what about the format's structure transfers cleanly onto the topic's subject without fabricating a connection.",
     "",
-    "# TITLE LENGTH",
-    `Every proposedTitle MUST land in 50-80 characters (ideal 50-70). Titles over 80 chars are regenerated once then dropped if still over. Titles under ${TITLE_LEN_DROP_FLOOR} are dropped outright.`,
+    "# OUTPUT CONSTRAINTS",
+    `- proposedTitle: 50-70 chars ideal, 80 chars hard ceiling, ${TITLE_LEN_DROP_FLOOR}+ floor.`,
+    "- Plain words a 14-year-old reads in <2 seconds. NEVER use: cinematic, sensory, visceral, profound, desolate expanse, humanity has ever charted, humanity has ever mapped, inexorable, vastest, the most absolute, physically impossible.",
+    "- Mirror the lexical register of the topic source's competitor outliers.",
+    "- topicLabel MUST match a topic candidate's label below.",
+    "- formatId MUST be one of the numeric ids listed in the format pool.",
+    "- topicSourceVideoId MUST be the topic candidate's primary source OR one of its confirmation video ids.",
+    "- formatSourceVideoId MUST be the chosen format's primary source OR one of its confirmation video ids.",
+    "- topicSourceVideoId !== formatSourceVideoId. ALWAYS.",
+    "- coherenceRationale: 1 short sentence (≤180 chars). NEVER empty.",
     "",
-    ...bannedBlock,
     ...ideationRulesBlock,
-    ...mixGuidance,
-    "From MENTOR_METHOD.md §1 (Competitor mapping — the B&S Method):",
-    opts.sec1 || "(section unavailable)",
-    "",
-    "From MENTOR_METHOD.md §4 (Title formats — structural patterns, not literal titles):",
-    opts.sec4 || "(section unavailable)",
-    "",
-    "From MENTOR_METHOD.md §7 (Ideation — synthesizing the inputs):",
-    opts.sec7 || "(section unavailable)",
-    "",
-    "From MENTOR_METHOD.md §9 (The \"what made it work\" lever taxonomy):",
-    opts.sec9 || "(section unavailable)",
-    "",
-    `# Allowed angle values (use these exact strings)`,
-    LEVERS.map((l) => `"${l}"`).join(", "),
-    "",
-    "# Hard rules",
-    `- Output ${OVER_FETCH_IDEAS} candidate ideas — the server drops some via length / banned-word / banned-topic / topic-frequency / originality / topic-dup / no-anchor filters and ships up to ${MAX_IDEAS}. Quality over quantity.`,
-    "- ANCHOR RULE — each idea MUST be anchored in EITHER (a) a trending format (sourceFormatId set to an id from TRENDING FORMATS), OR (b) a cross-channel viral topic (the source outlier has ≥2 cross-channel siblings at ≥3× — the server picks these from competitor data on your behalf, you just need to ensure the topicLabel describes something that's actually moving across multiple channels). Ideally BOTH. Ideas grounded in neither are dropped by the server. If you cannot find either anchor for an outlier you picked, skip it and pick a different one from the pool.",
-    "- Each idea cites exactly ONE source outlier in sourceTopicOutlierIds (use exactly one element).",
-    "- sourceFormatId is either a numeric id from TRENDING FORMATS or null. NEVER invent a format id.",
-    "- topicLabel is 4–8 words, the subject area, NOT the proposed title. Two ideas on the same topic will be deduped — DIVERSIFY topics across the slate.",
-    "- proposedTitle is YOUR composed title. Never copy a source title's phrasing. 50-70 chars ideal, 80 chars hard ceiling.",
-    "- angle is one §9 lever — the dominant lever the source outlier leans on.",
-    "- confidence (0.0–1.0): higher when (a) the source outlier hit ≥3×, (b) the topic naturally fits the channel's niche, (c) when using a format, the format has many examples + high rising rate.",
-    "- Authority + Breakthrough tier sources carry more weight than Adjacent + Far.",
-    "",
+    ...bannedBlock,
     "Return ONLY a JSON object. No prose, no markdown, no code fence.",
-    "Shape:",
     "{",
     '  "ideas": [',
     "    {",
     '      "topicLabel": string,',
-    '      "sourceTopicOutlierIds": string[],   // exactly one element',
-    outputShape,
+    '      "topicSourceVideoId": string,',
+    '      "formatId": number,',
+    '      "formatSourceVideoId": string,',
     '      "proposedTitle": string,',
-    '      "angle": string,',
-    '      "confidence": number',
+    '      "coherenceRationale": string',
     "    }",
     "  ]",
     "}",
   ].join("\n");
 }
 
-function buildUserBodyForCompose(opts: {
-  ctx: ChannelCtx;
-  formats: FormatLite[];
-  outliers: OutlierLite[];
-  supplied: boolean;
-  bannedTopics: string[];
-  mode: "mixed" | "free-form";
+function buildComposeUserBody(opts: {
+  ctx: { description: string; ideationRules: string };
+  topicCandidates: TopicCandidate[];
+  formatCandidates: FormatCandidate[];
 }): string {
-  const { ctx, formats, outliers, supplied, bannedTopics, mode } = opts;
-  const formatBlock =
-    mode === "free-form"
-      ? [
-          `# TRENDING FORMATS — DISABLED (caller requested free-form mode)`,
-          `Every idea MUST set sourceFormatId to null.`,
-          "",
-        ]
-      : formats.length > 0
-        ? [
-            `# TRENDING FORMATS (${formats.length}, ≥${FORMAT_MIN_EXAMPLES} examples, sorted by rising rate)`,
-            `OPTIONAL — use a format id ONLY when one fits the outlier's topic naturally. Free-form (sourceFormatId:null) is the right answer when no template fits.`,
-            ...formats.map(
-              (f) =>
-                `- [F-${f.id}] "${f.template}" — ${f.examples} examples — rising_rate=${(f.risingRate ?? 0).toFixed(2)}, avg_mult=${(f.avgMultiplier ?? 0).toFixed(1)}×`
-            ),
-            "",
-          ]
-        : [
-            `# TRENDING FORMATS — none extracted yet for this channel.`,
-            `Every idea MUST set sourceFormatId to null. Compose free-form titles in the channel's voice.`,
-            "",
-          ];
-  return [
-    "# USER CHANNEL CONTEXT",
-    `## About this channel`,
-    ctx.description.length > 0 ? ctx.description : "(not set — ask HAmo to fill /channel-info)",
-    "",
-    ...(bannedTopics.length > 0
-      ? [
-          `# BANNED TOPICS (skip outliers touching any of these as substring)`,
-          ...bannedTopics.map((t) => `- ${t}`),
-          "",
-        ]
-      : []),
-    ...formatBlock,
-    `# RECENT OUTLIERS (${outliers.length}${supplied ? ", caller-supplied" : `, ≥${OUTLIER_MIN_MULTIPLIER}× last ${OUTLIER_WINDOW_DAYS}d`}) — the PRIMARY inspiration pool`,
-    `Sorted by (multiplier DESC, recency DESC). Compose ONE idea per outlier you pick.`,
-    ...outliers.map(
-      (o) =>
-        `- [${o.videoId}] "${o.title}" — ${o.competitorTitle ?? "(unknown)"} (${o.tier}) — ${o.multiplier.toFixed(1)}× median — ${o.views.toLocaleString("en-US")} views — ${o.publishedAt ? fmtAge(o.publishedAt) : "unknown"}`
-    ),
-  ].join("\n");
+  const { ctx, topicCandidates, formatCandidates } = opts;
+  const lines: string[] = [];
+  lines.push("# USER CHANNEL CONTEXT");
+  lines.push("## About this channel");
+  lines.push(
+    ctx.description.length > 0
+      ? ctx.description
+      : "(not set — ask the user to fill /channel-info or the Brain panel in /chat)"
+  );
+  lines.push("");
+  lines.push(`# TOPIC CANDIDATES (${topicCandidates.length})`);
+  lines.push(
+    "Each topic is a cluster of cross-channel outliers sharing content nouns. Compose EXACTLY ONE title per topicLabel."
+  );
+  for (const t of topicCandidates) {
+    lines.push("");
+    lines.push(`## ${t.topicLabel}`);
+    lines.push(
+      `- distinct_channels=${t.distinctChannels}, max_multiplier=${t.maxMultiplier.toFixed(1)}×, shared_nouns=${t.sharedNouns.join(",")}`
+    );
+    lines.push(
+      `- primary source [${t.topicSourceVideo.videoId}] "${t.topicSourceVideo.title}" — ${t.topicSourceVideo.competitorTitle ?? "(unknown)"} (${t.topicSourceVideo.multiplier.toFixed(1)}×, ${t.topicSourceVideo.views.toLocaleString("en-US")} views)`
+    );
+    for (const c of t.topicConfirmationVideos) {
+      lines.push(
+        `- confirmation [${c.videoId}] "${c.title}" — ${c.competitorTitle ?? "(unknown)"} (${c.multiplier.toFixed(1)}×)`
+      );
+    }
+  }
+  lines.push("");
+  lines.push(`# FORMAT POOL (${formatCandidates.length})`);
+  lines.push(
+    "Each format is a structural template with proven examples. Pick the BEST-FITTING format per topic. The format source video id MUST NOT equal the topic source video id."
+  );
+  for (const f of formatCandidates) {
+    lines.push("");
+    lines.push(`## format_id=${f.formatId}`);
+    lines.push(
+      `- template: ${JSON.stringify(f.template)}${f.isSingleChannel ? " (single-channel pattern)" : ""}`
+    );
+    lines.push(
+      `- example_count=${f.exampleCount}, distinct_channels=${f.distinctChannels}, rising_rate=${(f.risingRate ?? 0).toFixed(2)}, avg_multiplier=${(f.avgMultiplier ?? 0).toFixed(1)}×`
+    );
+    lines.push(
+      `- primary source [${f.formatSourceVideo.videoId}] "${f.formatSourceVideo.title}" — ${f.formatSourceVideo.competitorTitle ?? "(unknown)"} (${f.formatSourceVideo.multiplier.toFixed(1)}×)`
+    );
+    for (const c of f.formatConfirmationVideos) {
+      lines.push(
+        `- example [${c.videoId}] "${c.title}" — ${c.competitorTitle ?? "(unknown)"} (${c.multiplier.toFixed(1)}×)`
+      );
+    }
+  }
+  return lines.join("\n");
 }
 
-/**
- * Title-length / banned-word forced retry body. Sent ONCE per turn for
- * any slot that violated T1 (length > 80) or T2 (banned word in title).
- * The model rewrites just those titles; surviving slots flow through the
- * downstream originality pass unchanged.
- */
-function buildTitleRetryBody(
-  flagged: Array<{
-    topicLabel: string;
-    sourceFormatId: number | null;
-    proposedTitle: string;
-    reason: "title_too_long" | "banned_word";
-    detail: string;
-  }>,
-  formats: FormatLite[]
-): string {
-  const fmtById = new Map(formats.map((f) => [f.id, f]));
-  return [
-    "# FORCED RETRY — title-length or banned-word violations",
-    "",
-    `Your previous titles broke one of two contracts. Rewrite each, keeping the same topicLabel and sourceFormatId (null stays null, a specific id stays that id). Hard constraints:`,
-    `  - Length: 50-70 chars ideal, 80 chars hard ceiling. < 35 or > 100 = dropped.`,
-    `  - Language: NEVER use cinematic, sensory, visceral, profound, desolate expanse, humanity has ever charted, humanity has ever mapped, inexorable, vastest, the most absolute, physically impossible. Plain words a 14-year-old reads in <2 seconds. Mirror competitor outlier register ("huge", "hiding", "real", "found").`,
-    "",
-    "Return JSON ONLY:",
-    "{",
-    '  "regenerated": [',
-    '    { "topicLabel": string, "proposedTitle": string, "angle": string, "confidence": number }',
-    "  ]",
-    "}",
-    "",
-    ...flagged.map((f) => {
-      const fmt = f.sourceFormatId !== null ? fmtById.get(f.sourceFormatId) : null;
-      return [
-        `## ${f.topicLabel}`,
-        fmt
-          ? `- Format [F-${f.sourceFormatId}]: "${fmt.template}"`
-          : `- Format: free-form (no template — keep it that way)`,
-        `- BLOCKED previous attempt (${f.detail}): "${f.proposedTitle}"`,
-      ].join("\n");
-    }),
-  ].join("\n");
-}
-
-function buildRegenerateBody(
-  flagged: Array<{
-    topicLabel: string;
-    sourceTopicOutlierIds: string[];
-    sourceFormatId: number | null;
-    proposedTitle: string;
-    originalityScore: number;
-    maxOverlap: number;
-    sharedNouns: number;
-    longestSharedRun: number;
-    worstSourceTitle: string | null;
-    flagReason: string | null;
-  }>,
-  formats: FormatLite[]
-): string {
-  const fmtById = new Map(formats.map((f) => [f.id, f]));
-  return [
-    "# FORCED RETRY — your previous titles echoed the source outlier too closely",
-    "",
-    "These are forced retries. Your previous attempts mirrored a source outlier's phrasing instead of proposing a new angle on the topic. Be AGGRESSIVE on novelty. For each entry below, generate a TRULY DIFFERENT title for the SAME topic and source outlier but with:",
-    "  - different subject phrasing,",
-    "  - different verb choice,",
-    "  - swap at least 2 content nouns for synonyms, related concepts, or oblique references.",
-    "",
-    "Examples of how to remix (illustrative — invent your own; do NOT reuse these literally):",
-    "  • instead of \"CERN Just Detected Two Timelines\" → \"A CERN Detector Quietly Logged Something Impossible\"",
-    "  • or → \"Two Timelines Appeared at CERN — and No One Will Discuss It\"",
-    "  • instead of \"James Webb Found Galaxies That Shouldn't Exist\" → \"Webb's Deep Field Holds a Geometry That Breaks the Models\"",
-    "  • or → \"There Are Galaxies in Webb's Data That Pre-Date the Universe\"",
-    "",
-    "Keep the same topicLabel and sourceFormatId (null stays null). Return JSON ONLY:",
-    "{",
-    '  "regenerated": [',
-    '    { "topicLabel": string, "proposedTitle": string, "angle": string, "confidence": number }',
-    "  ]",
-    "}",
-    "",
-    ...flagged.map((f) => {
-      const fmt = f.sourceFormatId !== null ? fmtById.get(f.sourceFormatId) : null;
-      const reasonLabel =
-        f.flagReason === "shared-run"
-          ? `shared a ${f.longestSharedRun}-word run with a source`
-          : f.flagReason === "shared-nouns"
-            ? `shared ${f.sharedNouns} content nouns with a source`
-            : `overlapped ${(f.maxOverlap * 100).toFixed(0)}% of tokens with a source`;
-      return [
-        `## ${f.topicLabel}`,
-        fmt
-          ? `- Format [F-${f.sourceFormatId}]: "${fmt.template}"`
-          : `- Format: free-form (no template — stay free-form)`,
-        `- BLOCKED previous attempt: "${f.proposedTitle}"`,
-        `- Reason: ${reasonLabel} (originalityScore=${f.originalityScore.toFixed(2)}, maxOverlap=${f.maxOverlap.toFixed(2)}, sharedNouns=${f.sharedNouns}, longestSharedRun=${f.longestSharedRun})`,
-        f.worstSourceTitle
-          ? `- Closest source: "${f.worstSourceTitle}"`
-          : `- Source ids: ${f.sourceTopicOutlierIds.join(", ")}`,
-      ].join("\n");
-    }),
-  ].join("\n");
+function parseComposeOutput(
+  raw: string,
+  knownTopicLabels: Set<string>,
+  knownFormatIds: Set<number>
+): ComposeOutput[] | null {
+  const parsed = parseJsonObject(raw);
+  if (!parsed || typeof parsed !== "object") return null;
+  const arr = (parsed as { ideas?: unknown }).ideas;
+  if (!Array.isArray(arr)) return null;
+  const out: ComposeOutput[] = [];
+  const seenLabels = new Set<string>();
+  for (const r of arr) {
+    if (!r || typeof r !== "object") continue;
+    const o = r as Record<string, unknown>;
+    const topicLabel =
+      typeof o.topicLabel === "string" ? o.topicLabel.trim() : "";
+    if (!topicLabel || !knownTopicLabels.has(topicLabel)) continue;
+    if (seenLabels.has(topicLabel)) continue;
+    const topicSourceVideoId =
+      typeof o.topicSourceVideoId === "string"
+        ? o.topicSourceVideoId.trim()
+        : "";
+    const formatSourceVideoId =
+      typeof o.formatSourceVideoId === "string"
+        ? o.formatSourceVideoId.trim()
+        : "";
+    const proposedTitle =
+      typeof o.proposedTitle === "string" ? o.proposedTitle.trim() : "";
+    const coherenceRationale =
+      typeof o.coherenceRationale === "string"
+        ? o.coherenceRationale.trim()
+        : "";
+    const formatId =
+      typeof o.formatId === "number" && Number.isFinite(o.formatId)
+        ? Math.floor(o.formatId)
+        : -1;
+    if (
+      !topicSourceVideoId ||
+      !formatSourceVideoId ||
+      topicSourceVideoId === formatSourceVideoId ||
+      !proposedTitle ||
+      !coherenceRationale ||
+      !knownFormatIds.has(formatId)
+    ) {
+      continue;
+    }
+    seenLabels.add(topicLabel);
+    out.push({
+      topicLabel,
+      topicSourceVideoId,
+      formatId,
+      formatSourceVideoId,
+      proposedTitle,
+      coherenceRationale,
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
-// Parsing
+// Claude #3 — retry compose (format swap)
 // ---------------------------------------------------------------------------
 
-type RawComposedIdea = {
+type RetryComposeOutput = {
   topicLabel: string;
-  sourceTopicOutlierIds: string[];
-  // Nullable post-soften-pass: free-form ideas have no format id.
-  sourceFormatId: number | null;
+  topicSourceVideoId: string;
+  formatId: number;
+  formatSourceVideoId: string;
   proposedTitle: string;
-  angle: string;
-  confidence: number;
+  coherenceRationale: string;
 };
 
-function fmtAge(ts: number): string {
-  const diff = Math.floor(Date.now() / 1000 - ts);
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d ago`;
-  if (diff < 86400 * 365) return `${Math.floor(diff / (86400 * 30))}mo ago`;
-  return `${Math.floor(diff / (86400 * 365))}y ago`;
+type RetryResult =
+  | { ok: true; ideas: RetryComposeOutput[] }
+  | { ok: false; error: string };
+
+async function runRetryComposeCall(opts: {
+  apiKey: string;
+  model: string;
+  payload: Array<{
+    slot: {
+      topicLabel: string;
+      proposedTitle: string;
+      formatId: number;
+    };
+    topic: TopicCandidate;
+    alternatives: FormatCandidate[];
+    reason: string;
+  }>;
+  ctx: { description: string; ideationRules: string };
+}): Promise<RetryResult> {
+  const { apiKey, model, payload, ctx } = opts;
+  const systemPrompt = [
+    "You are retrying YouTube title compositions that failed a logical-fit check.",
+    "",
+    "For each slot below: the original mix was rejected as INCOHERENT (topic and format combined to imply a fabricated fact). Compose a NEW title for the SAME topic using ONE of the ALTERNATIVE formats listed. The new title must:",
+    "  - keep the topic's subject intact,",
+    "  - apply only the alternative format's STRUCTURE,",
+    "  - NOT fabricate a connection — the alternative format's structure must transfer cleanly to the topic's subject.",
+    "",
+    "OUTPUT CONSTRAINTS (same as initial compose):",
+    `  - proposedTitle 50-80 chars, ${TITLE_LEN_DROP_FLOOR}+ floor, plain words, banned words barred.`,
+    "  - formatId MUST be one of the listed alternatives — NOT the banned format.",
+    "  - topicSourceVideoId !== formatSourceVideoId.",
+    "  - coherenceRationale: 1 short sentence (≤180 chars) explaining the new structure-to-subject mapping.",
+    "",
+    "Return ONLY a JSON object. No prose.",
+    "{",
+    '  "ideas": [',
+    "    {",
+    '      "topicLabel": string,',
+    '      "topicSourceVideoId": string,',
+    '      "formatId": number,',
+    '      "formatSourceVideoId": string,',
+    '      "proposedTitle": string,',
+    '      "coherenceRationale": string',
+    "    }",
+    "  ]",
+    "}",
+  ].join("\n");
+
+  const knownFormatIds = new Set<number>();
+  const knownTopicLabels = new Set<string>();
+
+  const body: string[] = [];
+  body.push("# USER CHANNEL CONTEXT");
+  body.push("## About this channel");
+  body.push(
+    ctx.description.length > 0
+      ? ctx.description
+      : "(not set)"
+  );
+  body.push("");
+  body.push("# RETRY SLOTS");
+  for (const { slot, topic, alternatives, reason } of payload) {
+    knownTopicLabels.add(slot.topicLabel);
+    body.push("");
+    body.push(`## topicLabel=${JSON.stringify(slot.topicLabel)}`);
+    body.push(`- previously banned format_id=${slot.formatId}`);
+    body.push(`- previous failed title: ${JSON.stringify(slot.proposedTitle)}`);
+    body.push(`- fit failure reason: ${JSON.stringify(reason)}`);
+    body.push(
+      `- topic primary source [${topic.topicSourceVideo.videoId}] "${topic.topicSourceVideo.title}" — ${topic.topicSourceVideo.competitorTitle ?? "(unknown)"}`
+    );
+    for (const c of topic.topicConfirmationVideos) {
+      body.push(
+        `- topic confirmation [${c.videoId}] "${c.title}" — ${c.competitorTitle ?? "(unknown)"}`
+      );
+    }
+    body.push("- ALTERNATIVE formats (pick ONE):");
+    for (const alt of alternatives) {
+      knownFormatIds.add(alt.formatId);
+      body.push(
+        `  - format_id=${alt.formatId}: ${JSON.stringify(alt.template)}${alt.isSingleChannel ? " (single-channel pattern)" : ""}`
+      );
+      body.push(
+        `    primary source [${alt.formatSourceVideo.videoId}] "${alt.formatSourceVideo.title}" — ${alt.formatSourceVideo.competitorTitle ?? "(unknown)"}`
+      );
+      for (const c of alt.formatConfirmationVideos) {
+        body.push(
+          `    example [${c.videoId}] "${c.title}" — ${c.competitorTitle ?? "(unknown)"}`
+        );
+      }
+    }
+  }
+
+  try {
+    const client = new Anthropic({ apiKey });
+    const resp = await client.messages.create({
+      model,
+      max_tokens: 8000,
+      temperature: 1,
+      system: systemPrompt,
+      messages: [{ role: "user", content: body.join("\n") }],
+      thinking: {
+        type: "enabled",
+        budget_tokens: Math.max(1024, Math.floor(IDEATION_THINKING_BUDGET / 2)),
+      },
+    });
+    const text = resp.content
+      .filter((b) => b.type === "text")
+      .map((b) => (b as { text: string }).text)
+      .join("\n")
+      .trim();
+    const parsed = parseComposeOutput(text, knownTopicLabels, knownFormatIds);
+    if (!parsed) return { ok: false, error: "retry returned malformed JSON" };
+    return { ok: true, ideas: parsed };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "retry call failed",
+    };
+  }
 }
 
-// YouTube's static thumbnail convention. Used when a row didn't carry an
-// explicit thumbnail_url — every published video has /vi/<id>/mqdefault.jpg.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 function ytThumbnail(videoId: string): string {
   return `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
 }
 
-/**
- * Parse the per-channel banned_topics row from channel_memory into a
- * normalized lowercase list. Tolerant of trailing commas + whitespace.
- * Returns [] when no row exists or value is empty.
- */
 function readBannedTopics(channelId: string): string[] {
   const rows = listChannelMemory(channelId);
   const row = rows.find((r) => r.key === "banned_topics");
@@ -1382,41 +1529,21 @@ function readBannedTopics(channelId: string): string[] {
     .filter((t) => t.length > 0);
 }
 
-/**
- * T1 — title-length classifier. Returns the band a title falls into:
- *   ideal       50-70 chars
- *   acceptable  71-80 chars (no retry needed but flagged)
- *   too_short   <50 chars but ≥TITLE_LEN_DROP_FLOOR (will be regenerated)
- *   too_long    81-100 chars (will be regenerated once)
- *   rejected    <TITLE_LEN_DROP_FLOOR or >100 (drop, no retry)
- */
 function titleLengthBandFor(
   title: string
-): "ideal" | "acceptable" | "too_short" | "too_long" | "rejected" {
+): "ideal" | "acceptable" | "too_long" | "rejected" {
   const len = title.length;
-  if (len > TITLE_LEN_RETRY_MAX || len < TITLE_LEN_DROP_FLOOR) return "rejected";
-  if (len <= TITLE_LEN_IDEAL_MAX && len >= TITLE_LEN_IDEAL_MIN) return "ideal";
-  if (len <= TITLE_LEN_HARD_MAX) return "acceptable";
-  if (len < TITLE_LEN_IDEAL_MIN) return "too_short";
-  return "too_long";
+  if (len < TITLE_LEN_DROP_FLOOR) return "rejected";
+  if (len > TITLE_LEN_HARD_MAX) return "too_long";
+  if (len >= TITLE_LEN_IDEAL_MIN && len <= TITLE_LEN_IDEAL_MAX) return "ideal";
+  return "acceptable";
 }
 
-/**
- * T2 — banned-words check. Single regex covers all 11 terms from
- * operating rule 13 (the word-boundary anchors handle multi-word phrases
- * because the inner space is matched literally, with boundaries at the
- * outer letter↔non-letter transitions). Returns the offending term so
- * the retry prompt can quote it back to the model.
- */
 function bannedWordMatch(title: string): string | null {
   const m = title.match(BANNED_WORDS_RE);
   return m ? m[0] : null;
 }
 
-/**
- * T5 — per-channel banned-topic substring scan. Returns the first
- * matching term so the drop accumulator can surface "why".
- */
 function bannedTopicMatch(
   topicLabel: string,
   proposedTitle: string,
@@ -1443,105 +1570,4 @@ function parseJsonObject(raw: string): unknown {
   } catch {
     return null;
   }
-}
-
-function parseComposedIdeas(
-  raw: string,
-  knownFormatIds: Set<number>,
-  knownVideoIds: Set<string>
-): RawComposedIdea[] | null {
-  const parsed = parseJsonObject(raw);
-  if (!parsed || typeof parsed !== "object") return null;
-  const rawIdeas = (parsed as { ideas?: unknown }).ideas;
-  if (!Array.isArray(rawIdeas)) return null;
-  const out: RawComposedIdea[] = [];
-  for (const r of rawIdeas) {
-    if (!r || typeof r !== "object") continue;
-    const o = r as Record<string, unknown>;
-    const topicLabel =
-      typeof o.topicLabel === "string" ? o.topicLabel.trim() : "";
-    const proposedTitle =
-      typeof o.proposedTitle === "string" ? o.proposedTitle.trim() : "";
-    const angle = typeof o.angle === "string" ? o.angle.trim() : "";
-    const confidence =
-      typeof o.confidence === "number"
-        ? Math.max(0, Math.min(1, o.confidence))
-        : 0;
-    // sourceFormatId is now nullable. The LLM is told to set null for
-    // free-form ideas; anything that doesn't match a known format id
-    // collapses to null too (rather than dropping the whole idea — a
-    // free-form composition with a made-up id is still a usable idea).
-    const rawFormatId = o.sourceFormatId;
-    let sourceFormatId: number | null = null;
-    if (rawFormatId === null) {
-      sourceFormatId = null;
-    } else if (
-      typeof rawFormatId === "number" &&
-      Number.isFinite(rawFormatId) &&
-      knownFormatIds.has(rawFormatId)
-    ) {
-      sourceFormatId = rawFormatId;
-    }
-    const sourceTopicOutlierIdsRaw = Array.isArray(o.sourceTopicOutlierIds)
-      ? o.sourceTopicOutlierIds
-          .filter((v): v is string => typeof v === "string")
-          .slice(0, 3)
-      : [];
-    const sourceTopicOutlierIds = sourceTopicOutlierIdsRaw.filter((id) =>
-      knownVideoIds.has(id)
-    );
-    if (
-      !topicLabel ||
-      !proposedTitle ||
-      !isLever(angle) ||
-      sourceTopicOutlierIds.length === 0
-    ) {
-      continue;
-    }
-    out.push({
-      topicLabel,
-      sourceTopicOutlierIds,
-      sourceFormatId,
-      proposedTitle,
-      angle,
-      confidence,
-    });
-  }
-  return out.length > 0 ? out : null;
-}
-
-function parseRegenerated(
-  raw: string
-): Array<{
-  topicLabel: string;
-  proposedTitle: string;
-  angle: string;
-  confidence: number;
-}> | null {
-  const parsed = parseJsonObject(raw);
-  if (!parsed || typeof parsed !== "object") return null;
-  const arr = (parsed as { regenerated?: unknown }).regenerated;
-  if (!Array.isArray(arr)) return null;
-  const out: Array<{
-    topicLabel: string;
-    proposedTitle: string;
-    angle: string;
-    confidence: number;
-  }> = [];
-  for (const r of arr) {
-    if (!r || typeof r !== "object") continue;
-    const o = r as Record<string, unknown>;
-    const topicLabel =
-      typeof o.topicLabel === "string" ? o.topicLabel.trim() : "";
-    const proposedTitle =
-      typeof o.proposedTitle === "string" ? o.proposedTitle.trim() : "";
-    const angle = typeof o.angle === "string" ? o.angle.trim() : "";
-    const confidence =
-      typeof o.confidence === "number"
-        ? Math.max(0, Math.min(1, o.confidence))
-        : 0;
-    if (!topicLabel || !proposedTitle) continue;
-    out.push({ topicLabel, proposedTitle, angle, confidence });
-  }
-  return out;
 }
