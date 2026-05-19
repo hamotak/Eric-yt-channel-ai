@@ -297,46 +297,32 @@ const IDEATION_TOOLS: Tool[] = [
   {
     name: "generate_ideas",
     description: [
-      "Compose up to 10 new YouTube video ideas via the TOPIC × FORMAT MIX pipeline. Server pulls top 50 competitor outliers ≥1.5× channel median in last 28d, clusters them by shared content nouns, KEEPS only clusters with ≥2 distinct channels (cross-channel topic validation), and pairs each surviving topic with a format template from the top-8 format pool. The topic source video and the format source video are ALWAYS DIFFERENT videos by construction — topic supplies the SUBJECT, format supplies the STRUCTURE.",
+      "Produce 3-5 viral YouTube title candidates. Server loads the full channel context (description + ideation_rules + banned_topics + competitor outliers + own-channel winners + extracted trending formats + last 20 own uploads) and hands all of it to Opus 4.7 with creative freedom. Up to 5 internal compose passes per turn — each retry re-prompts with the prior rejected titles + reasons so the model can adjust. JS post-filters: 50-80 char length, banned-word regex, banned-topic substring, exact-copy guard against source titles, topic-frequency check against the channel's last 20 uploads. No Haiku validator, no anchor gate, no catalog-tag machinery.",
       "",
-      "Hard cap: ≤3 Claude calls per turn (1 compose + 1 logical-fit validator + 1 retry compose for format-swap on fit failures).",
+      "Returns `{ titles: string[], ideas: ProposedIdea[], pipeline_failure? }`. The titles array is the ONLY thing the chat agent should render.",
+      "Each ProposedIdea: `{ proposedTitle, sourceTopicVideoId?, sourceFormatId?, coherenceRationale? }`. The optional source/rationale fields are populated by the model when it cites attribution and are surfaced ONLY on a follow-up `explain idea N` request — never in the initial render.",
       "",
-      "Each surviving idea has:",
-      "  - topicLabel, proposedTitle, coherenceRationale (one-sentence why-this-mix-works), logicallyCoherent, formatSwapped",
-      "  - topicSource: SourceVideo (videoId, title, youtubeUrl, thumbnailUrl, competitorTitle, competitorHandle, competitorSubscriberCount, views, channelMedian, multiplier, performanceBand, publishedAt)",
-      "  - formatSource: SourceVideo (same shape — DIFFERENT video from topicSource)",
-      "  - format: { id, template, exampleCount, distinctChannels, risingRate, isSingleChannel }",
-      "  - topicConfirmationVideos: SourceVideo[] — ≥2 cross-channel proofs (cluster siblings from different competitors)",
-      "  - validation: ValidateResult, ownCatalogMatches: OwnCatalogMatch[], topicSimilarOutliers: TopicSimilarMatch[]",
+      "## Ideation output format (MANDATORY)",
+      "Render ONLY a numbered list of `proposedTitle` strings. Nothing else. No preamble, no section headers, no source links, no thumbnails, no Topic/Format lines, no Why-this-for-{channel} rationale, no Catalog tag, no Next-step sentence, no closing prose.",
       "",
-      "## Ideation output format (MANDATORY when you present ideas in chat)",
-      "Text-only cards. NO thumbnails. NO `![]()` syntax anywhere in idea cards. NO 'Topic cross-channel proof' bullet list. NO 'Format proven across X channels' line. Title links stay as text-only `[title](url)` markdown links.",
+      "Exact shape (3-5 titles):",
+      "1. {proposedTitle}",
+      "2. {proposedTitle}",
+      "3. {proposedTitle}",
+      "4. {proposedTitle}",
+      "5. {proposedTitle}",
       "",
-      "### Each numbered idea — EXACTLY this shape:",
-      "### {N}. {proposedTitle}",
+      "Hard rules:",
+      "- NO emojis in titles or surrounding text.",
+      "- NO source URLs in the list.",
+      "- NO commentary above or below the list.",
+      "- NO trailing 'Next step this week' line.",
       "",
-      "**Topic:** [{topicSource.competitorTitle} — {topicSource.title}]({topicSource.youtubeUrl}) · {topicSource.views.toLocaleString()} views · {format topicSource.publishedAt as \"Mar 14, 2026\"} · {topicSource.multiplier}×",
-      "**Format:** `{format.template}` · from [{formatSource.competitorTitle} — {formatSource.title}]({formatSource.youtubeUrl}) · {formatSource.views.toLocaleString()} views · {format formatSource.publishedAt as \"Mar 14, 2026\"} · {formatSource.multiplier}×",
-      "**Why this for {channel.title}:** {2-3 sentences explaining why this title fits THIS channel's voice + audience + positioning per the system prompt's `## About this channel`. Must reference at least one SPECIFIC element from that description (e.g. the dread/cinematic framing, the 35-65 male skew, the sleep-ritual viewing pattern, the second-person immersion technique — whichever is most relevant). Paraphrase or APPLY the channel context; do NOT quote it verbatim. \"leads with dread and wonder\" or \"second-person immersion\" lifted as a direct quote is a fail.}",
-      "**Catalog:** {map server idea.catalogTag verbatim — fresh | covered_recent_winner — remix candidate | covered_old. NO \"skip\" tag ever surfaces in idea cards — the server drops recent-flop and dead-horse rows before they reach you. When catalogTag is covered_recent_winner, follow the line with a sub-bullet \"🔁 Remix candidate of [{catalogRemixSource.title}](https://www.youtube.com/watch?v={catalogRemixSource.videoId}) ({catalogRemixSource.multiplier}× your median).\"}",
-      "",
-      "---",
-      "",
-      "### Hard rules",
-      "- NO `![image](...)` syntax in idea cards. Text-only.",
-      "- topicSource.videoId !== formatSource.videoId. Server enforces.",
-      "- \"Why this for {channel}\" must show the agent UNDERSTANDS the channel, not echo the description verbatim. Paraphrase or apply, don't quote.",
-      "- Topic + Format lines ALWAYS include views + absolute upload date + multiplier — three numbers per source. Compact: \"224,099 views · Apr 14, 2026 · 24×\".",
-      "- STALE-TOPIC RULE: if topicSource.publishedAt is more than 30 days ago, the proposedTitle MUST be a fresh structural reframe (NOT a paraphrase of the source title). Compose enforces this via coherenceRationale; if you spot a stale-topic + paraphrase combination, FLAG it back to the user instead of shipping.",
-      "- If `idea.catalogTag === \"covered_recent_winner\"`, prefix the title with \"🔁 \" so the user can scan remix candidates at a glance.",
-      "- If a field is null/undefined, render \"(unknown)\" literally — NEVER fabricate.",
+      "### Follow-up `explain idea N`",
+      "When (and ONLY when) the user explicitly asks 'explain idea N', 'tell me more about #N', 'why this title', or similar, surface the stored attribution for that idea — `sourceTopicVideoId`, `sourceFormatId`, `coherenceRationale` — drawing from the most recent generate_ideas response in conversation memory. Render as prose, NOT as a re-rendered card. Two-three sentences max.",
       "",
       "### Empty-pipeline reporting (when ideas:[])",
-      "When the tool returns `ideas: []` with a `pipeline_failure` block, DO NOT improvise titles from list_outliers or list_format_patterns. Operating rule 17. Report the failure verbatim: cite the gate that consumed the most candidates (read pipeline_failure for outliers_pulled, clusters_after_grouping, clusters_passing_distinct_or_monster, formats_pulled, compose_returned, post_filter_survivors, validator_pass / validator_total), echo fail_reason, then ask HAmo which threshold to loosen. STOP. Improvising bypasses originality + logical-fit guards.",
-      "",
-      "### Closing",
-      "After ALL ideas: **Next step this week:** {one sentence — pick ONE idea and why}. One sentence. No follow-up paragraph.",
-      "Elaborate ONLY when the user explicitly asks ('why this format' / 'explain idea N' / 'tell me more'). Default = terse.",
+      "When the tool returns `titles: []` with a `pipeline_failure` block, surface the failure verbatim ('Pipeline couldn\\'t produce titles. Sync more competitors or widen the window.') — the server already ran 5 internal retries. Do NOT improvise. Op rule 17.",
     ].join("\n"),
     input_schema: {
       type: "object",
@@ -809,12 +795,17 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
         return {
           ok: true,
           data: {
+            // Primary render surface — the agent emits these as a
+            // numbered list and nothing else. Stripped per the spec.
+            titles: r.ideas.map((i) => i.proposedTitle),
+            // Per-idea attribution kept available for the agent's
+            // follow-up `explain idea N` handler. Not rendered on the
+            // initial output.
             ideas: r.ideas,
             generatedAt: r.generatedAt,
-            // Surfaces the attrition counters + human-readable
+            // Carries the per-gate attrition + a human-readable
             // fail_reason when the pipeline produced zero ideas. The
-            // agent's op rule 17 mandates reporting this to the user
-            // and stopping rather than improvising.
+            // server already ran 5 internal retries before reporting.
             pipeline_failure: r.pipelineFailure,
           },
         };
@@ -1385,8 +1376,8 @@ export function buildSystemPrompt(
     "13. The mandatory ideation output format lives in the generate_ideas tool description. Follow it exactly when listing ideas.",
     "14. If the channel is small/inactive/wrong-niche, say it directly. Honesty over polish.",
     "15. When generating ideas and viral_topic candidates from list_outliers are sparse (fewer than 5 topics with ≥3× multiplier in last 14d), call web_search with the channel's niche + 'trending this week' to surface fresh angles. Compose ideas blending those web-sourced topics with the trending formats from list_format_patterns. ALWAYS cite source URLs in the reply when a web result drives a title.",
-    "16. Logical coherence is non-negotiable. A title mixing topic from video A with format from video B must describe a plausible video. Format provides STRUCTURE, topic provides SUBJECT. Cannot create fabricated facts. The server runs a Logical-Fit validator (Haiku 4.5) on every composed title — survivors are coherent by construction; if you spot a fabrication in the output anyway (rare, but possible when the retry compose ships under call-cap), surface it to the user verbatim and DO NOT paper over it.",
-    "17. When generate_ideas returns ideas:[] with a pipeline_failure block, you MUST report the failure to the user and STOP. Do NOT improvise ideas from list_outliers or list_format_patterns data directly. Tell HAmo which gate ate the candidates (read pipeline_failure.fail_reason + the per-gate counters: outliers_pulled, clusters_after_grouping, clusters_passing_distinct_or_monster, formats_pulled, compose_returned, post_filter_survivors, validator_pass/validator_total) and ask if he wants to loosen a SPECIFIC threshold (widen the window, lower the multiplier, re-extract formats, ban fewer topics). Improvising bypasses the originality + logical-fit guards and produces lower-quality output than the pipeline — refuse the temptation."
+    "16. Logical coherence is non-negotiable. A title mixing a topic from video A with a format from video B must describe a plausible video. Format provides STRUCTURE, topic provides SUBJECT. The compose call is Opus 4.7 with thinking budget 6000 — it self-validates coherence by reasoning before emitting. If you somehow spot a fabrication in the output (e.g. a title implying Webb found a black hole when the topic source is biosignatures), surface it verbatim to the user and ask whether to drop it; do NOT paper over it.",
+    "17. When generate_ideas returns titles:[] with a pipeline_failure block, the server has already run 5 internal compose retries — say so to the user verbatim ('Pipeline couldn\\'t produce titles. Sync more competitors or widen the window.') and STOP. Do NOT improvise titles from list_outliers / list_format_patterns. Improvising bypasses the originality + length + banned-words + topic-frequency guards and ships worse titles than the pipeline."
   );
 
   // Per-mode addendum — drives WHAT the turn produces (ideas vs deep-dives
@@ -1398,15 +1389,13 @@ export function buildSystemPrompt(
       "The user wants you to think harder. Surface the WHY behind viral patterns, not just the WHAT. Use web_search if local data is thin (op rule 15). Compare findings against the user's catalog via list_my_winners + validate_idea + ownCatalogMatches on every idea.",
       "",
       "Output structure for Research:",
-      "1. Pre-ideation research block (Pattern research — same as Ideate).",
-      "2. **Outlier deep-dives (≥5):** For 5 of the strongest cross-channel outliers (from list_outliers + explain_outlier), output a short H3 each:",
+      "1. Outlier deep-dives (≥3): pick the strongest cross-channel outliers from list_outliers + explain_outlier and surface a short H3 each:",
       "   ### Why \"{outlier.title}\" hit ({outlier.multiplier}× — {views} vs median {channelMedian})",
       "   - Channel: {competitorTitle} ({competitorSubscriberCount.toLocaleString()} subs), uploaded {publishedAt absolute + relative}",
       "   - Levers (§9): {2-3 from explain_outlier}",
       "   - Why it worked: {1-2 sentences grounded in the levers}",
       "   - Your channel comparison: {findOwnCatalogTopicMatches result or \"Fresh territory\"}",
-      "3. Then the 10 ideas in the FORENSIC format from the generate_ideas tool description.",
-      "4. Next step this week: one sentence."
+      "2. Then call generate_ideas and render its `titles` as a numbered list — NO other formatting per the generate_ideas tool description."
     );
   } else if (mode === "validate") {
     lines.push(
@@ -1436,7 +1425,7 @@ export function buildSystemPrompt(
     lines.push(
       "",
       "## IDEATE MODE (active — default)",
-      "Lean turn: pull outliers + own-channel winners, compose 10 ideas via generate_ideas, render in the forensic format from the generate_ideas tool description. Do NOT over-research. Do NOT deep-dive on each outlier. The 10-idea output IS the deliverable."
+      "Lean turn: call generate_ideas, render its `titles` array as a numbered list (3-5 entries) and STOP. No preamble. No source citations. No catalog tags. No 'Next step this week' line. The numbered list IS the entire deliverable. If the user wants reasoning they'll ask 'explain idea N' in a follow-up — then surface the stored attribution from the most recent generate_ideas response."
     );
   }
 
