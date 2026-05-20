@@ -18,13 +18,12 @@ DB=data/app.db
 
 echo "============================================================"
 echo "AUDIT 1 — lib files with zero imports"
-echo "  Matches: @/lib/<path>, ./<file>, ../lib/<file>, ./lib/<file>"
+echo "  Uses the full path from src/lib/ for @/lib/<path> matches."
 echo "============================================================"
 $FIND $SRC/lib -type f -name '*.ts' -print0 | while IFS= read -r -d '' f; do
   rel=${f#$SRC/lib/}
   rel_noext=${rel%.ts}
   base=$($BASENAME "$f" .ts)
-  # Search for full path (e.g. ideate/pipeline) or bare filename for sibling-relative
   count=$($GREP -rlE "from ['\"]@/lib/${rel_noext}['\"]|from ['\"]\\./${base}['\"]|from ['\"]\\.\\./lib/${rel_noext}['\"]|from ['\"]\\./lib/${rel_noext}['\"]|require\\(['\"]@/lib/${rel_noext}['\"]\\)" $SRC scripts 2>/dev/null \
     | $GREP -v node_modules \
     | $GREP -v "^$f$" \
@@ -37,15 +36,16 @@ done
 echo ""
 echo "============================================================"
 echo "AUDIT 2 — components with zero references"
-echo "  Matches: @/components/<file>, ./components/<file>, or <PascalName tag"
+echo "  Uses the full path from src/components/ — picks up ui/<x>."
 echo "============================================================"
 $FIND $SRC/components -type f -name '*.tsx' -print0 | while IFS= read -r -d '' f; do
+  rel=${f#$SRC/components/}
+  rel_noext=${rel%.tsx}
   base=$($BASENAME "$f" .tsx)
-  # Convert kebab to PascalCase guess for tag usage. e.g. transcribe-all-banner → TranscribeAllBanner
   pascal=$(echo "$base" | $SED -E 's/(^|-)([a-z])/\U\2/g')
-  count=$($GREP -rlE "@/components/${base}\b|\\./${base}\b|@/components/${base#ui/}\b|<${pascal}\b" $SRC 2>/dev/null \
+  count=$($GREP -rlE "@/components/${rel_noext}\b|<${pascal}\b" $SRC 2>/dev/null \
     | $GREP -v node_modules \
-    | $GREP -v "^$f$" \
+    | $GREP -v "^${f}$" \
     | $WC -l | $TR -d ' ')
   if [ "$count" = "0" ]; then
     echo "DEAD: $f"
@@ -55,44 +55,70 @@ done
 echo ""
 echo "============================================================"
 echo "AUDIT 3 — API routes nothing in src/ fetches"
-echo "  Heuristic: search for the literal /api/<path> string in src/"
+echo "  [id] segments collapsed to [^/]+ regex so template-literal calls"
+echo "  like /api/channels/\${id}/tags actually match the route."
 echo "============================================================"
 $FIND $SRC/app/api -name route.ts -print0 | while IFS= read -r -d '' r; do
   dir=$($DIRNAME "$r")
-  # Strip src/app prefix to get the URL path. [id] segments collapsed to *.
   path_full=${dir#$SRC/app}
-  path_relaxed=$(echo "$path_full" | $SED -E 's|/\[[^]]+\]||g')
-  # Count occurrences of either the literal full path or the relaxed (dynamic-segment-stripped) one.
-  needle1="\"${path_full}"
-  needle2="\"${path_relaxed}/"
-  count=$($GREP -rl -E "${needle1}|${needle2}" $SRC 2>/dev/null \
+  # Replace each [id]-style segment with a non-greedy non-slash match.
+  path_re=$(echo "$path_full" | $SED -E 's|/\[[^]]+\]|/[^/]+|g')
+  count=$($GREP -rlE -- "${path_re}([^a-zA-Z0-9_/-]|$)" $SRC 2>/dev/null \
     | $GREP -v node_modules \
-    | $GREP -v "^$r$" \
+    | $GREP -v "^${r}$" \
     | $WC -l | $TR -d ' ')
   if [ "$count" = "0" ]; then
-    echo "DEAD: $r  (no fetch in src/ matches $path_full or ${path_relaxed}/...)"
+    echo "DEAD: $r  (regex=${path_re})"
   fi
 done
 
 echo ""
 echo "============================================================"
-echo "AUDIT 4 — DB tables nothing reads/writes"
+echo "AUDIT 4 — DB tables with no SELECT/INSERT/UPDATE/JOIN"
+echo "  Excludes DDL (CREATE/DROP/ALTER) — those exist for every table."
 echo "============================================================"
 $SQLITE "$DB" "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts_%' ORDER BY name;" | while read -r t; do
   if [ -z "$t" ]; then continue; fi
-  count=$($GREP -rlE "(FROM|INTO|UPDATE|TABLE)[[:space:]]+${t}\b" $SRC 2>/dev/null \
+  count=$($GREP -rlE "(FROM|INTO|UPDATE|JOIN)[[:space:]]+${t}\b" $SRC 2>/dev/null \
     | $GREP -v node_modules \
     | $WC -l | $TR -d ' ')
   if [ "$count" = "0" ]; then
-    echo "DEAD TABLE: $t"
+    rowcount=$($SQLITE "$DB" "SELECT COUNT(*) FROM $t;" 2>/dev/null)
+    echo "DEAD TABLE: $t (rows: $rowcount)"
   fi
 done
 
 echo ""
 echo "============================================================"
-echo "AUDIT 5 — unused npm dependencies (depcheck)"
+echo "AUDIT 5 — npm dependencies not imported from src/ or configs"
+echo "  Filter the candidates against your known build-system deps."
 echo "============================================================"
-PATH=$PATH:/usr/local/bin:/opt/homebrew/bin npx --no-install depcheck 2>&1 | head -60
+/usr/bin/python3 -c "
+import json, re, subprocess
+pkg = json.load(open('package.json'))
+deps = list(pkg.get('dependencies', {}).keys()) + list(pkg.get('devDependencies', {}).keys())
+DEAD = []
+for d in sorted(deps):
+    patterns = [
+        f'from [\\'\"]{re.escape(d)}[\\'\"]/?',
+        f'from [\\'\"]{re.escape(d)}/',
+        f'require\\([\\'\"]{re.escape(d)}/?[\\'\"]\\)',
+    ]
+    found = False
+    for p in patterns:
+        try:
+            r = subprocess.run(['/usr/bin/grep', '-rlE', p, 'src', 'next.config.ts',
+                                'eslint.config.mjs', 'tsconfig.json'],
+                               capture_output=True, text=True, errors='ignore')
+            if r.stdout.strip():
+                found = True; break
+        except Exception:
+            pass
+    if not found:
+        DEAD.append(d)
+for d in DEAD: print(f'CANDIDATE-DEAD-DEP: {d}')
+print(f'(Total deps: {len(deps)}; candidates: {len(DEAD)})')
+"
 
 echo ""
 echo "============================================================"
