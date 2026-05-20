@@ -1,0 +1,17 @@
+Collapsed sidebar rhythm (FIX-G).
+
+Three clear vertical gaps now visible at icon-only density:
+  1. mt-6 (24px) between Dashboard and Ideate (CREATE section boundary)
+  2. mt-6 (24px) between Ideate and Channel Info (CHANNEL section boundary)
+  3. Hairline border-t separator with mt-3 above / mb-2 below, between
+     Competitors and Settings (Settings is the standalone bottom item)
+
+Within-section items (Channel Info / Videos / Competitors) stack at the
+default space-y-0.5 — no extra gap; they read as one group.
+
+Separator in collapsed mode:
+  - Renders in BOTH modes (FIX-G change: was expanded-only)
+  - Uses -mx-2 in collapsed mode to extend back through the nav's px-2
+    padding so the hairline spans the full sidebar width.
+  - Measured: aside width 64.0px, separator width 63.4px (full width
+    minus the 0.6px border box).

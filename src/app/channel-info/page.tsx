@@ -1,8 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Check, Loader2, Sparkles, X } from "lucide-react";
 import {
   Card,
@@ -21,9 +20,11 @@ import {
   TranscriptsCoverageCard,
 } from "@/components/channel-detail-widgets";
 import {
+  BannedTopicsEditor,
   DescriptionEditor,
   IdeationRulesEditor,
 } from "@/components/agent-brain-editors";
+import { LearnedRulesPanel } from "@/components/learned-rules-panel";
 
 // Wire shape for the redesigned 2-field model. Legacy fields preserved
 // so older clients reading the GET response don't break; the page no
@@ -37,6 +38,7 @@ type ChannelContext = {
   subscriberCount: number | null;
   channelDescription: string;
   ideationRules: string;
+  bannedTopics: string;
   // Legacy — kept for type completeness, never rendered.
   niche: string;
   positioning: string;
@@ -49,48 +51,18 @@ type ChannelContext = {
 // {description}. Stale v1 entries are ignored.
 const ANALYZE_CACHE_TTL_MS = 5 * 60 * 1000;
 const ANALYZE_CACHE_VERSION = "v2";
-const VIEW_MODE_KEY = "dashboard.viewMode";
-
-function fmtCount(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "—";
-  if (n >= 1_000_000)
-    return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
-  if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, "") + "K";
-  return n.toLocaleString();
-}
 
 export default function ChannelInfoPage() {
-  // useSearchParams needs Suspense in Next 16's strict prerender. The
-  // inner component does all the work; this thin outer is just the
-  // boundary, mirroring /chat/page.tsx's wrapper pattern.
-  return (
-    <Suspense fallback={null}>
-      <ChannelInfoInner />
-    </Suspense>
-  );
-}
-
-function ChannelInfoInner() {
-  const router = useRouter();
-  const searchParams = useSearchParams();
-  const focusParam = searchParams.get("focus");
-
+  // FIX-I: scope to the active channel only. Multi-channel summary table
+  // removed; the top-right channel switcher is the single source of truth
+  // for which channel renders here. Switching there triggers a full
+  // window.location.reload() (see channel-switcher.tsx), which re-runs
+  // these useEffects and swaps the editor naturally — no extra
+  // revalidation wiring needed.
   const [channels, setChannels] = useState<ChannelContext[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<"all" | "channel">("channel");
   const [activeChannelId, setActiveChannelId] = useState<string | null>(null);
 
-  // Read view mode from localStorage (set by the top-right channel
-  // picker — Prompt 4.6 contract). ?focus=<id> overrides for one page
-  // load; the param is intentionally not persisted to localStorage.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const saved = window.localStorage.getItem(VIEW_MODE_KEY);
-    if (saved === "all" || saved === "channel") setViewMode(saved);
-  }, []);
-
-  // The server-side active-channel pointer lets us decide which row to
-  // render in single-channel mode (when there's no ?focus override).
   useEffect(() => {
     let cancelled = false;
     fetch("/api/channels/active", { cache: "no-store" })
@@ -128,23 +100,39 @@ function ChannelInfoInner() {
     );
   }, []);
 
-  // Decide which channel(s) to show. ?focus wins; otherwise viewMode.
-  const focusChannel = useMemo(() => {
-    if (!channels) return null;
-    if (focusParam) return channels.find((c) => c.channelId === focusParam) ?? null;
-    if (viewMode === "all") return null;
-    return channels.find((c) => c.channelId === activeChannelId) ?? channels[0] ?? null;
-  }, [channels, focusParam, viewMode, activeChannelId]);
+  const activeChannel =
+    channels && activeChannelId
+      ? channels.find((c) => c.channelId === activeChannelId) ?? null
+      : null;
 
-  const showSummaryTable =
-    !focusParam && viewMode === "all" && (channels?.length ?? 0) > 0;
+  // Status signal preserved from the deleted multi-channel table: green
+  // when description AND ideation rules are both populated, amber when
+  // anything is missing.
+  const contextFilled = !!activeChannel &&
+    activeChannel.channelDescription.trim().length > 0 &&
+    activeChannel.ideationRules.trim().length > 0;
 
   return (
     <div className="mx-auto max-w-4xl">
       <header className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">Channel Info</h1>
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-semibold tracking-tight">Channel Info</h1>
+          {activeChannel && (
+            <span
+              className={
+                contextFilled
+                  ? "inline-flex items-center rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400"
+                  : "inline-flex items-center rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400"
+              }
+            >
+              {contextFilled ? "Context filled" : "Needs context"}
+            </span>
+          )}
+        </div>
         <p className="mt-1 text-sm text-muted-foreground">
-          Channel context. Every AI feature reads from this.
+          {activeChannel
+            ? `Channel context for ${activeChannel.title ?? activeChannel.handle ?? "this channel"}. Every AI feature reads from this.`
+            : "Pick a channel from the top-right picker."}
         </p>
       </header>
 
@@ -158,23 +146,10 @@ function ChannelInfoInner() {
         <SkeletonCard />
       ) : channels.length === 0 ? (
         <EmptyState />
-      ) : showSummaryTable ? (
-        <SummaryTable
-          channels={channels}
-          onRowClick={(id) => router.push(`/channel-info?focus=${encodeURIComponent(id)}`)}
-        />
-      ) : focusChannel ? (
-        <SingleChannelCard
-          channel={focusChannel}
-          onUpdated={handleUpdated}
-          backToAll={
-            focusParam && viewMode === "all"
-              ? () => router.push("/channel-info")
-              : undefined
-          }
-        />
+      ) : activeChannel ? (
+        <SingleChannelCard channel={activeChannel} onUpdated={handleUpdated} />
       ) : (
-        <EmptyState />
+        <NoActiveChannelHint />
       )}
     </div>
   );
@@ -185,11 +160,9 @@ function ChannelInfoInner() {
 function SingleChannelCard({
   channel,
   onUpdated,
-  backToAll,
 }: {
   channel: ChannelContext;
   onUpdated: (next: ChannelContext) => void;
-  backToAll?: () => void;
 }) {
   const [analytics, setAnalytics] = useState<ChannelDetailAnalytics | null>(null);
   const [aiOpen, setAiOpen] = useState(false);
@@ -349,7 +322,7 @@ function SingleChannelCard({
   // server-side so derived state (e.g. analytics widget channel info)
   // stays in sync.
   const handleFieldSaved = useCallback(
-    (field: "channelDescription" | "ideationRules", value: string) => {
+    (field: "channelDescription" | "ideationRules" | "bannedTopics", value: string) => {
       const next: ChannelContext = { ...channel, [field]: value };
       onUpdated(next);
       setSavedToast("Saved — the agent will use this on the next message.");
@@ -359,16 +332,6 @@ function SingleChannelCard({
 
   return (
     <>
-      {backToAll && (
-        <button
-          type="button"
-          onClick={backToAll}
-          className="mb-3 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-        >
-          ← Back to all channels
-        </button>
-      )}
-
       <Card className="mb-4">
         <CardHeader>
           <div className="flex items-start justify-between gap-3">
@@ -437,6 +400,16 @@ function SingleChannelCard({
           </div>
           <div>
             <div className="mb-1 flex items-baseline justify-between gap-2">
+              <h3 className="text-sm font-semibold">Banned topics</h3>
+            </div>
+            <BannedTopicsEditor
+              channelId={channel.channelId}
+              initialValue={channel.bannedTopics}
+              onSaved={(v) => handleFieldSaved("bannedTopics", v)}
+            />
+          </div>
+          <div>
+            <div className="mb-1 flex items-baseline justify-between gap-2">
               <h3 className="text-sm font-semibold">Ideation rules <span className="text-xs font-normal text-muted-foreground">(HARD)</span></h3>
             </div>
             <p className="mb-2 text-xs text-muted-foreground">
@@ -450,6 +423,14 @@ function SingleChannelCard({
           </div>
         </CardContent>
       </Card>
+
+      <SectionDivider label="Learned rules" />
+      <div className="rounded-lg border border-border bg-card p-6">
+        <p className="mb-4 text-xs text-muted-foreground">
+          Rules the AI distilled from your notes on past ideas. Pending rows wait for you to Apply or Reject — nothing affects the next generation until you decide.
+        </p>
+        <LearnedRulesPanel channelId={channel.channelId} />
+      </div>
 
       <SectionDivider label="Channel details" />
       <MetaCard channel={detailChannel} />
@@ -479,87 +460,6 @@ function SectionDivider({ label }: { label: string }) {
       <span>{label}</span>
       <div className="h-px flex-1 bg-border" />
     </div>
-  );
-}
-
-/* ---------------- Summary table (all-channels mode) ---------------- */
-
-function SummaryTable({
-  channels,
-  onRowClick,
-}: {
-  channels: ChannelContext[];
-  onRowClick: (channelId: string) => void;
-}) {
-  return (
-    <Card>
-      <CardContent className="p-0">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="border-b border-border bg-muted/30">
-              <tr className="text-left text-[11px] uppercase tracking-wide text-muted-foreground">
-                <th className="px-3 py-2 font-medium w-10"></th>
-                <th className="px-3 py-2 font-medium">Title</th>
-                <th className="px-3 py-2 font-medium">Handle</th>
-                <th className="px-3 py-2 font-medium">Subs</th>
-                <th className="px-3 py-2 font-medium">Description</th>
-                <th className="px-3 py-2 font-medium">Status</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border">
-              {channels.map((c) => {
-                // "Context filled" now just means the agent has a usable
-                // description — the redesigned model collapses 5 fields
-                // into one paragraph. Empty description = needs work.
-                const filled = c.channelDescription.trim().length > 0;
-                const initial = (c.title ?? c.handle ?? "?")
-                  .slice(0, 1)
-                  .toUpperCase();
-                return (
-                  <tr
-                    key={c.channelId}
-                    onClick={() => onRowClick(c.channelId)}
-                    className="cursor-pointer transition-colors hover:bg-accent/40"
-                  >
-                    <td className="px-3 py-2 align-middle">
-                      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-semibold text-muted-foreground">
-                        {initial}
-                      </div>
-                    </td>
-                    <td className="px-3 py-2 align-middle font-medium">
-                      {c.title ?? "(no title)"}
-                    </td>
-                    <td className="px-3 py-2 align-middle font-mono text-xs text-muted-foreground">
-                      {c.handle ?? "—"}
-                    </td>
-                    <td className="px-3 py-2 align-middle tabular-nums">
-                      {fmtCount(c.subscriberCount)}
-                    </td>
-                    <td
-                      className="max-w-[320px] truncate px-3 py-2 align-middle text-xs text-muted-foreground"
-                      title={c.channelDescription}
-                    >
-                      {c.channelDescription || <span className="italic">—</span>}
-                    </td>
-                    <td className="px-3 py-2 align-middle">
-                      {filled ? (
-                        <span className="inline-flex items-center rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
-                          Context filled
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
-                          Needs context
-                        </span>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </CardContent>
-    </Card>
   );
 }
 
@@ -719,6 +619,21 @@ function EmptyState() {
             Integrations page
           </Link>
           .
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
+
+function NoActiveChannelHint() {
+  // Distinct from EmptyState: there ARE channels in the DB, but no active
+  // pointer is set. Steer the user to the top-right picker; don't push
+  // them back to /settings/integrations.
+  return (
+    <Card>
+      <CardContent className="py-10 text-center">
+        <p className="text-sm text-muted-foreground">
+          Pick a channel from the top-right picker to view its context.
         </p>
       </CardContent>
     </Card>

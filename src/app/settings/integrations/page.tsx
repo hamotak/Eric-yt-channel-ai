@@ -11,10 +11,9 @@ import { YouTubeChannelBinder } from "@/components/youtube-channel-binder";
 import { YouTubeCookies } from "@/components/youtube-cookies";
 import { GoogleOAuthConnector } from "@/components/google-oauth-connector";
 import { ClaudeUsage } from "@/components/claude-usage";
-import { ApifyUsage } from "@/components/apify-usage";
 import { DeepgramUsage } from "@/components/deepgram-usage";
 
-type Name = "claude" | "deepgram" | "apify" | "exa" | "youtube" | "google_gemini";
+type Name = "claude" | "deepgram" | "exa" | "youtube" | "google_gemini";
 
 type StatusMap = Record<
   Name,
@@ -87,19 +86,6 @@ export default function IntegrationsPage() {
         steps: t.integrations.gemini.helpSteps,
         link: t.integrations.gemini.helpLink,
         linkLabel: t.integrations.gemini.helpLinkLabel,
-      },
-    },
-    {
-      name: "apify",
-      label: t.integrations.apify.name,
-      desc: t.integrations.apify.desc,
-      placeholder: t.integrations.apify.placeholder,
-      mode: "key",
-      help: {
-        title: t.integrations.apify.helpTitle,
-        steps: t.integrations.apify.helpSteps,
-        link: t.integrations.apify.helpLink,
-        linkLabel: t.integrations.apify.helpLinkLabel,
       },
     },
     {
@@ -304,7 +290,6 @@ function IntegrationCard({
         )}
         {name === "claude" && <ClaudeUsage enabled={!!status?.hasKey} />}
         {name === "deepgram" && <DeepgramUsage enabled={!!status?.hasKey} />}
-        {name === "apify" && <ApifyUsage enabled={!!status?.hasKey} />}
       </CardContent>
     </Card>
   );

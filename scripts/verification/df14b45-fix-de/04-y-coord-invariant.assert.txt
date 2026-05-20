@@ -1,0 +1,10 @@
+Y-coordinate invariant — the Dashboard nav-item's getBoundingClientRect().top
+must differ by ≤ 8px between expanded and collapsed states (preserved
+across FIX-D and FIX-E).
+
+Measured (Playwright, viewport 1440×900, no localStorage override):
+  Expanded (after FIX-E sections + spacing):  47.998 px
+  Collapsed (icons-only with section gaps):   47.998 px
+  Δ = 0.000 px
+
+PASS (≤ 8px requirement).

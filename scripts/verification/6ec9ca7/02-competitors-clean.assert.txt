@@ -1,0 +1,10 @@
+/competitors page shows competitor cards with ONLY:
+  - avatar
+  - channel name
+  - @handle
+  - subscriber count
+  - inline Note textarea
+  - Delete button
+No tier filter dropdown, no tier badges (Authority/Breakthrough/Adjacent/Far),
+no outlier badges, no background-sync indicator, no view-snapshot graph,
+no format-pattern badges, no /competitors/[id] detail link.

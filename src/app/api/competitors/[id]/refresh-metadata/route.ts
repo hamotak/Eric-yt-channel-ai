@@ -12,9 +12,8 @@ export const maxDuration = 30;
  * POST /api/competitors/[id]/refresh-metadata
  *
  * Manual re-run of enrichCompetitorMetadataFromYouTube for one competitor.
- * Exposed as a button on the detail page header for the cases where the
- * initial worker pass left avatar/subs blank (the prior worker-order bug
- * where YT enrichment ran before Apify had resolved channel_id).
+ * Exposed for the cases where the initial worker pass left avatar/subs
+ * blank (a prior worker-order race that no longer applies).
  *
  * Returns the freshly-enriched competitor row in the same wire shape the
  * GET endpoint uses so the client can drop it straight into state.

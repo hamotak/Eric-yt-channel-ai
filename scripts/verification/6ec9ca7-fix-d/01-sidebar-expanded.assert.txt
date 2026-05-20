@@ -1,0 +1,7 @@
+Sidebar header (expanded state) shows exactly:
+  [logo icon]  YT Channel AI  [spacer]  [ChevronLeft button]
+
+No tagline ("AI-powered YouTube channel analytics" or any variant) anywhere.
+Header is a single row at height = py-5 + h-8 = 72px.
+
+Measured Dashboard nav-item top: 48px (rounded from 47.998).

@@ -1,0 +1,16 @@
+After clicking Generate at count=10/mode=auto, the page shows:
+  - Generate button replaced by a disabled "Generating..." pill (red)
+  - A progress bar with the step label ("Gathering competitor data..." 
+    early, then "Composing candidate ideas...", then "Validating and
+    scoring channel-fit")
+  - An elapsed-seconds counter on the right of the progress row (driven
+    by the server response; ticks at the poll interval)
+  - The exact hint line "This takes ~3-5 minutes. You can leave this tab open."
+  - Skeleton placeholder cards below
+  - The current generation row in the history sidebar carries an amber
+    PROCESSING badge
+
+The counter in this captured screenshot reads "0s" because the server's
+last poll completed near t=0 and the client doesn't tick between polls
+(polling backoff is 5s → 15s). The step label correctly reflects the
+gather phase that happens in the first few seconds.

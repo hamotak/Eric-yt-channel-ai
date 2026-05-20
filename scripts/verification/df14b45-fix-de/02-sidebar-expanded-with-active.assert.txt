@@ -1,0 +1,9 @@
+On /ideate: the Ideate nav item inside the CREATE section is the active
+item. Verified className: "bg-muted border-l-2 border-primary text-primary
+font-medium pl-[10px] pr-3". NO saturated bg-primary/full red fill.
+
+Inspection match in screenshot 02-sidebar-expanded-with-active.png:
+  - Subtle bg-muted strip behind the Ideate row (not a red fill)
+  - 2px red border-l on the left edge of the active row
+  - "Ideate" text and Sparkles icon both in red (text-primary)
+  - Dashboard and the items below remain unstyled

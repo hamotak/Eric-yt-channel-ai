@@ -54,3 +54,10 @@ next-env.d.ts
 # scratch files used to pass multi-line commit messages to git on
 # Windows where heredoc is unavailable
 .git-commit-msg.tmp
+
+# MCP playwright session artifacts (console logs + page snapshots,
+# regenerated on every browser_navigate / browser_snapshot call)
+.playwright-mcp/
+
+# Claude Code session state (PID + acquired timestamp)
+.claude/scheduled_tasks.lock

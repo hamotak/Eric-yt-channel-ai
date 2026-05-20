@@ -10,7 +10,7 @@ export const maxDuration = 60;
  * POST /api/videos/:id/captions
  *
  * Single-tier transcript fetch via YouTube's public timedtext endpoint
- * (`fetchTranscriptFreeWithDebug`). No API keys, no Apify, no Deepgram —
+ * (`fetchTranscriptFreeWithDebug`). No API keys, no Deepgram —
  * timedtext is the only path. Returns 200 + ok on success, or 404 with a
  * detailed `debug` block explaining exactly which probes were attempted
  * and what each returned, so when something fails the user (and the dev

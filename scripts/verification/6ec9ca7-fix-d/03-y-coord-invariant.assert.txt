@@ -1,0 +1,16 @@
+Y-coordinate invariant: the Dashboard nav item's getBoundingClientRect().top
+must differ by ≤ 8px between expanded and collapsed states.
+
+Measured (Playwright, viewport 1440×900, no localStorage override):
+  Expanded:  47.998046875 px
+  Collapsed: 47.998046875 px
+  Δ = 0.000 px
+
+PASS (≤ 8px requirement).
+
+Also confirmed:
+  - asideWidth: expanded=240, collapsed=64
+  - headerHasLogo:     expanded=true,  collapsed=false
+  - headerHasWordmark: expanded=true,  collapsed=false
+  - chevronVisible:    both states
+  - Cmd+B keyboard shortcut still toggles

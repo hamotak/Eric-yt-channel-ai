@@ -7,7 +7,7 @@ import { Topbar } from "@/components/topbar";
 
 export const metadata: Metadata = {
   title: "YT Channel AI",
-  description: "AI-powered YouTube channel analytics (local)",
+  description: "YT Channel AI (local)",
 };
 
 export default function RootLayout({
@@ -22,7 +22,12 @@ export default function RootLayout({
               <Sidebar />
               <div className="flex flex-1 flex-col overflow-hidden">
                 <Topbar />
-                <main className="flex-1 overflow-y-auto p-6">{children}</main>
+                {/* FIX-F: pt-20 (80px) gives every page a generous gap below
+                    the topbar — strictly above the 64px target after subpixel
+                    rounding. Sides + bottom keep 24px. Two-column pages that
+                    need full-bleed below the topbar (e.g. /ideate) override
+                    with -mt-20. */}
+                <main className="flex-1 overflow-y-auto px-6 pb-6 pt-20">{children}</main>
               </div>
             </div>
           </I18nProvider>

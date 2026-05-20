@@ -1,0 +1,2 @@
+/ideate composer is visible with the mode dropdown set to "Auto", the count
+slider at 10, and the primary "Generate" button enabled.

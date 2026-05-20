@@ -1,0 +1,10 @@
+After switching the active channel from Late Science to The Sleeping Orbit
+via the top-right channel switcher, /ideate:
+  - Header reads "Generate ideas for The Sleeping Orbit"
+  - History sidebar reloads to that channel's runs (none yet → "No runs
+    yet for this channel.")
+  - Main canvas reverts to the empty state with a single muted line and
+    primary-accent link: "Add at least 1 competitor first →" pointing to
+    /competitors
+  - Composer (mode dropdown + count slider + Generate button) is HIDDEN
+    until at least 1 competitor is added

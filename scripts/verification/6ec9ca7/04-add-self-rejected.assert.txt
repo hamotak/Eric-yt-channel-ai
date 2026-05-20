@@ -1,0 +1,6 @@
+After typing "@late_science" (the active user's own channel) and clicking Add,
+the page shows the exact error string:
+
+  "This is your own channel — cannot add as competitor."
+
+No new card was inserted. The 6 pre-existing competitor cards remain unchanged.

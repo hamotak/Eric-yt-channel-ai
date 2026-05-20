@@ -1,0 +1,18 @@
+Side-by-side comparison of expanded (240px) vs collapsed (64px) sidebar.
+
+Visual check:
+  - LEFT (expanded): logo + wordmark + chevron / Dashboard / CREATE /
+    Ideate / CHANNEL / Channel Info / Videos / Competitors / separator /
+    Settings
+  - RIGHT (collapsed): chevron-right / Dashboard icon / gap / Ideate icon
+    / gap / Channel Info icon / Videos icon / Competitors icon /
+    separator (full width) / Settings icon
+
+The rhythm matches between states — section breaks are clearly
+identifiable without text labels in collapsed mode.
+
+Y-coord invariant (FIX-D, re-verified after FIX-G changes):
+  Expanded:  Dashboard nav-item top = 47.998 px, toggle top = 4.004 px
+  Collapsed: Dashboard nav-item top = 47.998 px, toggle top = 4.004 px
+  Δ Dashboard = 0.000 px (≤ 8 target ✓)
+  Δ toggle    = 0.000 px

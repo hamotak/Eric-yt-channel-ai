@@ -1,0 +1,22 @@
+Collapsed sidebar (Cmd+B from expanded, or auto at <1024px):
+
+HEADER: only the [ChevronRight] button, centered in the ~64px column.
+Logo + wordmark omitted from DOM entirely (verified via querySelector).
+
+NAV: icons-only, vertically stacked. Section headers (CREATE / CHANNEL)
+are NOT rendered. Section grouping preserved visually via mt-4 gap on
+the first item of each non-first section:
+
+  [ChevronRight]
+  [Dashboard icon]    ← active when on /
+  [4px nav padding...]
+  [Ideate icon]       ← mt-4 gap above (CREATE section start, active here)
+  [Channel Info icon] ← mt-4 gap above (CHANNEL section start)
+  [Videos icon]
+  [Competitors icon]
+  ──── (separator with mx-1) ────
+  [Settings icon]
+
+Active state (collapsed): bg-muted + text-primary (no left-border in
+collapsed mode since icons are centered and a 2px bar would visually
+clip the icon column).

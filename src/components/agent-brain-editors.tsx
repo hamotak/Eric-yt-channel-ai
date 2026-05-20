@@ -14,13 +14,14 @@
  * ideation_rules cover every durable-agent-state case HAmo needs.
  */
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Check, Pencil } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 const DESCRIPTION_CAP = 1500;
 const IDEATION_RULES_CAP = 1200;
+const BANNED_TOPICS_CAP = 500;
 
 // ---------------------------------------------------------------------
 // Channel description — one big textarea + live counter
@@ -161,6 +162,86 @@ export function DescriptionEditor({
             {saving ? "Saving…" : "Save"}
           </Button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// Banned topics — comma-separated list, autosave on blur
+// ---------------------------------------------------------------------
+
+export function BannedTopicsEditor({
+  channelId,
+  initialValue,
+  onSaved,
+}: {
+  channelId: string;
+  initialValue: string;
+  onSaved?: (value: string) => void;
+}) {
+  const [value, setValue] = useState(initialValue);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setValue(initialValue);
+    setError(null);
+  }, [channelId, initialValue]);
+
+  const persist = useCallback(async () => {
+    const trimmed = value.trim();
+    if (trimmed === initialValue.trim()) return;
+    if (trimmed.length > BANNED_TOPICS_CAP) {
+      setError(`Banned topics exceed ${BANNED_TOPICS_CAP} chars`);
+      return;
+    }
+    setError(null);
+    try {
+      const r = await fetch("/api/channel-info", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channelId,
+          field: "bannedTopics",
+          value: trimmed,
+        }),
+      });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        setError(d.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      onSaved?.(trimmed);
+      setSavedFlash(true);
+      setTimeout(() => setSavedFlash(false), 1000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Save failed");
+    }
+  }, [value, initialValue, channelId, onSaved]);
+
+  const overCap = value.length > BANNED_TOPICS_CAP;
+
+  return (
+    <div className="space-y-1">
+      <textarea
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={persist}
+        rows={2}
+        placeholder="e.g. fermi paradox, dark energy, black holes, footages"
+        className={cn(
+          "w-full rounded-md border border-input bg-background px-3 py-2 text-sm",
+          "focus:outline-none focus:ring-2 focus:ring-ring",
+          overCap && "border-destructive/60 focus:ring-destructive"
+        )}
+      />
+      <div className="flex items-center gap-3 text-[11px] text-muted-foreground">
+        <span>AI will reject any idea matching these topics.</span>
+        <span className="ml-auto">
+          {savedFlash && <span className="text-emerald-600 dark:text-emerald-400">Saved</span>}
+          {error && <span className="text-destructive">{error}</span>}
+        </span>
       </div>
     </div>
   );

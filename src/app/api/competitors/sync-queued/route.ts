@@ -11,7 +11,6 @@ import {
 import {
   CompetitorSyncError,
   enrichCompetitorMetadataFromYouTube,
-  requeueApifyFailedCompetitorsOnce,
   syncCompetitor,
 } from "@/lib/competitor-sync";
 import { log } from "@/lib/logger";
@@ -24,14 +23,13 @@ const LOCK_KEY = "competitor_sync.in_progress";
 // lock would never clear. Anything older than this is treated as stale and
 // reclaimed. 10 minutes is long enough for any legitimate single sync.
 const STALE_LOCK_SEC = 600;
-// Background re-enrichment trigger: a row whose Apify sync succeeded but
-// whose YT-enriched fields are still null after a grace period almost
-// certainly hit the old "enrich-before-sync" worker-order bug. Re-queue
-// it so a fresh enrichment pass runs.
+// Background re-enrichment trigger: a row whose video sync succeeded
+// but whose YT-enriched fields are still null after a grace period
+// likely hit an old worker-order race; re-queue for a fresh enrichment.
 const STALE_META_SEC = 300;
-// Apify free-tier concurrency ceiling. 5 in-flight runs is safe per their
-// per-account limits and gives a ~5x wall-clock speedup over the prior
-// serial loop. Lower this if a different tier or actor caps lower.
+// Parallel-batch concurrency cap. 5 in-flight runs is a safe default
+// against the YouTube Data API quota and gives a ~5× wall-clock speedup
+// over the prior serial loop. Lower if you hit quota errors.
 const PARALLEL_CAP = 5;
 // Defensive total-processed cap. Was the prior loop's `i < 50` ceiling;
 // protects against runaway loops if the DB layer ever leaves a row stuck.
@@ -44,14 +42,13 @@ const MAX_PROCESSED_PER_RUN = 50;
  *   1. Acquire a process-wide lock via settings[LOCK_KEY] = unix-seconds.
  *      A second concurrent caller sees the lock and returns 200 {skipped}.
  *      A lock older than STALE_LOCK_SEC is treated as crashed and reclaimed.
- *   2. Loop: claim the oldest queued row → mark 'syncing' →
- *      run Apify sync FIRST (resolves channel_id) → THEN YT enrich
- *      (needs channel_id to fetch subs + avatar) → mark 'synced' or
- *      'failed' → kick similarity scoring (fire-and-forget so a failure
- *      there doesn't taint the sync result).
+ *   2. Loop: claim the oldest queued row → mark 'syncing' → run the
+ *      YouTube Data API sync (resolves channel_id + pulls videos) →
+ *      YT enrich (subs + avatar) → mark 'synced' or 'failed' → kick
+ *      similarity scoring (fire-and-forget so a failure there doesn't
+ *      taint the sync result).
  *   3. After draining: scan for synced rows with NULL metadata older
- *      than STALE_META_SEC — those got the old enrich-before-sync race
- *      and need a fresh enrichment pass.
+ *      than STALE_META_SEC — those need a fresh enrichment pass.
  *   4. Release the lock.
  */
 export async function POST(req: Request) {
@@ -62,20 +59,6 @@ export async function POST(req: Request) {
   }
   setSetting(LOCK_KEY, String(now));
 
-  // One-shot migration on the first run after the YT-default backend
-  // ships: re-queue competitors that previously failed with an Apify
-  // credits-exhausted error so the new backend picks them up cleanly.
-  // The helper is idempotent (guarded by a settings flag) so it's safe
-  // to call on every worker invocation.
-  try {
-    requeueApifyFailedCompetitorsOnce();
-  } catch (err) {
-    log.warn(
-      "competitors",
-      `Apify-failed requeue migration errored (non-fatal): ${err instanceof Error ? err.message : "?"}`
-    );
-  }
-
   let processed = 0;
   let succeeded = 0;
   let failed = 0;
@@ -83,15 +66,13 @@ export async function POST(req: Request) {
   const errors: string[] = [];
   const origin = new URL(req.url).origin;
 
-  // Per-row work — claim → apify → yt-enrich → mark done/failed, plus
-  // sanity logging and fire-and-forget similarity scoring. Hoisted out
-  // so the parallel-batch loop can run it for several rows at once.
+  // Per-row work — claim → YT sync → YT enrich → mark done/failed,
+  // plus sanity logging and fire-and-forget similarity scoring. Hoisted
+  // out so the parallel-batch loop can run it for several rows at once.
   const runOne = async (row: Competitor) => {
     try {
-      // Apify FIRST — resolves channel_id from the handle so the
-      // subsequent YT enrich call has something to look up. (The
-      // previous order, enrich-then-sync, was the cause of
-      // "title syncs but no avatar/subs" for newly-added competitors.)
+      // YT sync FIRST — resolves channel_id from the handle so the
+      // subsequent YT enrich call has something to look up.
       await syncCompetitor(row.id);
       // YT enrich SECOND — now channel_id is set, channels.list works.
       // Non-fatal: a YT failure here doesn't fail the sync overall.
@@ -151,10 +132,9 @@ export async function POST(req: Request) {
     // queue at once and run their sync+enrich in parallel via
     // Promise.allSettled. The lock still serialises *workers* (only
     // one /api/competitors/sync-queued at a time), but inside a single
-    // worker the per-row Apify + YT calls fire concurrently — 7
-    // competitors that took ~5 minutes serially now take ~1 minute.
-    // Apify free-tier concurrency cap is the binding constraint, so
-    // PARALLEL_CAP defaults to 5.
+    // worker the per-row YT sync + YT enrich calls fire concurrently —
+    // 7 competitors that took ~5 minutes serially now take ~1 minute.
+    // PARALLEL_CAP defaults to 5; raise if you have YT quota headroom.
     while (processed < MAX_PROCESSED_PER_RUN) {
       const batch: Array<Competitor> = [];
       while (batch.length < PARALLEL_CAP && processed + batch.length < MAX_PROCESSED_PER_RUN) {

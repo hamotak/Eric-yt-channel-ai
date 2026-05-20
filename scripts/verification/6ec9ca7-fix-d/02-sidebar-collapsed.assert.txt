@@ -1,0 +1,10 @@
+Sidebar header (collapsed state) shows exactly:
+  [ChevronRight button, centered in the ~64px column]
+
+The logo icon AND the "YT Channel AI" wordmark are omitted from the DOM
+entirely (not display:none, actually not rendered). The Dashboard nav-item
+sits immediately below at the same Y the chevron previously occupied in
+expanded mode.
+
+Measured Dashboard nav-item top: 48px (identical to expanded — Y-coord
+invariant satisfied).

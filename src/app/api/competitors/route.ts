@@ -1,203 +1,187 @@
 import { NextResponse } from "next/server";
 import {
-  addCompetitor,
-  COMPETITOR_TIERS,
-  Competitor,
-  CompetitorMetrics,
-  competitorListKpis,
-  competitorMetricsByCompetitor,
-  CompetitorTier,
-  countCompetitorsInFlight,
-  countUnassignedCompetitors,
+  addCompetitorResolved,
+  db,
   getActiveChannelId,
   getCompetitorByUserChannelAndHandle,
   getCompetitorByUserChannelAndYouTubeId,
-  isCompetitorTier,
-  listAllChannels,
   listCompetitors,
-  unreadCompetitorAlertCount,
 } from "@/lib/db";
-import { normaliseChannelUrl } from "@/lib/competitor-sync";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 30;
+
+const SELF_AS_COMPETITOR_ERROR =
+  "This is your own channel — cannot add as competitor.";
+
+function isUserOwnChannel(
+  channelId: string | null,
+  handle: string | null
+): boolean {
+  // channels table holds the user's own connected channels. Any match
+  // here means the user is trying to add themselves. Belt-and-braces:
+  // match on channel_id (UC...) if provided, and on handle for the
+  // resolve-by-handle path. Exact error string is asserted by Playwright
+  // (screenshot 04-add-self-rejected.png) — see SELF_AS_COMPETITOR_ERROR.
+  if (channelId) {
+    const byId = db
+      .prepare(`SELECT 1 AS x FROM channels WHERE id = ?`)
+      .get(channelId);
+    if (byId) return true;
+  }
+  if (handle) {
+    const normalised = handle.startsWith("@") ? handle : `@${handle}`;
+    const byHandle = db
+      .prepare(`SELECT 1 AS x FROM channels WHERE LOWER(handle) = LOWER(?)`)
+      .get(normalised);
+    if (byHandle) return true;
+  }
+  return false;
+}
 
 /**
  * GET /api/competitors
- *   - no param          → every row (used by the migration banner view)
- *   - ?userChannelId=X  → only competitors owned by user channel X
- *   - ?userChannelId=unassigned → only rows with user_channel_id IS NULL
  *
- * Response also carries:
- *   - unreadAlerts:    unread alert count scoped to the active user channel
- *   - unassignedCount: total NULL-user_channel_id rows — drives the migration banner
- *   - kpis:            top-strip aggregates (competitors, lastSync)
- *   - inFlight:        number of (queued + syncing) rows in the active scope
- *                      — the client uses this to decide whether to keep polling
+ * Returns competitors scoped to the active channel. T2 strip: no metrics,
+ * no tier/outlier/snapshot aggregates — just the fields the simplified
+ * card needs.
  */
-export async function GET(req: Request) {
-  const url = new URL(req.url);
-  const param = url.searchParams.get("userChannelId");
-  let scope: string | "unassigned" | undefined;
-  if (param === "unassigned") scope = "unassigned";
-  else if (typeof param === "string" && param.length > 0) scope = param;
-
-  const competitors = listCompetitors(scope);
+export async function GET(_req: Request) {
   const activeId = getActiveChannelId();
-  const metricsScope =
-    scope === "unassigned" ? null : (scope ?? activeId ?? null);
-  const metricsMap = competitorMetricsByCompetitor(metricsScope);
-  const kpis = competitorListKpis(activeId);
-  const inFlight = countCompetitorsInFlight(metricsScope);
-
-  return NextResponse.json({
-    competitors: competitors.map((c) => toWire(c, metricsMap.get(c.id))),
-    unreadAlerts: unreadCompetitorAlertCount(activeId),
-    unassignedCount: countUnassignedCompetitors(),
-    kpis,
-    inFlight,
-  });
-}
-
-/**
- * POST /api/competitors
- *
- * Body: { identifier, userChannelId, tier }
- *
- * Async flow:
- *   1. Validate input + dedup (same as before).
- *   2. INSERT the row with sync_status='queued' (addCompetitor default).
- *   3. Fire-and-forget a POST to /api/competitors/sync-queued — the worker
- *      picks up the queued row (sequentially, lock-guarded) and drains
- *      the queue.
- *   4. Return 202 immediately so the client can stop showing the spinner
- *      and start polling GET /api/competitors instead.
- */
-export async function POST(req: Request) {
-  const body = (await req.json().catch(() => ({}))) as {
-    identifier?: unknown;
-    userChannelId?: unknown;
-    tier?: unknown;
-  };
-  const identifier =
-    typeof body.identifier === "string" ? body.identifier.trim() : "";
-  const userChannelId =
-    typeof body.userChannelId === "string" ? body.userChannelId.trim() : "";
-  const tier = body.tier;
-
-  if (!identifier) {
-    return NextResponse.json({ error: "identifier required" }, { status: 400 });
+  if (!activeId) {
+    return NextResponse.json({ competitors: [], activeChannelId: null });
   }
-  if (!userChannelId) {
-    return NextResponse.json(
-      { error: "userChannelId required" },
-      { status: 400 }
-    );
-  }
-  if (!isCompetitorTier(tier)) {
-    return NextResponse.json(
-      { error: `tier must be one of: ${COMPETITOR_TIERS.join(", ")}` },
-      { status: 400 }
-    );
-  }
-  const allChannels = listAllChannels();
-  if (!allChannels.some((c) => c.id === userChannelId)) {
-    return NextResponse.json(
-      { error: `Unknown userChannelId: ${userChannelId}` },
-      { status: 400 }
-    );
-  }
-
-  let normalised: string;
-  try {
-    normalised = normaliseChannelUrl(identifier);
-  } catch (e) {
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : "invalid identifier" },
-      { status: 400 }
-    );
-  }
-
-  const ucMatch = normalised.match(/channel\/(UC[A-Za-z0-9_-]+)/);
-  const handleMatch = normalised.match(/@([A-Za-z0-9_.-]+)/);
-  const handle = handleMatch ? `@${handleMatch[1]}` : normalised;
-
-  // Pair-scoped dedup guards (same as before — must run before the INSERT).
-  if (ucMatch) {
-    const existing = getCompetitorByUserChannelAndYouTubeId(
-      userChannelId,
-      ucMatch[1]
-    );
-    if (existing) {
-      return NextResponse.json(
-        { error: "Already tracked under this channel.", id: existing.id },
-        { status: 409 }
-      );
-    }
-  }
-  const handleDup = getCompetitorByUserChannelAndHandle(userChannelId, handle);
-  if (handleDup) {
-    return NextResponse.json(
-      { error: "Already tracked under this channel.", id: handleDup.id },
-      { status: 409 }
-    );
-  }
-  const id = addCompetitor({
-    handle,
-    channel_id: ucMatch ? ucMatch[1] : null,
-    user_channel_id: userChannelId,
-    tier: tier as CompetitorTier,
-  });
-
-  // Fire-and-forget kick to the worker. We do NOT await — the response
-  // returns 202 immediately. The worker self-locks via settings flag, so
-  // duplicate kicks are safe; an offline worker just means the row sits
-  // queued until the next /sync-queued POST (which the client also issues
-  // when the page mounts with queued rows).
-  void kickWorker(req).catch((err) => {
-    // eslint-disable-next-line no-console
-    console.warn("[competitors] worker kick failed (non-fatal):", err);
-  });
-
-  return NextResponse.json(
-    { ok: true, id, queued: true },
-    { status: 202 }
-  );
-}
-
-async function kickWorker(req: Request): Promise<void> {
-  const origin = new URL(req.url).origin;
-  await fetch(`${origin}/api/competitors/sync-queued`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-    cache: "no-store",
-  });
-}
-
-function toWire(c: Competitor, metrics?: CompetitorMetrics) {
-  return {
+  const rows = listCompetitors(activeId);
+  const competitors = rows.map((c) => ({
     id: c.id,
     channelId: c.channel_id,
     handle: c.handle,
     title: c.title,
     avatarUrl: c.avatar_url,
     subscriberCount: c.subscriber_count,
-    videoCount: c.video_count,
+    note: c.note ?? null,
     addedAt: c.added_at,
-    lastSyncAt: c.last_sync_at,
-    userChannelId: c.user_channel_id,
-    tier: c.tier,
-    tierSetAt: c.tier_set_at,
-    syncStatus: c.sync_status,
-    syncError: c.sync_error,
-    similarityScore: c.similarity_score,
-    outliers60d: metrics?.outliers60d ?? 0,
-    medianViews60d: metrics?.medianViews60d ?? null,
-    lastUploadAt: metrics?.lastUploadAt ?? null,
-    recentVideoViews: metrics?.recentVideoViews ?? [],
-    totalViews: metrics?.totalViews ?? 0,
-    totalVideos: metrics?.totalVideos ?? 0,
-  };
+  }));
+  return NextResponse.json({ competitors, activeChannelId: activeId });
 }
 
+/**
+ * POST /api/competitors
+ *
+ * Body: { resolved: { channel_id, channel_name, handle, thumbnail_url,
+ *                     subscriber_count }, note? }
+ *
+ * The client first calls /api/competitors/resolve to fetch metadata from
+ * YouTube Data API; the returned object is then posted here as `resolved`.
+ * We do NOT re-call YT or queue any background sync — the row lands
+ * fully populated with sync_status='synced'. The new pipeline pulls
+ * competitor videos LIVE at ideation time (no per-competitor cache here).
+ *
+ * Guards:
+ *   - T8 self-as-competitor (channel_id OR handle matches user's own channels)
+ *   - Pair-scoped dedup (already tracked under this user channel)
+ */
+export async function POST(req: Request) {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
+  }
+
+  const parsed = body as {
+    resolved?: {
+      channel_id?: unknown;
+      channel_name?: unknown;
+      handle?: unknown;
+      thumbnail_url?: unknown;
+      subscriber_count?: unknown;
+    };
+    note?: unknown;
+  };
+
+  const r = parsed.resolved;
+  if (!r || typeof r !== "object") {
+    return NextResponse.json(
+      { error: "resolved object required — call /api/competitors/resolve first" },
+      { status: 400 }
+    );
+  }
+  const channelId = typeof r.channel_id === "string" ? r.channel_id.trim() : "";
+  const channelName = typeof r.channel_name === "string" ? r.channel_name.trim() : "";
+  const handle = typeof r.handle === "string" ? r.handle : null;
+  const thumbnail = typeof r.thumbnail_url === "string" ? r.thumbnail_url : null;
+  const subscriberCount =
+    typeof r.subscriber_count === "number" ? r.subscriber_count : null;
+  const note = typeof parsed.note === "string" ? parsed.note.trim() : null;
+
+  if (!channelId || !channelName) {
+    return NextResponse.json(
+      { error: "resolved.channel_id and resolved.channel_name required" },
+      { status: 400 }
+    );
+  }
+  if (!/^UC[A-Za-z0-9_-]{20,24}$/.test(channelId)) {
+    return NextResponse.json(
+      { error: `resolved.channel_id is not a valid YouTube channel ID: ${channelId}` },
+      { status: 400 }
+    );
+  }
+
+  const userChannelId = getActiveChannelId();
+  if (!userChannelId) {
+    return NextResponse.json(
+      { error: "no active channel — connect one from the top-right channel switcher" },
+      { status: 400 }
+    );
+  }
+
+  // T8: self-as-competitor guard.
+  if (isUserOwnChannel(channelId, handle)) {
+    return NextResponse.json(
+      { error: SELF_AS_COMPETITOR_ERROR },
+      { status: 400 }
+    );
+  }
+
+  // Pair-scoped dedup: already tracked under this user channel?
+  const dupById = getCompetitorByUserChannelAndYouTubeId(userChannelId, channelId);
+  if (dupById) {
+    return NextResponse.json(
+      { error: "Already tracked under this channel.", id: dupById.id },
+      { status: 409 }
+    );
+  }
+  if (handle) {
+    const dupByHandle = getCompetitorByUserChannelAndHandle(userChannelId, handle);
+    if (dupByHandle) {
+      return NextResponse.json(
+        { error: "Already tracked under this channel.", id: dupByHandle.id },
+        { status: 409 }
+      );
+    }
+  }
+
+  const id = addCompetitorResolved({
+    user_channel_id: userChannelId,
+    channel_id: channelId,
+    handle,
+    title: channelName,
+    avatar_url: thumbnail,
+    subscriber_count: subscriberCount,
+    note,
+  });
+
+  return NextResponse.json({
+    ok: true,
+    competitor: {
+      id,
+      channelId,
+      handle,
+      title: channelName,
+      avatarUrl: thumbnail,
+      subscriberCount: subscriberCount,
+      note,
+    },
+  });
+}

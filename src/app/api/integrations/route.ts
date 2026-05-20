@@ -3,13 +3,10 @@ import { listIntegrations, setIntegration } from "@/lib/db";
 
 // Deepgram is the primary transcription path for this local-only build:
 // yt-dlp pulls audio into RAM and streams it to Deepgram, transcripts
-// land in SQLite. Apify is kept as an optional fallback for users who'd
-// rather not run yt-dlp on their machine (uses residential proxies on
-// Apify's side, no audio transit through this host).
+// land in SQLite.
 const ALLOWED = [
   "claude",
   "deepgram",
-  "apify",
   "exa",
   "youtube",
   "google_gemini",

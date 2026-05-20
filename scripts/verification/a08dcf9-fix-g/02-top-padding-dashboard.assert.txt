@@ -1,0 +1,10 @@
+Dashboard top spacing — already satisfied by FIX-F (no code change needed
+this round; the earlier "30-40px" observation was the broken-DB layout
+collapsing the page).
+
+Measured (Playwright, viewport 1440×900):
+  topbar.bottom            = 56  px
+  "Dashboard" h1.top       = 136 px
+  gap                      = 80  px
+
+PASS (≥ 64 target). Layout <main> uses px-6 pb-6 pt-20.

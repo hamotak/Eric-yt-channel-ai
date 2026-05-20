@@ -1,0 +1,3 @@
+After typing "@veritasium" into the add-competitor input and clicking Add, a new
+card appears at the top of the list with the resolved channel name "Veritasium"
+and the @veritasium handle. The previous 6 cards remain below.

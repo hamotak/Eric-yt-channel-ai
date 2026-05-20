@@ -649,13 +649,11 @@ function TranscriptPanel({
           <div className="text-muted-foreground">{t.videoDetail.noTranscript}</div>
 
           {/*
-            Three ways to get a transcript (local-first ordering):
+            Two ways to get a transcript (local-first ordering):
               1. YouTube captions (free, via timedtext + Innertube). First try.
               2. Deepgram (recommended for this local build). yt-dlp pulls audio
                  into RAM on this machine, streams it to Deepgram, transcript
                  lands in the local DB. Costs ≈$0.0043/min ($0.26/hour).
-              3. Apify fallback — useful if yt-dlp is blocked or you'd rather
-                 not run the binary locally; ≈$0.02 per video.
           */}
           <div className="flex flex-wrap items-center justify-center gap-2">
             <Button

@@ -1,0 +1,35 @@
+=== FIX-F.4 blue-cast audit (post-neutralization) ===
+
+--- grep -rn 'hsl(220' src/ ---
+(no matches)
+
+--- grep -rn 'hsl(217' src/ ---
+(no matches)
+
+--- grep -rn 'hsl(214' src/ ---
+(no matches)
+
+--- grep -rn 'hsl(210' src/ ---
+(no matches)
+
+--- grep -rn 'hsl(222' src/ ---
+(no matches)
+
+--- grep -rnE '(slate|blue|sky|indigo|zinc)-[0-9]+' src/ (any context) ---
+src/app/settings/logs/page.tsx:51:    classes: "text-blue-700 dark:text-blue-300 bg-blue-500/10",
+src/lib/competitor-tiers.ts:21:    "bg-sky-500/15 text-sky-700 dark:text-sky-400 border border-sky-500/30",
+
+DOCUMENTATION:
+  - All chrome surfaces (background, foreground, card, popover, muted,
+    accent, secondary, border, input, sidebar, sidebar-border) now use
+    HSL hue 0, saturation 0% (pure neutral). Verified via window.getComputedStyle:
+      body  bg = rgb(18, 18, 18)  =  hsl(0 0% 7%)
+      aside bg = rgb(18, 18, 18)  =  hsl(0 0% 7%) — matches body, ChatGPT-style
+
+  - Two non-chrome matches remain (DATA-VIZ / DEAD CODE, expected):
+      src/app/settings/logs/page.tsx:51  text-blue-700 dark:text-blue-300 bg-blue-500/10
+        → INFO log-level row tint on the /settings/logs page. Data-viz only,
+          not chrome. Kept.
+      src/lib/competitor-tiers.ts:21  bg-sky-500/15 text-sky-700 ...
+        → Tier-badge color for the (now-deleted) Adjacent tier surface.
+          File is orphan code from T2 (no importers); harmless dead code.

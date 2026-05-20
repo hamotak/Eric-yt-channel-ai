@@ -26,6 +26,7 @@ export const runtime = "nodejs";
 type WireField =
   | "channelDescription"
   | "ideationRules"
+  | "bannedTopics"
   | "niche"
   | "positioning"
   | "audience"
@@ -35,6 +36,7 @@ type WireField =
 const WIRE_TO_DB: Record<WireField, ChannelContextField> = {
   channelDescription: "channel_description",
   ideationRules: "ideation_rules",
+  bannedTopics: "banned_topics",
   niche: "niche",
   positioning: "positioning",
   audience: "audience",
@@ -49,6 +51,7 @@ const WIRE_FIELDS = Object.keys(WIRE_TO_DB) as WireField[];
 const FIELD_CAPS: Partial<Record<WireField, number>> = {
   channelDescription: 1500,
   ideationRules: 1200,
+  bannedTopics: 500,
 };
 
 type ChannelContextWire = {
@@ -59,6 +62,7 @@ type ChannelContextWire = {
   subscriberCount: number | null;
   channelDescription: string;
   ideationRules: string;
+  bannedTopics: string;
   // Legacy fields still surfaced so older clients reading the GET
   // response don't break; the redesigned UI ignores them.
   niche: string;
@@ -77,6 +81,7 @@ function toWire(c: Channel): ChannelContextWire {
     subscriberCount: c.subscriber_count,
     channelDescription: c.channel_description ?? "",
     ideationRules: c.ideation_rules ?? "",
+    bannedTopics: c.banned_topics ?? "",
     niche: c.niche ?? "",
     positioning: c.positioning ?? "",
     audience: c.audience ?? "",

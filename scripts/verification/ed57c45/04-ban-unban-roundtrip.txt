@@ -1,0 +1,19 @@
+T6+T8 — Format ban/unban round trip
+====================================
+
+Date: 2026-05-18
+Channel: UCIqH5kGFOM_lP9x_AmPodjQ (Late Science)
+
+Before ban: 2 active formats (ids 22, 23)
+POST /api/outlier-formats/22/ban  → {ok:true, alreadyBanned:false}
+After ban:  1 active format  (id 23 only — 22 filtered by banned_at IS NULL clause in listFormatsForChannel)
+POST /api/outlier-formats/22/unban → {ok:true, alreadyActive:false}
+After unban: 2 active formats again (22 restored)
+
+Proves:
+  - DB migration applied (banned_at column exists, no SQL error)
+  - banOutlierFormat / unbanOutlierFormat helpers flip state correctly
+  - listFormatsForChannel filter (WHERE banned_at IS NULL) suppresses banned rows
+  - The same query path powers /api/outliers/formats (UI), list_format_patterns
+    (chat tool), and the idea-generator's format pool — so banning hides the
+    format from all three at once.

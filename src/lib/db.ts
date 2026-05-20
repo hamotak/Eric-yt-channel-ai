@@ -255,13 +255,22 @@ db.exec(`
 // transcripts — `searchTranscripts` does plain LIKE — so this table is
 // pure liability. Drop and let it stay gone.
 //
-// Also drop the retired Hook Lab + Hooks Library tables. Both features
-// were stripped out in the redesign; this guarantees fresh installs
-// don't carry orphaned tables forward.
+// Also drop a few retired tables — fresh installs shouldn't carry
+// orphans forward.
 try {
   db.exec(`DROP TABLE IF EXISTS transcripts_fts`);
   db.exec(`DROP TABLE IF EXISTS video_hooks`);
   db.exec(`DROP TABLE IF EXISTS hooks_library`);
+  // T1 deletions — /chat and /outliers surfaces removed in 2026-05. Run
+  // before any of the surviving schema is created (no FK references from
+  // any surviving table). competitor_videos / competitor_alerts /
+  // competitor_video_excludes are KEPT — the new pipeline doesn't read
+  // them but they're still populated by competitor-sync.
+  db.exec(`DROP TABLE IF EXISTS chat_messages`);
+  db.exec(`DROP TABLE IF EXISTS chat_sessions`);
+  db.exec(`DROP TABLE IF EXISTS outlier_format_videos`);
+  db.exec(`DROP TABLE IF EXISTS outlier_formats`);
+  db.exec(`DROP TABLE IF EXISTS outlier_explanations`);
 } catch {
   /* table didn't exist or rare concurrent issue — moving on either way */
 }
@@ -653,6 +662,9 @@ export type Channel = {
   // of truth for niche/positioning/audience/voice — replaces the legacy
   // 5 fields. ≤1500 chars after trim.
   channel_description?: string;
+  // T3 — comma-separated topic ban list. Pipeline hardRuleCheck() rejects
+  // any candidate idea matching tokens in this list.
+  banned_topics?: string | null;
 };
 
 /**
@@ -662,8 +674,7 @@ export type Channel = {
  * paragraph breaks (capped at 1500 chars). Returns "" when everything
  * is empty.
  *
- * Used by both the chat-tools system-prompt builder and the
- * idea-generator compose prompt so a channel that hasn't been
+ * Used by the ideation compose prompt so a channel that hasn't been
  * migrated yet (or had its description manually cleared) still
  * surfaces the legacy data to the agent.
  */
@@ -718,6 +729,10 @@ export function updateChannelMeta(channelId: string, patch: ChannelMeta): void {
 export type ChannelContextField =
   | "channel_description"
   | "ideation_rules"
+  // T3 — comma-separated topic ban list. Hard-rule check in
+  // src/lib/ideate/pipeline.ts rejects any candidate idea whose title
+  // or description contains a token from this list.
+  | "banned_topics"
   // Legacy — kept writable so old migrations + the chat tool's
   // backwards-compatible path keep working. UI no longer surfaces these.
   | "niche"
@@ -729,6 +744,7 @@ export type ChannelContextField =
 const CHANNEL_CONTEXT_FIELDS: readonly ChannelContextField[] = [
   "channel_description",
   "ideation_rules",
+  "banned_topics",
   "niche",
   "positioning",
   "audience",
@@ -1865,8 +1881,7 @@ db.exec(`
     // existing rows get an empty string immediately and the API never
     // returns NULL.
     // Legacy 5-field context model. These columns are NO LONGER read by
-    // the agent (chat-tools.ts buildSystemPrompt + idea-generator
-    // buildUserBodyForCompose). They remain in schema for backwards
+    // any active prompt builder. They remain in schema for backwards
     // compatibility — the migration below baked their concatenated text
     // into the new channel_description column. Treat as deprecated;
     // /channel-info no longer surfaces them.
@@ -3120,11 +3135,9 @@ export function clearLogs(opts: { level?: LogLevel; olderThanSec?: number } = {}
 /* ============================================================
  * COMPETITORS (Phase B)
  *
- * Tracks rival YouTube channels for gap/outlier analysis. Synced
- * through Apify (per the user's existing Apify integration), not the
- * YouTube Data API — Apify lets us pull title + views + thumbnail at
- * scale without burning the 10K/day quota that we save for the user's
- * own channel.
+ * Tracks rival YouTube channels for the /ideate pipeline's live
+ * outlier-gather step. Synced via the YouTube Data API (1 unit per
+ * resolveChannel + 1 per playlistItems.list + batched videos.list).
  * ============================================================ */
 
 // Fresh-install shape. Note: NO `UNIQUE` on channel_id — uniqueness is now
@@ -3466,6 +3479,7 @@ export type Competitor = {
   sync_status: CompetitorSyncStatus;
   sync_error: string | null;
   similarity_score: number | null;
+  note: string | null;
 };
 
 export const COMPETITOR_TIERS = ["authority", "breakthrough", "adjacent", "far"] as const;
@@ -3660,6 +3674,49 @@ export function setCompetitorSimilarityScore(id: number, score: number): void {
   db.prepare(
     `UPDATE competitors SET similarity_score = ? WHERE id = ?`
   ).run(Math.max(0, Math.min(100, Math.round(score))), id);
+}
+
+/**
+ * T2 insert path: the new /competitors UI resolves the channel via YT
+ * Data API at POST time (no background sync), so we land a fully
+ * populated row with sync_status='synced'. Tier defaults to 'authority'
+ * via the column DEFAULT — the new UI doesn't surface tiers.
+ */
+export function addCompetitorResolved(input: {
+  user_channel_id: string;
+  channel_id: string;
+  handle: string | null;
+  title: string;
+  avatar_url: string | null;
+  subscriber_count: number | null;
+  note: string | null;
+}): number {
+  const info = db
+    .prepare(
+      `INSERT INTO competitors
+         (handle, channel_id, title, avatar_url, subscriber_count,
+          user_channel_id, note, tier, tier_set_at, sync_status, last_sync_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'authority', strftime('%s','now'),
+               'synced', strftime('%s','now'))`
+    )
+    .run(
+      input.handle,
+      input.channel_id,
+      input.title,
+      input.avatar_url,
+      input.subscriber_count,
+      input.user_channel_id,
+      input.note
+    );
+  return Number(info.lastInsertRowid);
+}
+
+export function setCompetitorNote(id: number, note: string | null): void {
+  const trimmed = note?.trim() ?? null;
+  db.prepare(`UPDATE competitors SET note = ? WHERE id = ?`).run(
+    trimmed && trimmed.length > 0 ? trimmed : null,
+    id
+  );
 }
 
 /**
@@ -4380,836 +4437,106 @@ export function upsertCommentAnalysis(a: CommentAnalysis): void {
   );
 }
 
-/* ============================================================
- * OUTLIER EXPLANATIONS (Phase E — /outliers page)
- *
- * Claude's "what made it work" lever tagging + 2-3-sentence reasoning
- * for a single competitor video that beat its own channel's median by
- * ≥ the configured multiplier. Per MENTOR_METHOD §2 + §9. Cached
- * permanently (lever attribution doesn't change as the video ages);
- * cascaded delete via competitor_id when a competitor is removed.
- * ============================================================ */
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS outlier_explanations (
-    video_id TEXT PRIMARY KEY,
-    competitor_id INTEGER NOT NULL,
-    levers TEXT NOT NULL,             -- JSON array of lever strings
-    explanation TEXT NOT NULL,        -- 2-3 sentences plain English
-    generated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    model TEXT,                       -- e.g. "claude-sonnet-4-6"
-    FOREIGN KEY (competitor_id) REFERENCES competitors(id) ON DELETE CASCADE
-  );
-  CREATE INDEX IF NOT EXISTS idx_outlier_explanations_competitor
-    ON outlier_explanations(competitor_id);
-`);
-
-export type OutlierExplanation = {
-  videoId: string;
-  competitorId: number;
-  levers: string[];
-  explanation: string;
-  generatedAt: number;
-  model: string | null;
-};
-
-export function getOutlierExplanation(
-  videoId: string
-): OutlierExplanation | null {
-  const row = db
-    .prepare(
-      `SELECT video_id, competitor_id, levers, explanation, generated_at, model
-       FROM outlier_explanations WHERE video_id = ?`
-    )
-    .get(videoId) as
-    | {
-        video_id: string;
-        competitor_id: number;
-        levers: string;
-        explanation: string;
-        generated_at: number;
-        model: string | null;
-      }
-    | undefined;
-  if (!row) return null;
-  let levers: string[] = [];
-  try {
-    const parsed = JSON.parse(row.levers);
-    if (Array.isArray(parsed)) levers = parsed.filter((v) => typeof v === "string");
-  } catch {
-    /* keep [] */
-  }
-  return {
-    videoId: row.video_id,
-    competitorId: row.competitor_id,
-    levers,
-    explanation: row.explanation,
-    generatedAt: row.generated_at,
-    model: row.model,
-  };
-}
-
-export function upsertOutlierExplanation(input: {
-  videoId: string;
-  competitorId: number;
-  levers: string[];
-  explanation: string;
-  model: string | null;
-}): void {
-  db.prepare(
-    `INSERT INTO outlier_explanations
-       (video_id, competitor_id, levers, explanation, generated_at, model)
-     VALUES (?, ?, ?, ?, strftime('%s','now'), ?)
-     ON CONFLICT(video_id) DO UPDATE SET
-       levers = excluded.levers,
-       explanation = excluded.explanation,
-       generated_at = strftime('%s','now'),
-       model = excluded.model`
-  ).run(
-    input.videoId,
-    input.competitorId,
-    JSON.stringify(input.levers),
-    input.explanation,
-    input.model
-  );
-}
 
 /* ============================================================
- * OUTLIER FORMAT LIBRARY (Phase E — /outliers Patterns tab)
+ * Ideation pipeline tables (T5 — /ideate one-button)
  *
- * Claude-extracted structural title-format templates from a channel's
- * current outliers (per MENTOR_METHOD §4: title formats are patterns,
- * not literal titles). One row per (user_channel_id, template); the
- * link table maps each format to its example videos with a snapshot of
- * the multiplier at extraction time (snapshot avoids recomputing the
- * per-competitor median for the weekly charts every render).
+ * generations         — one row per Generate click (request_id PK)
+ * ideas               — per-idea rows linked to generation_id
+ * ideation_rules      — channel-scoped rules (free-form banned topics +
+ *                       LLM-distilled rules with pending=1 awaiting Apply)
+ * gather_attrition_log — competitors dropped from a gather() pass when
+ *                       the YT API call ceiling would otherwise be exceeded
+ *
+ * Channel-level additions:
+ *   channels.banned_topics  — comma-separated topic ban list (free-form)
+ *   competitors.note        — per-competitor free-form note shown on card
  * ============================================================ */
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS outlier_formats (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_channel_id TEXT NOT NULL,
-    template TEXT NOT NULL,
-    avg_multiplier REAL,
-    total_views_month INTEGER,
-    rising_rate REAL,
-    extracted_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    model TEXT,
-    UNIQUE(user_channel_id, template)
-  );
-  CREATE INDEX IF NOT EXISTS idx_outlier_formats_user
-    ON outlier_formats(user_channel_id, rising_rate DESC, avg_multiplier DESC);
-
-  CREATE TABLE IF NOT EXISTS outlier_format_videos (
-    format_id INTEGER NOT NULL,
-    video_id TEXT NOT NULL,
-    multiplier_at_extract REAL,
-    PRIMARY KEY (format_id, video_id),
-    FOREIGN KEY (format_id) REFERENCES outlier_formats(id) ON DELETE CASCADE
-  );
-  CREATE INDEX IF NOT EXISTS idx_outlier_format_videos_video
-    ON outlier_format_videos(video_id);
-`);
-
-// T6: banned_at column for soft-ban of trending formats. NULL = active,
-// non-NULL = banned at that timestamp. Idempotent ADD COLUMN via PRAGMA
-// guard (matches the chat_messages.thinking / chat_sessions.channel_id
-// patterns above). Index lets the IS NULL filter in listFormatsForChannel
-// hit cheaply. Wipe-on-reextract already deletes rows by user_channel_id,
-// so a ban survives until the next re-extract that drops/recreates the
-// template — that's the right semantic: a banned template should not
-// resurface, but a fresh extract that no longer detects it doesn't need
-// to keep the ban around.
+// ALTER channels: add banned_topics. Idempotent via PRAGMA guard.
 try {
   const cols = db
-    .prepare(`PRAGMA table_info(outlier_formats)`)
+    .prepare(`PRAGMA table_info(channels)`)
     .all() as { name: string }[];
-  if (!cols.some((c) => c.name === "banned_at")) {
-    db.exec(`ALTER TABLE outlier_formats ADD COLUMN banned_at INTEGER`);
+  if (!cols.some((c) => c.name === "banned_topics")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN banned_topics TEXT`);
   }
-  // is_single_channel: 1 = format only spans one competitor (came from
-  // the relaxed fallback pass — "author pattern", not a true cross-
-  // channel trend). 0/null = standard cross-channel format. UI badges
-  // single-channel rows; the agent labels them appropriately.
-  if (!cols.some((c) => c.name === "is_single_channel")) {
-    db.exec(
-      `ALTER TABLE outlier_formats ADD COLUMN is_single_channel INTEGER NOT NULL DEFAULT 0`
-    );
-  }
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS idx_outlier_formats_banned
-       ON outlier_formats(user_channel_id, banned_at)`
-  );
 } catch {
   /* noop */
 }
 
-export type OutlierFormat = {
-  id: number;
-  userChannelId: string;
-  template: string;
-  avgMultiplier: number | null;
-  totalViewsMonth: number | null;
-  risingRate: number | null;
-  extractedAt: number;
-  model: string | null;
-  // T6: NULL = active, non-NULL timestamp = banned. listFormatsForChannel
-  // filters banned rows out; idea-generator's format pool inherits that
-  // filter via getFormatsForChannel; the chat tool list_format_patterns
-  // calls getFormatsForChannel directly too.
-  bannedAt: number | null;
-  // T3 (diag pass): true when the format only spans one competitor
-  // (came from the relaxed fallback in extractFormatsFromOutliers).
-  // UI badges these "author pattern"; the agent labels them in chat
-  // output. NEVER counted as a cross-channel trend.
-  isSingleChannel: boolean;
-};
-
-/**
- * Upsert a format row by (user_channel_id, template). Used by the
- * format-extraction flow when Claude returns the format batch — each
- * format's metrics are computed in JS first, then written here.
- * Returns the row id whether inserted or updated.
- */
-export function upsertOutlierFormat(input: {
-  userChannelId: string;
-  template: string;
-  avgMultiplier: number | null;
-  totalViewsMonth: number | null;
-  risingRate: number | null;
-  model: string | null;
-  isSingleChannel?: boolean;
-}): number {
-  const singleChannelFlag = input.isSingleChannel ? 1 : 0;
-  db.prepare(
-    `INSERT INTO outlier_formats
-       (user_channel_id, template, avg_multiplier, total_views_month,
-        rising_rate, extracted_at, model, is_single_channel)
-     VALUES (?, ?, ?, ?, ?, strftime('%s','now'), ?, ?)
-     ON CONFLICT(user_channel_id, template) DO UPDATE SET
-       avg_multiplier = excluded.avg_multiplier,
-       total_views_month = excluded.total_views_month,
-       rising_rate = excluded.rising_rate,
-       extracted_at = strftime('%s','now'),
-       model = excluded.model,
-       is_single_channel = excluded.is_single_channel`
-  ).run(
-    input.userChannelId,
-    input.template,
-    input.avgMultiplier,
-    input.totalViewsMonth,
-    input.risingRate,
-    input.model,
-    singleChannelFlag
-  );
-  const row = db
-    .prepare(
-      `SELECT id FROM outlier_formats WHERE user_channel_id = ? AND template = ?`
-    )
-    .get(input.userChannelId, input.template) as { id: number } | undefined;
-  return row?.id ?? -1;
-}
-
-/**
- * Wipe every stored format + its video links for one user channel.
- * Called at the top of extractFormatsFromOutliers so Re-extract is a
- * clean slate. Without this, formats from prior extractions that the
- * new LLM call doesn't re-emit linger forever, and stale video links
- * survive even when the new dedup pass would have removed them.
- * Cascade through outlier_format_videos via FK ON DELETE CASCADE.
- */
-export function wipeFormatsForChannel(userChannelId: string): {
-  formatsDeleted: number;
-  linksDeleted: number;
-} {
-  const before = db
-    .prepare(
-      `SELECT
-         (SELECT COUNT(*) FROM outlier_formats WHERE user_channel_id = ?)  AS formats,
-         (SELECT COUNT(*) FROM outlier_format_videos ofv
-            JOIN outlier_formats f ON f.id = ofv.format_id
-            WHERE f.user_channel_id = ?)                                   AS links`
-    )
-    .get(userChannelId, userChannelId) as { formats: number; links: number };
-  db.prepare(`DELETE FROM outlier_formats WHERE user_channel_id = ?`).run(
-    userChannelId
-  );
-  return { formatsDeleted: before.formats, linksDeleted: before.links };
-}
-
-/**
- * Replace this format's video links with a fresh set. Idempotent —
- * deletes existing rows for this format_id then inserts the new ones.
- * Called once per format on each re-extract.
- */
-export function rebuildFormatVideoLinks(
-  formatId: number,
-  links: Array<{ videoId: string; multiplierAtExtract: number }>
-): void {
-  const tx = db.transaction(() => {
-    db.prepare(`DELETE FROM outlier_format_videos WHERE format_id = ?`).run(
-      formatId
-    );
-    const ins = db.prepare(
-      `INSERT INTO outlier_format_videos
-         (format_id, video_id, multiplier_at_extract)
-       VALUES (?, ?, ?)`
-    );
-    for (const l of links) {
-      ins.run(formatId, l.videoId, l.multiplierAtExtract);
-    }
-  });
-  tx();
-}
-
-/**
- * List formats for a user channel sorted by rising rate DESC, then by
- * avg multiplier DESC. Used by the Patterns tab + the list_format_patterns
- * chat tool. The example videos (top 5 by multiplier_at_extract) come
- * from getExampleVideosForFormat in a per-row call — at the format
- * scale we expect (≤ 20), N+1 is fine.
- */
-export function listFormatsForChannel(
-  userChannelId: string,
-  limit = 50
-): OutlierFormat[] {
-  const rows = db
-    .prepare(
-      `SELECT id, user_channel_id, template, avg_multiplier,
-              total_views_month, rising_rate, extracted_at, model, banned_at,
-              is_single_channel
-       FROM outlier_formats
-       WHERE user_channel_id = ?
-         AND banned_at IS NULL
-       ORDER BY COALESCE(rising_rate, 0) DESC, COALESCE(avg_multiplier, 0) DESC
-       LIMIT ?`
-    )
-    .all(userChannelId, limit) as Array<{
-    id: number;
-    user_channel_id: string;
-    template: string;
-    avg_multiplier: number | null;
-    total_views_month: number | null;
-    rising_rate: number | null;
-    extracted_at: number;
-    model: string | null;
-    banned_at: number | null;
-    is_single_channel: number;
-  }>;
-  return rows.map((r) => ({
-    id: r.id,
-    userChannelId: r.user_channel_id,
-    template: r.template,
-    avgMultiplier: r.avg_multiplier,
-    totalViewsMonth: r.total_views_month,
-    risingRate: r.rising_rate,
-    extractedAt: r.extracted_at,
-    model: r.model,
-    bannedAt: r.banned_at,
-    isSingleChannel: r.is_single_channel === 1,
-  }));
-}
-
-/**
- * T6 — soft-ban a single format. Marks banned_at = now(); leaves the row
- * + its video links intact (a future unban restores everything cleanly).
- * Returns true if a row was actually flipped from active → banned.
- */
-export function banOutlierFormat(formatId: number): boolean {
-  const info = db
-    .prepare(
-      `UPDATE outlier_formats
-         SET banned_at = strftime('%s','now')
-       WHERE id = ? AND banned_at IS NULL`
-    )
-    .run(formatId);
-  return info.changes > 0;
-}
-
-/**
- * T6 — clear the soft-ban. Returns true if the row went banned → active.
- */
-export function unbanOutlierFormat(formatId: number): boolean {
-  const info = db
-    .prepare(
-      `UPDATE outlier_formats
-         SET banned_at = NULL
-       WHERE id = ? AND banned_at IS NOT NULL`
-    )
-    .run(formatId);
-  return info.changes > 0;
-}
-
-/**
- * T6 — fetch a single format by id (active OR banned). Used by the ban
- * endpoint to confirm the row exists + by the chat tool to resolve a
- * format_id before mutating it.
- */
-export function getOutlierFormatById(
-  formatId: number
-): OutlierFormat | null {
-  const r = db
-    .prepare(
-      `SELECT id, user_channel_id, template, avg_multiplier,
-              total_views_month, rising_rate, extracted_at, model, banned_at,
-              is_single_channel
-       FROM outlier_formats
-       WHERE id = ?`
-    )
-    .get(formatId) as
-    | {
-        id: number;
-        user_channel_id: string;
-        template: string;
-        avg_multiplier: number | null;
-        total_views_month: number | null;
-        rising_rate: number | null;
-        extracted_at: number;
-        model: string | null;
-        banned_at: number | null;
-        is_single_channel: number;
-      }
-    | undefined;
-  if (!r) return null;
-  return {
-    id: r.id,
-    userChannelId: r.user_channel_id,
-    template: r.template,
-    avgMultiplier: r.avg_multiplier,
-    totalViewsMonth: r.total_views_month,
-    risingRate: r.rising_rate,
-    extractedAt: r.extracted_at,
-    model: r.model,
-    bannedAt: r.banned_at,
-    isSingleChannel: r.is_single_channel === 1,
-  };
-}
-
-/**
- * T8 — fuzzy template lookup for the chat ban_format / unban_format tools.
- * Substring (case-insensitive) match over template for the active channel.
- * Returns up to `limit` rows so the agent can either disambiguate ("which
- * of these did you mean?") or proceed directly when the match is unique.
- * Both active and banned rows are returned so unban can target banned
- * rows — callers filter banned_at IS NULL when they care.
- */
-export function findOutlierFormatsByTemplateMatch(
-  userChannelId: string,
-  substring: string,
-  limit = 5
-): OutlierFormat[] {
-  const needle = substring.trim();
-  if (!needle) return [];
-  const rows = db
-    .prepare(
-      `SELECT id, user_channel_id, template, avg_multiplier,
-              total_views_month, rising_rate, extracted_at, model, banned_at,
-              is_single_channel
-       FROM outlier_formats
-       WHERE user_channel_id = ?
-         AND LOWER(template) LIKE LOWER(?)
-       ORDER BY COALESCE(rising_rate, 0) DESC, COALESCE(avg_multiplier, 0) DESC
-       LIMIT ?`
-    )
-    .all(userChannelId, `%${needle}%`, limit) as Array<{
-    id: number;
-    user_channel_id: string;
-    template: string;
-    avg_multiplier: number | null;
-    total_views_month: number | null;
-    rising_rate: number | null;
-    extracted_at: number;
-    model: string | null;
-    banned_at: number | null;
-    is_single_channel: number;
-  }>;
-  return rows.map((r) => ({
-    id: r.id,
-    userChannelId: r.user_channel_id,
-    template: r.template,
-    avgMultiplier: r.avg_multiplier,
-    totalViewsMonth: r.total_views_month,
-    risingRate: r.rising_rate,
-    extractedAt: r.extracted_at,
-    model: r.model,
-    bannedAt: r.banned_at,
-    isSingleChannel: r.is_single_channel === 1,
-  }));
-}
-
-/**
- * Top example videos for a format, joined to the competitor_videos row
- * so the UI can show thumbnails + titles + competitor metadata. Sorted
- * by the snapshot multiplier descending.
- */
-export function getExampleVideosForFormat(
-  formatId: number,
-  limit = 5
-): Array<{
-  videoId: string;
-  title: string;
-  thumbnailUrl: string | null;
-  views: number;
-  publishedAt: number | null;
-  competitorId: number;
-  competitorTitle: string | null;
-  competitorHandle: string | null;
-  competitorSubs: number | null;
-  tier: string;
-  multiplierAtExtract: number;
-}> {
-  const rows = db
-    .prepare(
-      `SELECT ofv.video_id, ofv.multiplier_at_extract,
-              cv.title, cv.thumbnail_url, cv.views, cv.published_at,
-              cv.competitor_id,
-              c.title  AS competitor_title,
-              c.handle AS competitor_handle,
-              c.subscriber_count AS competitor_subs,
-              c.tier
-       FROM outlier_format_videos ofv
-       JOIN competitor_videos cv ON cv.video_id = ofv.video_id
-       JOIN competitors c        ON c.id        = cv.competitor_id
-       WHERE ofv.format_id = ?
-       ORDER BY ofv.multiplier_at_extract DESC
-       LIMIT ?`
-    )
-    .all(formatId, limit) as Array<{
-    video_id: string;
-    multiplier_at_extract: number;
-    title: string;
-    thumbnail_url: string | null;
-    views: number;
-    published_at: number | null;
-    competitor_id: number;
-    competitor_title: string | null;
-    competitor_handle: string | null;
-    competitor_subs: number | null;
-    tier: string;
-  }>;
-  return rows.map((r) => ({
-    videoId: r.video_id,
-    title: r.title,
-    thumbnailUrl: r.thumbnail_url,
-    views: r.views,
-    publishedAt: r.published_at,
-    competitorId: r.competitor_id,
-    competitorTitle: r.competitor_title,
-    competitorHandle: r.competitor_handle,
-    competitorSubs: r.competitor_subs,
-    tier: r.tier,
-    multiplierAtExtract: r.multiplier_at_extract,
-  }));
-}
-
-/**
- * Per-format weekly histogram for the tiny charts on each card. Returns
- * up to 10 weeks of (week_index, n, avg_mult) where week_index = 0 is
- * "this week" and 9 is "9 weeks ago". Used by getFormatChartData in
- * src/lib/outlier-formats.ts to assemble the SVG inputs.
- */
-export function getFormatWeeklyHistogram(
-  formatId: number
-): Array<{ weekIndex: number; n: number; avgMult: number }> {
-  return db
-    .prepare(
-      `SELECT
-         CAST((strftime('%s','now') - cv.published_at) / (7 * 86400) AS INTEGER) AS week_index,
-         COUNT(*) AS n,
-         AVG(ofv.multiplier_at_extract) AS avg_mult
-       FROM outlier_format_videos ofv
-       JOIN competitor_videos cv ON cv.video_id = ofv.video_id
-       WHERE ofv.format_id = ?
-         AND cv.published_at IS NOT NULL
-         AND cv.published_at >= strftime('%s','now') - 10 * 7 * 86400
-       GROUP BY week_index
-       ORDER BY week_index ASC`
-    )
-    .all(formatId) as Array<{ week_index: number; n: number; avg_mult: number }>;
-}
-
-/**
- * Outliers query for the /outliers page. Returns competitor videos
- * whose views exceed `minMultiplier × the competitor's own median over
- * the same window`, per MENTOR_METHOD §2. Scoped to one user channel's
- * competitors or "all" (null) across every user channel. Tier filter
- * is a 4-slot array — pass empty string in unused slots to no-op.
- *
- * One SQL pass — uses window functions for per-competitor median, then
- * joins back to the in-window videos and applies the multiplier filter.
- * No N+1. Capped at 50 results, sorted by multiplier DESC then views DESC.
- */
-export type OutlierRow = {
-  videoId: string;
-  title: string;
-  thumbnailUrl: string | null;
-  views: number;
-  publishedAt: number | null;
-  durationSeconds: number | null;
-  competitorId: number;
-  competitorTitle: string | null;
-  competitorHandle: string | null;
-  competitorAvatar: string | null;
-  // YouTube channel id of the competitor (UC...). Used by callers to
-  // double-check that a row is not from the user's own channel — the
-  // SQL below already excludes self-tracked-as-competitor rows, but
-  // idea-generator runs an additional defense-in-depth filter on this
-  // field per DEF-I1 (Late Science was tracked as its own competitor
-  // and surfaced its own videos as "inspiration").
-  competitorChannelId: string | null;
-  // T4: surfaced so the agent can render "Channel (N subs)" inline
-  // without a second tool call. Pulled from the competitors row via
-  // JOIN in outliersForUserChannel.
-  competitorSubscriberCount: number | null;
-  tier: string;
-  multiplier: number;
-  channelMedian: number;
-};
-
-export function outliersForUserChannel(opts: {
-  userChannelId: string | null; // null = across all user channels
-  windowDays: number;            // 7 | 30 | 90
-  minMultiplier: number;         // >= 1
-  tiers: readonly string[];      // subset of ["authority","breakthrough","adjacent","far"]
-  limit?: number;
-  competitorId?: number | null;  // null/undefined = no filter; number = single-competitor scope (used by /competitors/[id])
-}): {
-  outliers: OutlierRow[];
-  totalScanned: number;
-  competitorsCovered: number;
-} {
-  const limit = Math.min(opts.limit ?? 50, 200);
-  // Tier IN-list — pad to 4 slots so the prepared statement has a fixed
-  // arity. Unused slots get an impossible value so they no-op.
-  const tierSlots: [string, string, string, string] = ["", "", "", ""];
-  for (let i = 0; i < Math.min(opts.tiers.length, 4); i++) {
-    tierSlots[i] = opts.tiers[i];
+// ALTER competitors: add note. Idempotent. T2 surfaces this as an
+// inline textarea on each card. NULL = no note yet.
+try {
+  const cols = db
+    .prepare(`PRAGMA table_info(competitors)`)
+    .all() as { name: string }[];
+  if (!cols.some((c) => c.name === "note")) {
+    db.exec(`ALTER TABLE competitors ADD COLUMN note TEXT`);
   }
-
-  const scope = opts.userChannelId; // null | string
-  const compScope = opts.competitorId ?? null; // null | number — extra single-competitor narrow.
-
-  // LEFT JOIN competitor_video_excludes + IS NULL inside scoped_videos
-  // strips any (user_channel, video) pair the user has hidden. The
-  // exclude is matched against c.user_channel_id (the competitor's
-  // owning channel), which is correct for every caller — chat tool,
-  // Topics Gap source, Patterns extraction, /competitors/[id], and
-  // the per-channel /api/outliers fetch — because they all view
-  // outliers through the lens of a specific user_channel.
-  // Self-tracked-as-competitor exclusion (DEF-I1): some installs have the
-  // user's own channel registered as a competitor of itself (Late Science
-  // had this — competitors row 8 with channel_id == user_channel_id). Those
-  // rows pollute the inspiration pool with the user's own videos. The
-  // `c.channel_id IS NULL OR c.channel_id != c.user_channel_id` clause
-  // strips them at the SQL layer; idea-generator runs a defense-in-depth
-  // filter on the OutlierRow.competitorChannelId field too.
-  const outliers = db
-    .prepare(
-      `WITH scoped_videos AS (
-         SELECT
-           cv.video_id, cv.title, cv.thumbnail_url, cv.views,
-           cv.published_at, cv.duration_seconds,
-           cv.competitor_id,
-           c.title              AS competitor_title,
-           c.handle             AS competitor_handle,
-           c.avatar_url         AS competitor_avatar,
-           c.channel_id         AS competitor_channel_id,
-           c.subscriber_count   AS competitor_subscriber_count,
-           c.tier,
-           c.user_channel_id,
-           ROW_NUMBER() OVER (PARTITION BY cv.competitor_id ORDER BY cv.views) AS rn,
-           COUNT(*)     OVER (PARTITION BY cv.competitor_id)                  AS n_in_window
-         FROM competitor_videos cv
-         JOIN competitors c ON c.id = cv.competitor_id
-         LEFT JOIN competitor_video_excludes e
-           ON e.user_channel_id = c.user_channel_id
-          AND e.video_id        = cv.video_id
-         WHERE cv.published_at >= strftime('%s','now') - ? * 86400
-           AND (? IS NULL OR c.user_channel_id = ?)
-           AND c.tier IN (?, ?, ?, ?)
-           AND (? IS NULL OR c.id = ?)
-           AND e.video_id IS NULL
-           AND (c.channel_id IS NULL OR c.channel_id != c.user_channel_id)
-       ),
-       qualified_medians AS (
-         SELECT competitor_id, AVG(views) AS median_views
-         FROM scoped_videos
-         WHERE n_in_window >= 5
-           AND rn IN ((n_in_window + 1) / 2, (n_in_window + 2) / 2)
-         GROUP BY competitor_id
-       )
-       SELECT
-         v.video_id, v.title, v.thumbnail_url, v.views,
-         v.published_at, v.duration_seconds,
-         v.competitor_id, v.competitor_title, v.competitor_handle,
-         v.competitor_avatar, v.competitor_channel_id,
-         v.competitor_subscriber_count, v.tier,
-         CAST(m.median_views AS INTEGER)   AS channel_median,
-         (v.views * 1.0 / m.median_views)  AS multiplier
-       FROM scoped_videos v
-       JOIN qualified_medians m ON m.competitor_id = v.competitor_id
-       WHERE v.views > ? * m.median_views
-       ORDER BY multiplier DESC, v.views DESC
-       LIMIT ?`
-    )
-    .all(
-      opts.windowDays,
-      scope,
-      scope,
-      tierSlots[0],
-      tierSlots[1],
-      tierSlots[2],
-      tierSlots[3],
-      compScope,
-      compScope,
-      opts.minMultiplier,
-      limit
-    ) as Array<{
-    video_id: string;
-    title: string;
-    thumbnail_url: string | null;
-    views: number;
-    published_at: number | null;
-    duration_seconds: number | null;
-    competitor_id: number;
-    competitor_title: string | null;
-    competitor_handle: string | null;
-    competitor_avatar: string | null;
-    competitor_channel_id: string | null;
-    competitor_subscriber_count: number | null;
-    tier: string;
-    channel_median: number;
-    multiplier: number;
-  }>;
-
-  const totalScanned = (
-    db
-      .prepare(
-        `SELECT COUNT(*) AS n
-         FROM competitor_videos cv
-         JOIN competitors c ON c.id = cv.competitor_id
-         WHERE cv.published_at >= strftime('%s','now') - ? * 86400
-           AND (? IS NULL OR c.user_channel_id = ?)
-           AND c.tier IN (?, ?, ?, ?)
-           AND (? IS NULL OR c.id = ?)`
-      )
-      .get(
-        opts.windowDays,
-        scope,
-        scope,
-        tierSlots[0],
-        tierSlots[1],
-        tierSlots[2],
-        tierSlots[3],
-        compScope,
-        compScope
-      ) as { n: number }
-  ).n;
-
-  const competitorsCovered = (
-    db
-      .prepare(
-        `SELECT COUNT(DISTINCT id) AS n
-         FROM competitors
-         WHERE (? IS NULL OR user_channel_id = ?)
-           AND tier IN (?, ?, ?, ?)
-           AND (? IS NULL OR id = ?)`
-      )
-      .get(
-        scope,
-        scope,
-        tierSlots[0],
-        tierSlots[1],
-        tierSlots[2],
-        tierSlots[3],
-        compScope,
-        compScope
-      ) as { n: number }
-  ).n;
-
-  return {
-    outliers: outliers.map((r) => ({
-      videoId: r.video_id,
-      title: r.title,
-      thumbnailUrl: r.thumbnail_url,
-      views: r.views,
-      publishedAt: r.published_at,
-      durationSeconds: r.duration_seconds,
-      competitorId: r.competitor_id,
-      competitorTitle: r.competitor_title,
-      competitorHandle: r.competitor_handle,
-      competitorAvatar: r.competitor_avatar,
-      competitorChannelId: r.competitor_channel_id,
-      competitorSubscriberCount: r.competitor_subscriber_count,
-      tier: r.tier,
-      multiplier: Number(r.multiplier.toFixed(2)),
-      channelMedian: r.channel_median,
-    })),
-    totalScanned,
-    competitorsCovered,
-  };
+} catch {
+  /* noop */
 }
 
-/**
- * Bulk-fetch competitor videos by ID for the /api/outliers/generate-ideas
- * endpoint. Joins competitor metadata so the AI prompt has tier + name
- * context per row. Filters out unknown ids silently.
- */
-export function getCompetitorVideosByIds(
-  videoIds: string[]
-): Array<{
-  videoId: string;
-  title: string;
-  views: number;
-  publishedAt: number | null;
-  durationSeconds: number | null;
-  competitorId: number;
-  competitorTitle: string | null;
-  competitorHandle: string | null;
-  competitorChannelId: string | null;
-  tier: string;
-  userChannelId: string | null;
-}> {
-  if (videoIds.length === 0) return [];
-  const placeholders = videoIds.map(() => "?").join(",");
-  const rows = db
-    .prepare(
-      `SELECT cv.video_id, cv.title, cv.views, cv.published_at, cv.duration_seconds,
-              cv.competitor_id,
-              c.title       AS competitor_title,
-              c.handle      AS competitor_handle,
-              c.channel_id  AS competitor_channel_id,
-              c.tier,
-              c.user_channel_id
-       FROM competitor_videos cv
-       JOIN competitors c ON c.id = cv.competitor_id
-       WHERE cv.video_id IN (${placeholders})`
-    )
-    .all(...videoIds) as Array<{
-    video_id: string;
-    title: string;
-    views: number;
-    published_at: number | null;
-    duration_seconds: number | null;
-    competitor_id: number;
-    competitor_title: string | null;
-    competitor_handle: string | null;
-    competitor_channel_id: string | null;
-    tier: string;
-    user_channel_id: string | null;
-  }>;
-  return rows.map((r) => ({
-    videoId: r.video_id,
-    title: r.title,
-    views: r.views,
-    publishedAt: r.published_at,
-    durationSeconds: r.duration_seconds,
-    competitorId: r.competitor_id,
-    competitorTitle: r.competitor_title,
-    competitorHandle: r.competitor_handle,
-    competitorChannelId: r.competitor_channel_id,
-    tier: r.tier,
-    userChannelId: r.user_channel_id,
-  }));
-}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS generations (
+    id TEXT PRIMARY KEY,
+    user_channel_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('auto','new_angles','title_tweaks')),
+    count INTEGER NOT NULL CHECK (count >= 10 AND count <= 25),
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+    estimated_cost_millicents INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    error TEXT,
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_generations_channel_started
+    ON generations(user_channel_id, started_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_generations_status
+    ON generations(status, started_at DESC);
 
+  CREATE TABLE IF NOT EXISTS ideas (
+    id TEXT PRIMARY KEY,
+    generation_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    source_attribution TEXT,
+    validation_status TEXT NOT NULL CHECK (validation_status IN ('passed','rejected')),
+    validation_reason TEXT,
+    fit_score INTEGER,
+    user_note TEXT,
+    note_distilled_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_ideas_generation ON ideas(generation_id);
+  CREATE INDEX IF NOT EXISTS idx_ideas_note_pending
+    ON ideas(generation_id, note_distilled_at)
+    WHERE user_note IS NOT NULL AND note_distilled_at IS NULL;
+
+  CREATE TABLE IF NOT EXISTS ideation_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    rule_type TEXT NOT NULL CHECK (rule_type IN ('banned_topic','banned_substitution','banned_pattern','preferred_format','preferred_topic')),
+    rule_value TEXT NOT NULL,
+    source_note TEXT,
+    source_idea_id TEXT,
+    pending INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_ideation_rules_channel
+    ON ideation_rules(user_channel_id, pending, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS gather_attrition_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation_id TEXT NOT NULL,
+    dropped_competitor_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_gather_attrition_generation
+    ON gather_attrition_log(generation_id);
+`);

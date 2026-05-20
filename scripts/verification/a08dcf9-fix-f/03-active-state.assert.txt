@@ -1,0 +1,18 @@
+/ideate sidebar active state. Subtle neutral muted background + 2px red
+left border + red text/icon. No saturated red fill.
+
+Verified className on the Ideate nav item (live, on /ideate):
+  "flex items-center rounded-md text-sm transition-colors gap-3 py-2.5
+   border-l-2 border-primary bg-muted pl-[10px] pr-3 text-primary font-medium"
+
+Key parts:
+  bg-muted              → now hsl(0 0% 14%) (neutralized from hsl(217 33% 17%))
+  border-l-2            → 2px left accent strip
+  border-primary        → red (hsl(0 72% 51%), unchanged)
+  text-primary          → red text + red icon
+  pl-[10px] pr-3        → border eats 2px of the 12px left padding
+                          so text aligns with non-active items
+
+No bg-primary anywhere on the active state (that was the old saturated
+red fill). The active item now reads as "lit gray tile with a red accent"
+— ChatGPT pattern.

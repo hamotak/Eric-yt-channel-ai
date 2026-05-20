@@ -1,0 +1,27 @@
+Expanded sidebar (default for ≥1024px, no user override):
+
+HEADER row (h-8 + py-5 = 72px constant):
+  [logo icon 32x32 with red bg] + "YT Channel AI" wordmark + flex-1 spacer + [ChevronLeft button]
+  NO tagline anywhere.
+
+NAV (px-3 py-2):
+  Dashboard            ← standalone at top, no section header above (active when on /)
+  CREATE               ← uppercase, muted, tracked, mt-6 mb-1
+    Ideate
+  CHANNEL              ← mt-5 mb-1
+    Channel Info
+    Videos
+    Competitors
+  ──── (separator: border-t border-sidebar-border/60, mt-6 mb-2) ────
+  Settings             ← standalone at bottom
+
+Each nav item: py-2.5 (more breathing room than prior py-2), gap-3 between
+icon and label, items within a section stack at space-y-0.5.
+
+Active state (any active item): bg-muted + text-primary + border-l-2
+border-primary + pl-[10px]+pr-3 (border consumes 2px of the 12px left
+padding to keep text aligned with non-active items).
+
+Inactive state: border-l-2 border-transparent (reserves the 2px slot so
+items don't shift left when active changes), text-sidebar-foreground/80,
+hover bg-accent/40.

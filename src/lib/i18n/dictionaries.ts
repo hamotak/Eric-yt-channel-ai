@@ -1,5 +1,5 @@
 type DictionaryShape = {
-  app: { name: string; tagline: string };
+  app: { name: string };
   nav: {
     dashboard: string;
     videos: string;
@@ -276,15 +276,6 @@ type DictionaryShape = {
       helpLink: string;
       helpLinkLabel: string;
     };
-    apify: {
-      name: string;
-      desc: string;
-      placeholder: string;
-      helpTitle: string;
-      helpSteps: string[];
-      helpLink: string;
-      helpLinkLabel: string;
-    };
     exa: {
       name: string;
       desc: string;
@@ -433,7 +424,6 @@ export const dictionaries: { en: DictionaryShape } = {
   en: {
     app: {
       name: "YT Channel AI",
-      tagline: "AI-powered YouTube channel analytics",
     },
     nav: {
       dashboard: "Dashboard",
@@ -470,7 +460,7 @@ export const dictionaries: { en: DictionaryShape } = {
     banner: {
       connectTitle: "Connect your integrations to get started",
       connectDesc:
-        "Add your API keys for Claude, Apify, Exa, NexLev and YouTube to unlock full analysis.",
+        "Add your API keys for Claude, Exa, NexLev and YouTube to unlock full analysis.",
       connectCta: "Go to Integrations",
     },
     dashboard: {
@@ -734,21 +724,6 @@ export const dictionaries: { en: DictionaryShape } = {
         ],
         helpLink: "https://aistudio.google.com/apikey",
         helpLinkLabel: "Open Google AI Studio",
-      },
-      apify: {
-        name: "Apify (competitor scrapers)",
-        desc: "Optional. Powers competitor channel scraping and bulk comment fetching when you analyse other people's channels. Transcription itself runs on Deepgram in this build — Apify is only here for the scraper actors. Free plan ships $5 / month of credit ≈ 100 competitor channel syncs (~$0.05 each).",
-        placeholder: "apify_api_...",
-        helpTitle: "How to get an Apify API token",
-        helpSteps: [
-          "Sign up at apify.com — the Free plan includes $5 of usage credit every month, no credit card needed up front.",
-          "In the console, click your profile avatar → Settings → Integrations (or open the Integrations tab directly).",
-          "Copy your Personal API token (it starts with apify_api_).",
-          "Paste it below and Save. The progress bar that appears after will show how much of the $5 monthly credit is left.",
-          "Cost guide: competitor channel scrape ≈ $0.05 / channel (so ~100 channels on the free $5). Run out before month end? Just top up the account at console.apify.com/billing.",
-        ],
-        helpLink: "https://console.apify.com/account/integrations",
-        helpLinkLabel: "Open Apify Console",
       },
       exa: {
         name: "Exa",

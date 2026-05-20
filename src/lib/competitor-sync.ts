@@ -1,5 +1,4 @@
 import "server-only";
-import { apifyYouTubeScrape, type ApifyYouTubeVideo } from "./apify";
 import {
   Competitor,
   competitorMedianViews,
@@ -21,22 +20,10 @@ import {
 } from "./youtube";
 
 // -----------------------------------------------------------------------
-// Default backend: YouTube Data API (free, ~3 quota units per full sync —
+// Backend: YouTube Data API (free, ~3 quota units per full sync —
 // 1 for resolveChannel + 1 for listUploadIds + 1 for fetchVideos, all
 // well under the 10,000/day free-tier ceiling).
-// Apify retained for users who hit the YT quota ceiling on >100 competitors.
-// Override via settings.competitor_sync_backend = "apify".
 // -----------------------------------------------------------------------
-
-// Settings key + values for the backend selector.
-const BACKEND_SETTING = "competitor_sync_backend";
-type SyncBackend = "youtube" | "apify";
-const DEFAULT_BACKEND: SyncBackend = "youtube";
-
-function getSyncBackend(): SyncBackend {
-  const raw = (getSetting(BACKEND_SETTING) ?? "").trim().toLowerCase();
-  return raw === "apify" ? "apify" : DEFAULT_BACKEND;
-}
 
 // Outlier threshold — when a video's views exceed median × this we flag it.
 // Generation floor is 1.5×; the methodology canon (MENTOR_METHOD §2) stays
@@ -46,10 +33,9 @@ function getSyncBackend(): SyncBackend {
 // filter = methodology preserved at the surface, with an opt-in wider bucket.
 const OUTLIER_MULTIPLIER = 1.5;
 
-// How many videos to pull per sync. Apify charges per request, so we cap
-// at 50 — covers most channels' recent activity without burning credits.
-// YT backend pulls the same window (last 50 from uploads playlist) for
-// parity with the prior data shape.
+// How many videos to pull per sync. 50 covers most channels' recent
+// activity without burning quota; matches the new pipeline's
+// per-competitor window.
 const VIDEOS_PER_SYNC = 50;
 
 export class CompetitorSyncError extends Error {
@@ -61,7 +47,7 @@ export class CompetitorSyncError extends Error {
 
 /**
  * Resolve various user-supplied identifiers (@handle, full URLs, plain
- * UCxxxxx) to a single canonical channel URL that Apify accepts.
+ * UCxxxxx) to a single canonical channel URL.
  */
 export function normaliseChannelUrl(input: string): string {
   const trimmed = input.trim();
@@ -82,7 +68,7 @@ export function normaliseChannelUrl(input: string): string {
   );
 }
 
-/** Parse Apify's duration string ("PT3M42S" or "3:42" or seconds) into seconds. */
+/** Parse a duration string ("PT3M42S" or "3:42" or seconds) into seconds. */
 function parseDuration(raw: string | undefined): number | null {
   if (!raw) return null;
   if (/^\d+$/.test(raw)) return Number(raw);
@@ -124,22 +110,11 @@ export type SyncResult = {
 };
 
 /**
- * Orchestrator. Dispatches to the YouTube Data API path (default) or
- * the legacy Apify path based on the `competitor_sync_backend` setting.
- * Both paths produce the same DB shape (competitor_videos +
- * competitor_alerts rows) so callers don't see the difference.
- *
- * Backend selection:
- *   - settings.competitor_sync_backend = "youtube" (default) → YT Data API
- *   - settings.competitor_sync_backend = "apify"             → legacy
- * No UI for this; toggle via SQL or `setSetting` in code.
+ * Orchestrator. The only sync path is the YouTube Data API. Kept as a
+ * separate function so any future backend fan-out has a single chokepoint.
  */
 export async function syncCompetitor(competitorId: number): Promise<SyncResult> {
-  const backend = getSyncBackend();
-  if (backend === "youtube") {
-    return syncCompetitorViaYouTube(competitorId);
-  }
-  return syncCompetitorViaApify(competitorId);
+  return syncCompetitorViaYouTube(competitorId);
 }
 
 /**
@@ -162,7 +137,7 @@ export async function syncCompetitorViaYouTube(
   const apiKey = getIntegration("youtube")?.api_key;
   if (!apiKey) {
     throw new CompetitorSyncError(
-      "YouTube Data API key is not configured. Add it on the Integrations page (or switch competitor_sync_backend to 'apify')."
+      "YouTube Data API key is not configured. Add it on the Integrations page."
     );
   }
 
@@ -308,170 +283,16 @@ export async function syncCompetitorViaYouTube(
   };
 }
 
-/**
- * Legacy Apify-backed sync. Kept for users who hit the YT Data API quota
- * ceiling on >100 competitors. Short-circuits with a clear error when
- * either the Apify key is missing OR the backend setting hasn't been
- * flipped to "apify" — the default-YT switch makes this the rare path.
- */
-export async function syncCompetitorViaApify(
-  competitorId: number
-): Promise<SyncResult> {
-  if (getSyncBackend() !== "apify") {
-    throw new CompetitorSyncError(
-      "Apify backend disabled — using YouTube Data API. Set settings.competitor_sync_backend='apify' to re-enable."
-    );
-  }
-  const apifyKey = getIntegration("apify")?.api_key;
-  if (!apifyKey) {
-    throw new CompetitorSyncError(
-      "Apify API key is not configured. Add it on Integrations OR switch to the YouTube Data API backend (default)."
-    );
-  }
-
-  const competitor = getCompetitor(competitorId);
-  if (!competitor) {
-    throw new CompetitorSyncError(`Competitor ${competitorId} not found`);
-  }
-
-  const url = competitor.channel_id
-    ? `https://www.youtube.com/channel/${competitor.channel_id}`
-    : competitor.handle
-      ? normaliseChannelUrl(competitor.handle)
-      : null;
-  if (!url) {
-    throw new CompetitorSyncError(
-      `Competitor ${competitorId} has no channel identifier — re-add with a valid handle/URL.`
-    );
-  }
-
-  log.info("competitors", "Syncing competitor (Apify legacy)", {
-    competitorId,
-    url,
-  });
-  const startedAt = Date.now();
-  const items: ApifyYouTubeVideo[] = await apifyYouTubeScrape(
-    { startUrls: [{ url }], maxResults: VIDEOS_PER_SYNC, includeTranscript: false },
-    apifyKey
-  );
-
-  // Pull channel metadata off the first item (Apify embeds channelName
-  // / channelUrl on every video row).
-  const first = items[0];
-  const channelTitle = first?.channelName ?? competitor.title ?? null;
-  const channelIdMatch = first?.channelUrl?.match(/channel\/(UC[A-Za-z0-9_-]+)/);
-  const resolvedChannelId = channelIdMatch ? channelIdMatch[1] : competitor.channel_id;
-
-  let videosInserted = 0;
-  for (const it of items) {
-    const vid = extractVideoId(it.url, it.id);
-    if (!vid || !it.title) continue;
-    upsertCompetitorVideo({
-      competitor_id: competitorId,
-      video_id: vid,
-      title: it.title,
-      thumbnail_url: `https://i.ytimg.com/vi/${vid}/mqdefault.jpg`,
-      views: it.viewCount ?? 0,
-      likes: it.likes ?? 0,
-      comments: it.commentsCount ?? 0,
-      duration_seconds: parseDuration(it.duration),
-      published_at: parseDate(it.date),
-    });
-    videosInserted++;
-  }
-
-  updateCompetitorAfterSync(competitorId, {
-    title: channelTitle,
-    channel_id: resolvedChannelId,
-    video_count: videosInserted,
-  });
-
-  const median = competitorMedianViews(competitorId);
-  let newAlerts = 0;
-  if (median > 0) {
-    for (const it of items) {
-      const vid = extractVideoId(it.url, it.id);
-      if (!vid || !it.title || !it.viewCount) continue;
-      const multiplier = it.viewCount / median;
-      if (multiplier >= OUTLIER_MULTIPLIER) {
-        recordCompetitorAlert({
-          competitor_id: competitorId,
-          video_id: vid,
-          title: it.title,
-          thumbnail_url: `https://i.ytimg.com/vi/${vid}/mqdefault.jpg`,
-          views: it.viewCount,
-          channel_median_views: median,
-          multiplier: Math.round(multiplier * 10) / 10,
-        });
-        newAlerts++;
-      }
-    }
-  }
-
-  log.info("competitors", "Competitor sync done (Apify)", {
-    competitorId,
-    videosSeen: items.length,
-    videosInserted,
-    newAlerts,
-    medianViews: median,
-    durationMs: Date.now() - startedAt,
-  });
-
-  return {
-    videosSeen: items.length,
-    videosInserted,
-    newAlerts,
-    channelTitle,
-    medianViews: median,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// One-shot migration: re-queue competitors that previously failed with an
-// Apify-credits-exhausted error so the new YT backend can pick them up
-// cleanly. Gated by a settings flag — runs once per database.
-// ---------------------------------------------------------------------------
-
-const APIFY_FAILED_REQUEUE_FLAG = "competitor_sync_backend.apify_failed_requeue_done";
-
-export function requeueApifyFailedCompetitorsOnce(): number {
-  if (getSetting(APIFY_FAILED_REQUEUE_FLAG) === "1") return 0;
-  // Pattern-match common Apify credit-exhausted messages. The actor
-  // surfaces variations of "out of credits" / "credits exhausted" /
-  // "monthly limit" — case-insensitive substring covers all of them.
-  const info = db
-    .prepare(
-      `UPDATE competitors
-       SET sync_status = 'queued', sync_error = NULL
-       WHERE sync_status = 'failed'
-         AND sync_error IS NOT NULL
-         AND (
-           LOWER(sync_error) LIKE '%apify%'
-           OR LOWER(sync_error) LIKE '%credits%'
-           OR LOWER(sync_error) LIKE '%credit%exhaust%'
-           OR LOWER(sync_error) LIKE '%monthly limit%'
-         )`
-    )
-    .run();
-  setSetting(APIFY_FAILED_REQUEUE_FLAG, "1");
-  if (info.changes > 0) {
-    log.info(
-      "competitors",
-      `[migration] requeued ${info.changes} Apify-failed competitor(s) for the new YT-default backend`
-    );
-  }
-  return info.changes;
-}
 
 /**
- * Always-on YouTube Data API metadata enrichment. Layered on top of the
- * Apify sync (Apify still owns video lists + view counts; YT API owns
- * canonical channel metadata: title, subscriber count, video count, avatar).
+ * Always-on YouTube Data API metadata enrichment. Pulls canonical
+ * channel metadata (title, subscriber count, video count, avatar) and
+ * writes it onto the competitor row.
  *
  * Safe to call repeatedly — overwrites the same DB columns each time.
  * Returns ok:false rather than throwing on any of:
  *   - competitor row missing
- *   - channel_id not yet resolved (Apify hasn't run / errored on add)
+ *   - channel_id not yet resolved (handle-only row before first sync)
  *   - no YouTube Data API key configured
  *   - YouTube API error (4xx/5xx, network, channel not found)
  *
@@ -497,7 +318,7 @@ export async function enrichCompetitorMetadataFromYouTube(
     return { ok: false, fields: {}, error: "competitor not found" };
   }
   if (!comp.channel_id) {
-    // Handle-only entries until first Apify sync resolves the UC-id.
+    // Handle-only entries until the first sync resolves the UC-id.
     return { ok: false, fields: {}, error: "no channel_id resolved yet" };
   }
   const apiKey = getIntegration("youtube")?.api_key;

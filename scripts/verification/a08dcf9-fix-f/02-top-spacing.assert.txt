@@ -1,0 +1,17 @@
+Top spacing on /competitors. Gap between topbar.bottom and the main H1
+("Competitors") must be ≥ 64px.
+
+Measured (Playwright, viewport 1440×900):
+  topbar.bottom = 56 px
+  h1.top        = 136 px
+  gap           = 80 px
+
+PASS (≥ 64 target, 80 actual after the layout pt-20 bump). The layout's
+<main> went from p-6 (24px top) to px-6 pb-6 pt-20 (80px top); /competitors
+internal py-10 was reduced to pb-10 to avoid stacking padding twice.
+
+Equivalent verification for /ideate (separate measurement):
+  /ideate H1 ("Generate ideas for {channel}") is at top = 136 px ⇒ 80 px gap.
+  The page uses -mx-6 -mb-6 -mt-20 to escape layout's pt-20 for the two-
+  column full-bleed history sidebar, and re-adds pt-20 on the inner main
+  canvas div so the H1 lands at 80 px below the topbar.

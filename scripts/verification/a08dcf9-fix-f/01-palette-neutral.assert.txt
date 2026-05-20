@@ -1,0 +1,12 @@
+/ideate full canvas in dark mode. Background should read as pure neutral
+dark (no blue/navy cast). Sidebar bg matches body bg exactly — only the
+1px border-r is the visual separator (ChatGPT pattern).
+
+Verified via window.getComputedStyle (after FIX-F):
+  body bg     = rgb(18, 18, 18)  = hsl(0 0% 7%)
+  sidebar bg  = rgb(18, 18, 18)  = hsl(0 0% 7%)
+  main bg     = transparent (inherits body)
+
+Prior values had hue 222 (slate/navy) on background and 217 on chrome.
+Now hue 0 across all chrome tokens. Primary (red) and destructive (red)
+are unchanged — chrome went neutral, the brand accent stays loud.

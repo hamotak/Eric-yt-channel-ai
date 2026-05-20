@@ -1,0 +1,2 @@
+Sidebar contains exactly: Dashboard, Channel Info, Ideate, Videos, Competitors, Settings.
+NO entries for Chat / AI Chat, Outliers, or Tutorial.

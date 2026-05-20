@@ -1,0 +1,73 @@
+ISSUE 1 — DASHBOARD EMPTY: ROOT CAUSE FOUND. DB IS INTACT. NO DESTRUCTIVE ACTION NEEDED.
+
+REAL DB STATE (on disk, verified directly):
+  /Users/hamidaliyev/Eric-yt-channel-ai-main/data/app.db (inode 80713469, 2.4 MB)
+    channels:     3   →  Late Science (116000), The Sleeping Orbit (3630), Earth Radar (3550)
+    integrations: 6   →  claude(108) deepgram(40) youtube(39) exa(36) google_gemini(39) apify(46) — all enabled
+    competitors:  6
+    generations:  5
+    settings.youtube.activeChannelId = UCIqH5kGFOM_lP9x_AmPodjQ  (Late Science)
+
+  data/app.db.backup-pre-ideate-2026-05-20 — present, 2.3 MB (rollback anchor untouched)
+
+LIVE API RESPONSES (every single one returns zero rows):
+  GET /api/channels          → { channels: [], activeId: null }
+  GET /api/channels/active   → { activeId: null }
+  GET /api/competitors       → { competitors: [], activeChannelId: null }
+  GET /api/dashboard         → { stats.total: 0 }
+  GET /api/channel-info      → { channels: [] }
+
+ROOT CAUSE:
+The dev server (node PID 24271, started at 19:05) has open file handles
+pointing to:
+  /Users/hamidaliyev/Desktop/Eric-yt-channel-ai-main/data/app.db (inode 82880983)
+                              ↑
+                       NEITHER of the real DBs.
+
+`find /Users/hamidaliyev -inum 82880983` returns nothing → that inode is
+an UNLINKED file (the directory entry is gone but the file is held open
+by the running process; Unix keeps the blocks alive until the FD closes).
+
+TIMELINE:
+  19:05  npm run dev started. At that moment, /Users/hamidaliyev/Desktop/
+         Eric-yt-channel-ai-main was an empty shell directory (created by
+         some earlier process — likely Playwright auto-mkdir under the
+         old project path). db.ts's findProjectRoot() walked up from a
+         compile artifact and pinned PROJECT_ROOT to the Desktop path.
+         better-sqlite3 created a fresh empty data/app.db there, applied
+         the schema, returned zero rows for everything.
+  19:18  Playwright wrote screenshots to that empty shell dir (Desktop
+         path was its "allowed root").
+  19:20  I `rm -rf`'d the empty Desktop shell to clear stale files, then
+         `ln -s` to symlink Desktop → real project. The rm UNLINKED the
+         empty DB file BUT the dev server still held the file handle, so
+         the file's blocks stayed alive (orphan inode 82880983). The
+         dev server kept reading/writing the orphan, blind to the real DB
+         the symlink now points at.
+
+WHY EARLIER `curl /api/competitors` RETURNED 6 ROWS BUT NOW RETURNS 0:
+  Looking at the timeline more carefully: the earlier successful API
+  responses occurred BEFORE the dev server I'm currently inspecting was
+  started. The 19:05 server is the one that opened the orphan. Any prior
+  dev-server instance (now killed) had opened the correct file.
+
+PROPOSED FIX (non-destructive, file-system level):
+  1. kill PID 24271 (and parent 24270) — releases the orphan handle,
+     and the orphan inode's blocks return to the filesystem free pool.
+     The real DB on disk is UNTOUCHED. Verification screenshots,
+     migrations, idea data, notes — all preserved.
+  2. rm /Users/hamidaliyev/Desktop/Eric-yt-channel-ai-main  (the symlink)
+     so Next.js can't accidentally pin PROJECT_ROOT there again.
+  3. rm -rf /Users/hamidaliyev/Eric-yt-channel-ai-main/.next  (any cached
+     compile artifacts that might still embed the Desktop path).
+  4. Restart npm run dev from /Users/hamidaliyev/Eric-yt-channel-ai-main.
+     findProjectRoot() now walks up only through the real path and opens
+     the real data/app.db.
+  5. Verify: curl /api/channels should return 3 channels.
+
+NOTE: step 4 will break Playwright's "allowed roots" lookup (since I
+relied on the Desktop symlink to satisfy its hard-coded path). For
+future screenshots I'll keep Playwright captures inside the .playwright-
+mcp dir (its allowed root) and copy them out via Bash.
+
+WAITING FOR HAMO'S CALL: proceed with restart, or hold?

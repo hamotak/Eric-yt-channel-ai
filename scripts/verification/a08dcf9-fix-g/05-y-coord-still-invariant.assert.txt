@@ -1,0 +1,20 @@
+Re-confirm FIX-D Y-coordinate invariant after FIX-G additions
+(mt-4 → mt-6 between sections; full-width separator in collapsed mode).
+
+Method: Playwright getBoundingClientRect(), viewport 1440×900,
+localStorage cleared before each measurement.
+
+Element                         Expanded     Collapsed    Δ
+─────────────────────────────────────────────────────────────────
+aside.width                     240 px       64 px        (width target)
+toggle (chevron) button .top    4.004 px     4.004 px     0.000 px
+Dashboard nav-item .top         47.998 px    47.998 px    0.000 px
+
+PASS — toggle Y identical between states (0.000 px), Dashboard Y
+identical between states (0.000 px). Both within the ≤ 8 px tolerance.
+
+The Y-coord invariant survives the FIX-G section-rhythm changes because
+the mt-6 collapsed-section-gap is applied to items BELOW Dashboard, not
+above it, so Dashboard's own position is unchanged. The separator above
+Settings is also positioned BELOW Dashboard, so it doesn't affect this
+invariant either.

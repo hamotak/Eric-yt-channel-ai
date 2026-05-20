@@ -1,0 +1,19 @@
+Active-item style change: outlined+muted rather than saturated.
+
+EXPANDED (verified live on /ideate):
+  className contains: "bg-muted text-primary font-medium border-l-2 border-primary"
+  className does NOT contain: "bg-primary" (the prior saturated-red fill)
+
+COLLAPSED:
+  className contains: "bg-muted text-primary"
+  className does NOT contain: "bg-primary" or "border-l-2 border-primary"
+  (Border-l would visually clip the centered icon column.)
+
+INACTIVE items in expanded mode keep "border-l-2 border-transparent" so
+they don't shift left when an item becomes active.
+
+Visual confirmation in 02-sidebar-expanded-with-active.png:
+  - Ideate row has subtle gray-tinted background, NOT a red fill
+  - Red text + red icon
+  - 2px red bar on the left edge
+  - Rest of the sidebar items remain visually unchanged
