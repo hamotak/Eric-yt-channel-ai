@@ -63,6 +63,7 @@ export async function syncUserChannelVideos(
     subscriber_count: ch.subscribers,
     view_count: ch.views,
     video_count: ch.videoCount,
+    avatar_url: ch.thumbnail,
   });
 
   // Call #2 — playlistItems.list, first page only (max=50 keeps it to

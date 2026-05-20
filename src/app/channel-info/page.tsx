@@ -13,11 +13,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { ChannelAudience } from "@/components/channel-audience";
 import { ChannelRevenue } from "@/components/channel-revenue";
-import {
-  ChannelDetailAnalytics,
-  MetaCard,
-  ThemesCard,
-} from "@/components/channel-detail-widgets";
+import { MetaCard } from "@/components/channel-detail-widgets";
+import { ContentThemesCard } from "@/components/content-themes-card";
 import {
   BannedTopicsEditor,
   DescriptionEditor,
@@ -35,6 +32,7 @@ type ChannelContext = {
   title: string | null;
   handle: string | null;
   subscriberCount: number | null;
+  avatarUrl: string | null;
   channelDescription: string;
   ideationRules: string;
   bannedTopics: string;
@@ -163,7 +161,6 @@ function SingleChannelCard({
   channel: ChannelContext;
   onUpdated: (next: ChannelContext) => void;
 }) {
-  const [analytics, setAnalytics] = useState<ChannelDetailAnalytics | null>(null);
   const [aiOpen, setAiOpen] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
@@ -179,26 +176,6 @@ function SingleChannelCard({
     const id = window.setTimeout(() => setSavedToast(null), 3000);
     return () => window.clearTimeout(id);
   }, [savedToast]);
-
-  // Load /api/channel to populate the detail widgets (themes, about,
-  // meta). Pass the focused channel id explicitly so the
-  // server scopes its queries to THIS channel even when the global active
-  // pointer points elsewhere (e.g. user clicked a row in the "All
-  // channels" summary table → ?focus=<id> overrides for one page load).
-  useEffect(() => {
-    let cancelled = false;
-    const qs = `?channelId=${encodeURIComponent(channel.channelId)}`;
-    fetch(`/api/channel${qs}`, { cache: "no-store" })
-      .then((r) => r.json())
-      .then((d) => {
-        if (cancelled) return;
-        setAnalytics(d.analytics ?? null);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [channel.channelId]);
 
   const detailChannel = {
     id: channel.channelId,
@@ -335,9 +312,19 @@ function SingleChannelCard({
         <CardHeader>
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-start gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-semibold text-muted-foreground">
-                {initial}
-              </div>
+              {channel.avatarUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={channel.avatarUrl}
+                  alt=""
+                  className="h-10 w-10 shrink-0 rounded-full"
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-semibold text-muted-foreground">
+                  {initial}
+                </div>
+              )}
               <div className="min-w-0">
                 <CardTitle className="text-lg">
                   {channel.title ?? channel.channelId}
@@ -435,7 +422,7 @@ function SingleChannelCard({
       <MetaCard channel={detailChannel} />
       <ChannelAudience channelId={channel.channelId} />
       <ChannelRevenue channelId={channel.channelId} />
-      {analytics && <ThemesCard analytics={analytics} />}
+      <ContentThemesCard channelId={channel.channelId} />
 
       {aiOpen && (
         <AnalyzeModal

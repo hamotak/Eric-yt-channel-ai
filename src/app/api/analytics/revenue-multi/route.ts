@@ -101,6 +101,11 @@ type Payload = {
      *  prev month — i.e. the figure misses the early days of that
      *  month because the selected period didn't reach back far enough. */
     prevMonthPartial: boolean;
+    /** Channel IDs that returned `total === null` (transient OAuth 401,
+     *  monetary access denied, etc.) and were silently dropped from
+     *  every sum in this `totals` block. The UI surfaces this as a
+     *  warning chip so the user knows the headline is incomplete. */
+    excludedChannelIds: string[];
   };
   /**
    * Day-by-day combined revenue across every channel that succeeded.
@@ -145,6 +150,7 @@ export async function GET(req: Request) {
         prevMonthCoverageStart: "",
         prevMonthCoverageEnd: "",
         prevMonthPartial: false,
+        excludedChannelIds: [],
       },
       combinedDaily: [],
     } satisfies Payload);
@@ -164,10 +170,11 @@ export async function GET(req: Request) {
   // so we have to actually try each one. Per-channel skip lives inside
   // the iteration below.
 
-  // v6: payload now also reports prevMonth coverage range so the UI
-  // can label partial-coverage figures honestly (e.g. "Apr 3-30" on a
-  // 28d window vs full "April" on 90d). v5 entries lack those fields.
-  const cacheKey = `analytics.revenue-multi.v6.${periodKey}.${channels
+  // v7: payload now also reports totals.excludedChannelIds (any channel
+  // whose total === null was silently dropped from the sums; the UI
+  // surfaces a warning chip). v6 entries lack that field; bumping the
+  // cache key flushes them.
+  const cacheKey = `analytics.revenue-multi.v7.${periodKey}.${channels
     .map((c) => c.id)
     .sort()
     .join(",")}`;
@@ -377,6 +384,10 @@ export async function GET(req: Request) {
   const prevMonthPartial =
     !!prevMonthCoverageStart && prevMonthCoverageStart > prevMonthFirstDay;
 
+  const excludedChannelIds = settled
+    .filter((c) => c.total === null)
+    .map((c) => c.channelId);
+
   const totals = settled.reduce(
     (s, c) => {
       const gross = c.total ?? 0;
@@ -408,6 +419,7 @@ export async function GET(req: Request) {
       prevMonthCoverageStart,
       prevMonthCoverageEnd,
       prevMonthPartial,
+      excludedChannelIds,
     }
   );
   totals.period = Number(totals.period.toFixed(2));

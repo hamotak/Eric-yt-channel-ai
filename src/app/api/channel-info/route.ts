@@ -60,6 +60,7 @@ type ChannelContextWire = {
   title: string | null;
   handle: string | null;
   subscriberCount: number | null;
+  avatarUrl: string | null;
   channelDescription: string;
   ideationRules: string;
   bannedTopics: string;
@@ -79,6 +80,7 @@ function toWire(c: Channel): ChannelContextWire {
     title: c.title,
     handle: c.handle,
     subscriberCount: c.subscriber_count,
+    avatarUrl: c.avatar_url ?? null,
     channelDescription: c.channel_description ?? "",
     ideationRules: c.ideation_rules ?? "",
     bannedTopics: c.banned_topics ?? "",

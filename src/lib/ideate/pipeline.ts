@@ -146,11 +146,29 @@ export interface SourceVideo {
   multiplier: number | null;
 }
 
+/**
+ * Which compose path produced the idea — surfaced as a badge next to FIT.
+ *  - new_angle  : two-outlier mashup (topic from outlier A, format from outlier B)
+ *  - title_tweak: same topic as an existing high-performer, fresh title/hook
+ *  - fresh      : neither — a real-event grounding or pure ideation path
+ *
+ * Old rows (pre-2026-05) have no method on disk; the UI renders "—" in
+ * that case. parseComposeJson hard-fails an idea whose method is set
+ * but invalid; missing-method is allowed for read-side back-compat.
+ */
+export type IdeaMethod = "new_angle" | "title_tweak" | "fresh";
+const VALID_METHODS: ReadonlySet<string> = new Set([
+  "new_angle",
+  "title_tweak",
+  "fresh",
+]);
+
 export interface SourceAttribution {
   family: string;
   topic_source: SourceVideo | null;
   format_source: SourceVideo | null;
   reasoning: string;
+  method?: IdeaMethod;
 }
 
 export interface ComposedIdea {
@@ -651,6 +669,20 @@ function buildComposeSystemPrompt(): string {
     "- Both source objects carry { video_id, title, channel_name, channel_handle, multiplier }.",
     "- video_id MUST be picked from the competitor outliers or own uploads block in the user prompt — do not invent IDs.",
     "",
+    "## METHOD TAG (HARD)",
+    "Every idea MUST include source_attribution.method, set to ONE of:",
+    "  - \"new_angle\"   : a two-outlier mashup. Topic from one competitor outlier,",
+    "                    title format from a DIFFERENT competitor outlier. Both",
+    "                    source video_ids MUST come from the competitor_outliers",
+    "                    block and BOTH outliers MUST have multiplier ≥ 2.0.",
+    "                    topic_source and format_source must reference DIFFERENT video_ids.",
+    "                    If you cannot satisfy ALL of these constraints for a candidate,",
+    "                    do NOT propose it as new_angle — propose it as \"fresh\" instead.",
+    "  - \"title_tweak\" : same topic as an existing high-performer (competitor or own",
+    "                    upload), restructured with a fresh hook/title format.",
+    "  - \"fresh\"       : neither — a real-event grounding, originality-driven pitch,",
+    "                    or any idea that doesn't tie back to two outliers.",
+    "",
     "## OUTPUT",
     'Return ONLY a single JSON object: { "ideas": [...] }. No prose, no markdown.',
     "Each idea has this exact shape (1-shot example):",
@@ -674,7 +706,8 @@ function buildComposeSystemPrompt(): string {
     '      "channel_handle": "@late_science",',
     '      "multiplier": 8.8',
     '    },',
-    '    "reasoning": "Topic from Milky Stellar 5.0× × Late Science\'s own 8.8× format structure."',
+    '    "reasoning": "Topic from Milky Stellar 5.0× × Late Science\'s own 8.8× format structure.",',
+    '    "method": "new_angle"',
     "  }",
     "}",
     "```",
@@ -829,6 +862,16 @@ export function parseComposeJson(raw: string): ComposedIdea[] | null {
     }
     const topicSource = parseSourceVideo(attr.topic_source);
     const formatSource = parseSourceVideo(attr.format_source);
+    // method is required on new output; if the model returned something
+    // unrecognised, drop the idea outright — better to ship 9 valid ones
+    // than 10 with a junk badge. Missing entirely is also rejected
+    // (caller's prompt explicitly demands it).
+    let method: IdeaMethod;
+    if (typeof attr.method === "string" && VALID_METHODS.has(attr.method)) {
+      method = attr.method as IdeaMethod;
+    } else {
+      continue;
+    }
     out.push({
       title: ii.title,
       description: ii.description,
@@ -837,6 +880,7 @@ export function parseComposeJson(raw: string): ComposedIdea[] | null {
         topic_source: topicSource,
         format_source: formatSource,
         reasoning: attr.reasoning,
+        method,
       },
     });
   }
@@ -1042,17 +1086,102 @@ export function hardRuleCheck(idea: ComposedIdea, gathered: GatherResult): HardR
       return { passed: false, reason: `violates learned rule: ${rule.rule_value}` };
     }
   }
-  for (const own of gathered.own_recent_uploads) {
-    const ownTitle = (own.title ?? "").toLowerCase();
-    if (!ownTitle) continue;
-    const ownWords = new Set(ownTitle.split(/\s+/).filter((w) => w.length > 4));
-    const newWords = lowerTitle.split(/\s+/).filter((w) => w.length > 4);
-    let overlap = 0;
-    for (const w of newWords) if (ownWords.has(w)) overlap++;
-    if (newWords.length >= 3 && overlap >= 3) {
-      const multiplier = gathered.own_median_views > 0 ? own.views / gathered.own_median_views : 0;
-      if (multiplier < 3) {
-        return { passed: false, reason: `duplicate of recent upload: ${own.title}` };
+
+  const method = idea.source_attribution.method;
+
+  // PRIO-4: new_angle gate. Both source video_ids must come from the
+  // competitor_outliers context (not own uploads, not invented), must be
+  // distinct, and both must clear the 2.0× multiplier bar. The compose
+  // prompt already pushes the model to fall back to "fresh" when these
+  // can't be satisfied — this is the back-stop that fails loudly when
+  // the model ignores the instruction.
+  if (method === "new_angle") {
+    const outlierIds = new Set(
+      gathered.competitors.flatMap((c) =>
+        c.videos.filter((v) => v.is_outlier).map((v) => v.video_id)
+      )
+    );
+    const outlierMultiplierById = new Map<string, number>();
+    for (const c of gathered.competitors) {
+      for (const v of c.videos) {
+        if (v.is_outlier) outlierMultiplierById.set(v.video_id, v.multiplier);
+      }
+    }
+    const topic = idea.source_attribution.topic_source?.video_id ?? null;
+    const fmt = idea.source_attribution.format_source?.video_id ?? null;
+    if (!topic || !fmt) {
+      return { passed: false, reason: "new_angle missing valid outlier source" };
+    }
+    if (topic === fmt) {
+      return { passed: false, reason: "new_angle missing valid outlier source" };
+    }
+    if (!outlierIds.has(topic) || !outlierIds.has(fmt)) {
+      return { passed: false, reason: "new_angle missing valid outlier source" };
+    }
+    const tMult = outlierMultiplierById.get(topic) ?? 0;
+    const fMult = outlierMultiplierById.get(fmt) ?? 0;
+    if (tMult < 2.0 || fMult < 2.0) {
+      return { passed: false, reason: "new_angle missing valid outlier source" };
+    }
+  }
+
+  // PRIO-7: title_tweak token-diff rule. The whole point of a tweak is a
+  // changed title against the same proven topic — if the new title is
+  // identical or a near-clone, it's just a copy. Require ≥ 2 distinct
+  // content words (length > 3) that don't appear in the source title.
+  if (method === "title_tweak") {
+    const sourceTitle = idea.source_attribution.topic_source?.title ?? "";
+    const srcWords = new Set(
+      sourceTitle
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((w) => w.length > 3)
+    );
+    const newWords = lowerTitle
+      .split(/[^a-z0-9]+/)
+      .filter((w) => w.length > 3);
+    let distinct = 0;
+    for (const w of newWords) if (!srcWords.has(w)) distinct++;
+    if (sourceTitle.trim().length > 0 && distinct < 2) {
+      return {
+        passed: false,
+        reason: `title_tweak too close to source (${distinct} distinct content words)`,
+      };
+    }
+  }
+
+  // PRIO-7: relax the duplicate-of-recent-upload gate for title_tweak
+  // when the source upload was a winner (≥ 3× channel median). The mode
+  // exists exactly to tweak proven winners; without this skip, every
+  // legitimate tweak got rejected by the freq check. Other methods
+  // (fresh, new_angle) keep the original frequency check.
+  const skipFreqCheck =
+    method === "title_tweak" &&
+    (() => {
+      const src = idea.source_attribution.topic_source;
+      if (!src) return false;
+      const own = gathered.own_recent_uploads.find(
+        (u) => u.video_id === src.video_id
+      );
+      if (!own) return false;
+      const m =
+        gathered.own_median_views > 0 ? own.views / gathered.own_median_views : 0;
+      return m >= 3;
+    })();
+
+  if (!skipFreqCheck) {
+    for (const own of gathered.own_recent_uploads) {
+      const ownTitle = (own.title ?? "").toLowerCase();
+      if (!ownTitle) continue;
+      const ownWords = new Set(ownTitle.split(/\s+/).filter((w) => w.length > 4));
+      const newWords = lowerTitle.split(/\s+/).filter((w) => w.length > 4);
+      let overlap = 0;
+      for (const w of newWords) if (ownWords.has(w)) overlap++;
+      if (newWords.length >= 3 && overlap >= 3) {
+        const multiplier = gathered.own_median_views > 0 ? own.views / gathered.own_median_views : 0;
+        if (multiplier < 3) {
+          return { passed: false, reason: `duplicate of recent upload: ${own.title}` };
+        }
       }
     }
   }
@@ -1319,19 +1448,31 @@ function buildDistillSystemPrompt(): string {
 }
 
 export async function distillFeedback(userChannelId: string, clientOverride?: Anthropic): Promise<void> {
+  // PRIO-10: read structured feedback (feedback + feedback_reason)
+  // instead of free-text user_note. Pending = feedback present AND
+  // note_distilled_at not yet stamped. Positive feedback with no reason
+  // is still useful: the distiller maps the idea's family/topic into a
+  // preferred_* rule. Negative feedback always carries a reason (the UI
+  // requires one before submitting NO).
+  // The old user_note column is preserved for back-compat but no longer
+  // drives any rule generation.
   const pending = db
     .prepare(
-      `SELECT i.id, i.user_note, i.title
+      `SELECT i.id, i.title, i.feedback, COALESCE(i.feedback_reason, '') AS reason
        FROM ideas i
        JOIN generations g ON g.id = i.generation_id
        WHERE g.user_channel_id = ?
-         AND i.user_note IS NOT NULL
-         AND TRIM(i.user_note) != ''
+         AND i.feedback IS NOT NULL
          AND i.note_distilled_at IS NULL
        ORDER BY i.created_at DESC
        LIMIT 50`
     )
-    .all(userChannelId) as { id: string; user_note: string; title: string }[];
+    .all(userChannelId) as {
+    id: string;
+    title: string;
+    feedback: "positive" | "negative";
+    reason: string;
+  }[];
 
   if (pending.length === 0) return;
 
@@ -1348,8 +1489,15 @@ export async function distillFeedback(userChannelId: string, clientOverride?: An
   }
   const systemPrompt = buildDistillSystemPrompt();
   const userPrompt = [
-    "## Notes to distill",
-    ...pending.map((p) => `- idea_id=${p.id} | "${p.title}" — note: ${p.user_note}`),
+    "## Feedback to distill",
+    "Each entry has feedback (positive|negative) and optionally a one-line",
+    "reason. Map POSITIVE → preferred_topic / preferred_format. Map",
+    "NEGATIVE → banned_topic / banned_substitution / banned_pattern.",
+    "",
+    ...pending.map(
+      (p) =>
+        `- idea_id=${p.id} | "${p.title}" — ${p.feedback}${p.reason ? ` — reason: ${p.reason}` : " (no reason given)"}`
+    ),
     "",
     "Return JSON only.",
   ].join("\n");

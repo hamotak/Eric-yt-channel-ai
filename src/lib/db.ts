@@ -559,6 +559,9 @@ export type Channel = {
   view_count: number | null;
   video_count: number | null;
   imported_at: number;
+  avatar_url?: string | null;
+  topic_analysis_json?: string | null;
+  topic_analysis_at?: string | null;
   // User-managed metadata (set via /integrations row Edit). All
   // optional; missing on rows imported before the migration ran.
   editor_name?: string | null;
@@ -978,10 +981,12 @@ export type Video = {
   imported_at: number;
 };
 
-export function upsertChannel(c: Partial<Channel> & { id: string }): void {
+export function upsertChannel(
+  c: Partial<Channel> & { id: string; avatar_url?: string | null }
+): void {
   db.prepare(
-    `INSERT INTO channels (id, title, handle, description, subscriber_count, view_count, video_count, imported_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+    `INSERT INTO channels (id, title, handle, description, subscriber_count, view_count, video_count, avatar_url, imported_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
      ON CONFLICT(id) DO UPDATE SET
        title = COALESCE(excluded.title, channels.title),
        handle = COALESCE(excluded.handle, channels.handle),
@@ -989,6 +994,7 @@ export function upsertChannel(c: Partial<Channel> & { id: string }): void {
        subscriber_count = COALESCE(excluded.subscriber_count, channels.subscriber_count),
        view_count = COALESCE(excluded.view_count, channels.view_count),
        video_count = COALESCE(excluded.video_count, channels.video_count),
+       avatar_url = COALESCE(excluded.avatar_url, channels.avatar_url),
        imported_at = excluded.imported_at`
   ).run(
     c.id,
@@ -997,7 +1003,8 @@ export function upsertChannel(c: Partial<Channel> & { id: string }): void {
     c.description ?? null,
     c.subscriber_count ?? null,
     c.view_count ?? null,
-    c.video_count ?? null
+    c.video_count ?? null,
+    c.avatar_url ?? null
   );
 }
 
@@ -4150,6 +4157,15 @@ try {
   if (!cols.some((c) => c.name === "last_user_videos_sync_at")) {
     db.exec(`ALTER TABLE channels ADD COLUMN last_user_videos_sync_at TEXT`);
   }
+  if (!cols.some((c) => c.name === "avatar_url")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN avatar_url TEXT`);
+  }
+  if (!cols.some((c) => c.name === "topic_analysis_json")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN topic_analysis_json TEXT`);
+  }
+  if (!cols.some((c) => c.name === "topic_analysis_at")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN topic_analysis_at TEXT`);
+  }
 } catch {
   /* noop */
 }
@@ -4162,6 +4178,35 @@ try {
     .all() as { name: string }[];
   if (!cols.some((c) => c.name === "note")) {
     db.exec(`ALTER TABLE competitors ADD COLUMN note TEXT`);
+  }
+} catch {
+  /* noop */
+}
+
+// ALTER ideas: PRIO-9 used_by_user + used_at; PRIO-10 feedback +
+// feedback_reason + feedback_at. The CREATE TABLE below carries these
+// for fresh installs; this guard backfills existing rows.
+// Note: SQLite ALTER TABLE doesn't support CHECK constraints on added
+// columns — we enforce 'positive'|'negative' in the route handler. The
+// CREATE TABLE below DOES have the CHECK (applies on fresh schema).
+try {
+  const cols = db
+    .prepare(`PRAGMA table_info(ideas)`)
+    .all() as { name: string }[];
+  if (!cols.some((c) => c.name === "used_by_user")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN used_by_user INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!cols.some((c) => c.name === "used_at")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN used_at TEXT`);
+  }
+  if (!cols.some((c) => c.name === "feedback")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN feedback TEXT`);
+  }
+  if (!cols.some((c) => c.name === "feedback_reason")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN feedback_reason TEXT`);
+  }
+  if (!cols.some((c) => c.name === "feedback_at")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN feedback_at TEXT`);
   }
 } catch {
   /* noop */
@@ -4196,6 +4241,11 @@ db.exec(`
     fit_score INTEGER,
     user_note TEXT,
     note_distilled_at TEXT,
+    used_by_user INTEGER NOT NULL DEFAULT 0,
+    used_at TEXT,
+    feedback TEXT CHECK (feedback IS NULL OR feedback IN ('positive','negative')),
+    feedback_reason TEXT,
+    feedback_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE CASCADE
   );

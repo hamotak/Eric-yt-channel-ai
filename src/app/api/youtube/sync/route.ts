@@ -89,6 +89,7 @@ export async function POST(req: Request) {
           subscriber_count: ch.subscribers,
           view_count: ch.views,
           video_count: ch.videoCount,
+          avatar_url: ch.thumbnail,
         });
         send({
           type: "channel",

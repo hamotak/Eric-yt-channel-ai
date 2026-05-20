@@ -1,13 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import {
-  Calendar,
-  ChevronDown,
-  ChevronUp,
-  Hash,
-  Type,
-} from "lucide-react";
+import { Calendar, ChevronDown, ChevronUp } from "lucide-react";
 import {
   Card,
   CardContent,
@@ -30,13 +24,6 @@ import { cn } from "@/lib/utils";
  * intentionally NOT defined here because the widgets that read them
  * were removed in Prompt 4.8 Change 4.
  */
-export type ChannelDetailAnalytics = {
-  themes: {
-    topTags: { tag: string; count: number }[];
-    topTitleWords: { word: string; count: number }[];
-    avgTitleLength: number;
-  };
-};
 
 export type ChannelDetailChannel = {
   id: string;
@@ -131,86 +118,6 @@ export function MetaCard({ channel }: { channel: ChannelDetailChannel }) {
           value={fmtDate(channel.imported_at)}
           icon={Calendar}
         />
-      </CardContent>
-    </Card>
-  );
-}
-
-export function ThemesCard({
-  analytics,
-}: {
-  analytics: ChannelDetailAnalytics;
-}) {
-  const { t } = useI18n();
-  const th = analytics.themes;
-  return (
-    <Card className="mb-4">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Hash className="h-4 w-4 text-primary" />
-          {t.channel.themesTitle}
-        </CardTitle>
-        <CardDescription>{t.channel.themesDesc}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
-        <div>
-          <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
-            <Hash className="h-3 w-3" />
-            <span className="font-medium text-foreground">{t.channel.topTags}</span>
-          </div>
-          {th.topTags.length === 0 ? (
-            <p className="text-xs text-muted-foreground">{t.channel.noTags}</p>
-          ) : (
-            <div className="flex flex-wrap gap-1.5">
-              {th.topTags.map((tag) => (
-                <span
-                  key={tag.tag}
-                  className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs"
-                >
-                  <span>{tag.tag}</span>
-                  <span className="rounded bg-primary/20 px-1 text-[10px] font-mono tabular-nums">
-                    {tag.count}
-                  </span>
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-
-        <div>
-          <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
-            <Type className="h-3 w-3" />
-            <span className="font-medium text-foreground">
-              {t.channel.topTitleWords}
-            </span>
-            <span className="ml-auto text-muted-foreground">
-              {t.channel.avgTitleLen}: {th.avgTitleLength} {t.channel.charsShort}
-            </span>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {th.topTitleWords.map((w, i) => {
-              const weight = Math.max(
-                0.7,
-                Math.min(
-                  1.8,
-                  (w.count / (th.topTitleWords[0]?.count || 1)) * 1.4
-                )
-              );
-              return (
-                <span
-                  key={w.word + i}
-                  className="rounded-full bg-muted px-2 py-0.5 font-mono"
-                  style={{ fontSize: `${0.7 * weight}rem` }}
-                >
-                  {w.word}
-                  <span className="ml-1 text-muted-foreground text-[10px]">
-                    {w.count}
-                  </span>
-                </span>
-              );
-            })}
-          </div>
-        </div>
       </CardContent>
     </Card>
   );

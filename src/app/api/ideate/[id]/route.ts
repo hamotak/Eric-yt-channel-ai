@@ -24,6 +24,9 @@ interface IdeaRow {
   validation_reason: string | null;
   fit_score: number | null;
   user_note: string | null;
+  used_by_user: number;
+  feedback: "positive" | "negative" | null;
+  feedback_reason: string | null;
 }
 
 export async function GET(
@@ -88,7 +91,8 @@ export async function GET(
   const rows = db
     .prepare(
       `SELECT id, title, description, source_attribution, validation_status,
-              validation_reason, fit_score, user_note
+              validation_reason, fit_score, user_note,
+              used_by_user, feedback, feedback_reason
        FROM ideas WHERE generation_id = ?
        ORDER BY validation_status ASC, fit_score DESC, created_at ASC`
     )
@@ -102,6 +106,9 @@ export async function GET(
       description: r.description,
       fit_score: r.fit_score,
       user_note: r.user_note,
+      used: r.used_by_user === 1,
+      feedback: r.feedback,
+      feedback_reason: r.feedback_reason,
       source_attribution: r.source_attribution ? safeParse(r.source_attribution) : null,
     }));
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
 import { Check, ChevronsUpDown, Globe, Tv } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -49,6 +49,20 @@ export function ChannelSwitcher() {
   const [open, setOpen] = useState(false);
   const [switching, setSwitching] = useState(false);
   const popRef = useRef<HTMLDivElement>(null);
+
+  // Display order: largest channel first, alphabetical tiebreak. Otherwise
+  // a freshly-added 100-sub channel can bury the 117K main channel below
+  // the fold. "All channels" stays pinned above this list in the render.
+  const sortedChannels = useMemo(() => {
+    return [...channels].sort((a, b) => {
+      const aSubs = a.subscriber_count ?? -1;
+      const bSubs = b.subscriber_count ?? -1;
+      if (aSubs !== bSubs) return bSubs - aSubs;
+      const aLabel = (a.title ?? a.handle ?? "").toLowerCase();
+      const bLabel = (b.title ?? b.handle ?? "").toLowerCase();
+      return aLabel.localeCompare(bLabel);
+    });
+  }, [channels]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -179,7 +193,7 @@ export function ChannelSwitcher() {
       </Button>
       {open ? (
         <div className="absolute right-0 top-[calc(100%+4px)] z-30 w-72 overflow-hidden rounded-md border border-border bg-popover shadow-lg">
-          <div className="max-h-80 overflow-y-auto p-1">
+          <div className="max-h-[min(70vh,560px)] overflow-y-auto p-1">
             {/* "All channels" sentinel — first entry, separated by a
                 bottom border. Only the Dashboard renders the combined
                 view; other pages keep scoping to the active channel. */}
@@ -200,7 +214,7 @@ export function ChannelSwitcher() {
                 </div>
               </div>
             </button>
-            {channels.map((c) => (
+            {sortedChannels.map((c) => (
               <button
                 key={c.id}
                 onClick={() => pick(c.id)}

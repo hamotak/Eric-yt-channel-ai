@@ -63,6 +63,7 @@ type Payload = {
     prevMonthCoverageStart?: string;
     prevMonthCoverageEnd?: string;
     prevMonthPartial?: boolean;
+    excludedChannelIds?: string[];
   };
   combinedDaily: { date: string; total: number }[];
 };
@@ -237,6 +238,34 @@ export function MultiChannelEarnings() {
       </CardHeader>
 
       <CardContent className="space-y-4">
+        {/* Silent-exclude warning: any channel whose row returned
+            total === null was dropped from the headline totals (e.g. a
+            transient OAuth 401, monetary access denied, etc.). Without
+            this banner the user sees a number that looks complete but
+            silently misses one or more channels. */}
+        {(() => {
+          const excluded = data.channels.filter((c) => c.total === null);
+          if (excluded.length === 0) return null;
+          const names = excluded
+            .map((c) => c.title ?? c.handle ?? c.channelId)
+            .join(", ");
+          return (
+            <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+              <span className="font-medium">
+                {excluded.length} channel{excluded.length === 1 ? "" : "s"} excluded from totals:
+              </span>
+              <span className="min-w-0 flex-1 truncate">{names}</span>
+              <button
+                onClick={() => load(period)}
+                disabled={loading}
+                className="font-medium underline-offset-2 hover:underline disabled:opacity-50"
+              >
+                Re-fetch
+              </button>
+            </div>
+          );
+        })()}
+
         {/* Top-line totals — show both gross (always) and net-after-CMS
             (only when at least one channel has a non-zero CMS cut, so
             we don't visually crowd the dashboard for users without
