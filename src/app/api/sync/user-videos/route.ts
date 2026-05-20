@@ -16,7 +16,6 @@
  */
 
 import {
-  getActiveTranscriptionJob,
   getIntegration,
   getLastUserVideosSyncAt,
   listAllChannels,
@@ -36,12 +35,6 @@ function isFresh(lastIso: string | null): boolean {
 }
 
 export async function POST() {
-  // Don't compete with a full sync or batch transcription. Bail silently
-  // — the layout/onChange callers ignore the response either way.
-  if (getActiveTranscriptionJob()) {
-    return Response.json({ skipped: "transcription_job_active" });
-  }
-
   if (!getIntegration("youtube")?.api_key) {
     return Response.json({ skipped: "no_youtube_key" });
   }

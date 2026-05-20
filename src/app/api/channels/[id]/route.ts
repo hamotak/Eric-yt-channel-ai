@@ -6,9 +6,9 @@ export const runtime = "nodejs";
 type Ctx = { params: Promise<{ id: string }> };
 
 /**
- * Delete a single channel and every video / transcript / comment / cache
- * row that scoped to it. Used by the multi-channel binder when the user
- * removes a channel from the list.
+ * Delete a single channel and every video / comment / cache row that
+ * scoped to it. Used by the multi-channel binder when the user removes
+ * a channel from the list.
  */
 export async function DELETE(_req: Request, ctx: Ctx) {
   const { id } = await ctx.params;

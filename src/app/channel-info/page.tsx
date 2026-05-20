@@ -17,7 +17,6 @@ import {
   ChannelDetailAnalytics,
   MetaCard,
   ThemesCard,
-  TranscriptsCoverageCard,
 } from "@/components/channel-detail-widgets";
 import {
   BannedTopicsEditor,
@@ -181,8 +180,8 @@ function SingleChannelCard({
     return () => window.clearTimeout(id);
   }, [savedToast]);
 
-  // Load /api/channel to populate the detail widgets (themes, transcripts
-  // coverage, about, meta). Pass the focused channel id explicitly so the
+  // Load /api/channel to populate the detail widgets (themes, about,
+  // meta). Pass the focused channel id explicitly so the
   // server scopes its queries to THIS channel even when the global active
   // pointer points elsewhere (e.g. user clicked a row in the "All
   // channels" summary table → ?focus=<id> overrides for one page load).
@@ -437,7 +436,6 @@ function SingleChannelCard({
       <ChannelAudience channelId={channel.channelId} />
       <ChannelRevenue channelId={channel.channelId} />
       {analytics && <ThemesCard analytics={analytics} />}
-      {analytics && <TranscriptsCoverageCard analytics={analytics} />}
 
       {aiOpen && (
         <AnalyzeModal
@@ -501,9 +499,9 @@ function AnalyzeModal({
                 AI-drafted channel description
               </CardTitle>
               <CardDescription>
-                Claude analyzed this channel&apos;s recent videos, transcripts,
-                and (when connected) Studio demographics. One paragraph the
-                agent will read before every job.
+                Claude analyzed this channel&apos;s recent videos, comment
+                signals, and (when connected) Studio demographics. One
+                paragraph the agent will read before every job.
               </CardDescription>
             </div>
             <Button
@@ -526,7 +524,7 @@ function AnalyzeModal({
           {loading && (
             <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
-              Analyzing recent videos and transcripts…
+              Analyzing recent videos and comments…
             </div>
           )}
           {!loading && proposal && (

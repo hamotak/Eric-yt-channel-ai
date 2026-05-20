@@ -1,16 +1,10 @@
 import { NextResponse } from "next/server";
 import { listIntegrations, setIntegration } from "@/lib/db";
 
-// Deepgram is the primary transcription path for this local-only build:
-// yt-dlp pulls audio into RAM and streams it to Deepgram, transcripts
-// land in SQLite.
-const ALLOWED = [
-  "claude",
-  "deepgram",
-  "exa",
-  "youtube",
-  "google_gemini",
-] as const;
+// The only integrations the app actively uses post-simplification.
+// Claude powers ideation + analyze-with-ai; YouTube Data API powers
+// channel + video sync.
+const ALLOWED = ["claude", "youtube"] as const;
 type Name = (typeof ALLOWED)[number];
 
 function mask(key: string | null) {

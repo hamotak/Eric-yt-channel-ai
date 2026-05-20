@@ -18,9 +18,8 @@ export async function GET(req: Request) {
   if (!channel) return NextResponse.json({ channel: null });
   const stats = videoStats(channelId);
   // Deep analytics bundle — everything we can compute from the local
-  // `videos` + `transcripts` tables, no external API calls. Drives the
-  // Channel Details section of /channel-info. Returns `null` if there
-  // are no videos yet.
+  // `videos` table, no external API calls. Drives the Channel Details
+  // section of /channel-info. Returns `null` if there are no videos yet.
   const analytics = channelAnalytics(channelId);
   return NextResponse.json({ channel, stats, analytics });
 }

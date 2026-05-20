@@ -80,27 +80,14 @@ type DictionaryShape = {
     comments: string;
     engagementRate: string;
     avgViewsPerDay: string;
-    askClaudeTitle: string;
-    askClaudeHint: string;
-    attachToChat: string;
     tabOverview: string;
-    tabTranscript: string;
     tabComments: string;
     soon: string;
     description: string;
     noDescription: string;
-    noTranscript: string;
-    searchTranscript: string;
     copy: string;
     copied: string;
     commentsComingSoon: string;
-    transcribeBtn: string;
-    transcribeHint: string;
-    transcribing: string;
-    reTranscribe: string;
-    reTranscribeHint: string;
-    reTranscribeConfirm: string;
-    deepgramNotConfigured: string;
     openIntegrations: string;
   };
   channel: {
@@ -167,11 +154,6 @@ type DictionaryShape = {
     avgTitleLen: string;
     charsShort: string;
     noTags: string;
-    transcriptsCoverageTitle: string;
-    transcriptsCoverageDesc: string;
-    coverage: string;
-    avgTranscriptLen: string;
-    languagesLabel: string;
     growthTitle: string;
     growthDesc: string;
     recent5Avg: string;
@@ -267,34 +249,7 @@ type DictionaryShape = {
       helpLink: string;
       helpLinkLabel: string;
     };
-    gemini: {
-      name: string;
-      desc: string;
-      placeholder: string;
-      helpTitle: string;
-      helpSteps: string[];
-      helpLink: string;
-      helpLinkLabel: string;
-    };
-    exa: {
-      name: string;
-      desc: string;
-      placeholder: string;
-      helpTitle: string;
-      helpSteps: string[];
-      helpLink: string;
-      helpLinkLabel: string;
-    };
     youtube: {
-      name: string;
-      desc: string;
-      placeholder: string;
-      helpTitle: string;
-      helpSteps: string[];
-      helpLink: string;
-      helpLinkLabel: string;
-    };
-    deepgram: {
       name: string;
       desc: string;
       placeholder: string;
@@ -330,40 +285,6 @@ type DictionaryShape = {
     rowDuration: string;
     rowActiveTools: string;
     ledgerSinceHint: string;
-  };
-  deepgram: {
-    // Transcribe-all banner on /videos
-    missingTitle: string;
-    missingHint: string;
-    ctaHint: string;
-    ctaButton: string;
-    runningTitle: string;
-    runningHint: string;
-    spentSoFar: string;
-    doneTitle: string;
-    doneSpent: string;
-    failed: string;
-    notConfiguredHint: string;
-    goToIntegrations: string;
-    // Confirm modal
-    modalTitle: string;
-    modalSubtitle: string;
-    modalRowVideos: string;
-    modalRowDuration: string;
-    modalRowCost: string;
-    modalRowRemaining: string;
-    modalRowAfter: string;
-    overrunWarning: string;
-    firstFew: string;
-    confirm: string;
-    cancel: string;
-    // Usage widget on Integrations page
-    usageTitle: string;
-    transcriptsCount: string;
-    of: string;
-    remainingHint: string;
-    creditLimitLabel: string;
-    recentTitle: string;
   };
   import: {
     title: string;
@@ -460,7 +381,7 @@ export const dictionaries: { en: DictionaryShape } = {
     banner: {
       connectTitle: "Connect your integrations to get started",
       connectDesc:
-        "Add your API keys for Claude, Exa, NexLev and YouTube to unlock full analysis.",
+        "Add your API keys for Claude and YouTube to unlock the full app.",
       connectCta: "Go to Integrations",
     },
     dashboard: {
@@ -493,9 +414,9 @@ export const dictionaries: { en: DictionaryShape } = {
     },
     videos: {
       title: "Videos",
-      subtitle: "All videos with transcripts and metadata",
+      subtitle: "All videos",
       empty: "No videos yet. Import your channel data first.",
-      search: "Search videos or transcripts...",
+      search: "Search videos…",
       sortLabel: "Sort",
       durationLabel: "Duration",
       countFound: "{n} videos",
@@ -516,32 +437,14 @@ export const dictionaries: { en: DictionaryShape } = {
       comments: "Comments",
       engagementRate: "Engagement",
       avgViewsPerDay: "~{n} views / day since publish",
-      askClaudeTitle: "Ask Claude about this video",
-      askClaudeHint:
-        "Attach this video to a new chat — Claude gets the full metadata + transcript as context.",
-      attachToChat: "Attach to chat",
       tabOverview: "Overview",
-      tabTranscript: "Transcript",
       tabComments: "Comments",
       soon: "soon",
       description: "Description",
       noDescription: "No description.",
-      noTranscript: "No transcript on file for this video yet.",
-      searchTranscript: "Find in transcript...",
       copy: "Copy",
       copied: "Copied",
       commentsComingSoon: "Comments will appear here once Phase 2 is shipped.",
-      transcribeBtn: "Transcribe with Deepgram",
-      transcribeHint:
-        "Streams audio from YouTube to Deepgram in the cloud — nothing is saved to disk. Takes about 15-40 seconds depending on length.",
-      transcribing: "Transcribing…",
-      reTranscribe: "Re-transcribe",
-      reTranscribeHint:
-        "Replace the existing transcript with a fresh Deepgram run. Useful if the current one is short or wrong.",
-      reTranscribeConfirm:
-        "Replace the current transcript with a fresh Deepgram run? You'll be charged for another transcription on your Deepgram account.",
-      deepgramNotConfigured:
-        "Deepgram isn't configured yet — without it we can't transcribe videos that lack YouTube captions.",
       openIntegrations: "Open Integrations",
     },
     channel: {
@@ -609,11 +512,6 @@ export const dictionaries: { en: DictionaryShape } = {
       avgTitleLen: "Avg title length",
       charsShort: "chars",
       noTags: "No tags set on any video.",
-      transcriptsCoverageTitle: "Transcript coverage",
-      transcriptsCoverageDesc: "How much of your catalog has a searchable transcript.",
-      coverage: "Coverage",
-      avgTranscriptLen: "Avg transcript length",
-      languagesLabel: "Languages",
       growthTitle: "Growth trajectory",
       growthDesc: "Recent uploads performance vs the preceding batch — are views trending up or cooling?",
       recent5Avg: "Recent 5 avg views",
@@ -710,38 +608,9 @@ export const dictionaries: { en: DictionaryShape } = {
         helpLink: "https://console.anthropic.com/settings/keys",
         helpLinkLabel: "Open Anthropic Console",
       },
-      gemini: {
-        name: "Google Gemini",
-        desc: "Optional second AI brain. Pick Gemini in the chat header for tasks where Google's larger YouTube knowledge graph helps; keep Claude for sharper reasoning on the data you've imported.",
-        placeholder: "AIzaSy...",
-        helpTitle: "How to get a Gemini API key",
-        helpSteps: [
-          "Go to aistudio.google.com and sign in with the Google account you want billed.",
-          "Click \"Get API key\" (top-right or sidebar). Create one — give it any name.",
-          "Copy the key (starts with AIza…). Paste it below and Save.",
-          "Pricing on Gemini 2.5 Flash: $0.30 / $2.50 per million tokens (input/output) — roughly half the cost of Claude Sonnet for typical chat turns. Pro is ~4× more expensive but better at long-context analysis.",
-          "The chat lets you switch between Flash, Pro, and Claude per session — start with Flash and bump to Pro only when you need it.",
-        ],
-        helpLink: "https://aistudio.google.com/apikey",
-        helpLinkLabel: "Open Google AI Studio",
-      },
-      exa: {
-        name: "Exa",
-        desc: "Semantic web search — Claude uses this to find articles, competitors, industry context outside YouTube.",
-        placeholder: "Your Exa API key",
-        helpTitle: "How to get an Exa API key",
-        helpSteps: [
-          "Sign up at exa.ai. New accounts get 1,000 free searches.",
-          "In the dashboard, find API Keys (top-right or sidebar). Create one.",
-          "Copy and paste below. Pricing after free tier: $5 per 1k neural searches — cheap for normal use.",
-          "When to enable: whenever the user asks about competitors by name, niche trends, or anything that requires live web context.",
-        ],
-        helpLink: "https://dashboard.exa.ai/api-keys",
-        helpLinkLabel: "Open Exa Dashboard",
-      },
       youtube: {
         name: "YouTube Data API v3",
-        desc: "Public YouTube data — videos, statistics, captions, search, comments. Required for syncing a channel.",
+        desc: "Public YouTube data — videos, statistics, search, comments. Required for syncing a channel.",
         placeholder: "YouTube API key",
         helpTitle: "How to get a YouTube API key",
         helpSteps: [
@@ -753,21 +622,6 @@ export const dictionaries: { en: DictionaryShape } = {
         ],
         helpLink: "https://console.cloud.google.com/apis/credentials",
         helpLinkLabel: "Open Google Cloud Console",
-      },
-      deepgram: {
-        name: "Deepgram (speech-to-text)",
-        desc: "Generates transcripts for videos without YouTube captions. Cloud-only — audio never touches your disk, only transits RAM for a few seconds per video.",
-        placeholder: "Deepgram API key",
-        helpTitle: "How to get a Deepgram API key",
-        helpSteps: [
-          "Sign up at deepgram.com. New accounts get $200 of free credit — enough for ~770 hours of audio (Nova-3 model).",
-          "In the console, go to API Keys → Create a new key. Scope: \"Member\" is enough.",
-          "Copy and paste below. Pricing after free credit: $0.0043/min = $0.26/hour of audio.",
-          "How it works here: click \"Transcribe all\" on the Videos page — yt-dlp pulls audio, streams it through RAM to Deepgram, saves only the text. Zero disk I/O, zero accumulation.",
-          "The credit bar below tracks spending. When you switch channels, transcripts auto-delete with the old videos, but your $ balance stays.",
-        ],
-        helpLink: "https://console.deepgram.com/",
-        helpLinkLabel: "Open Deepgram Console",
       },
     },
     claudeUsage: {
@@ -798,40 +652,6 @@ export const dictionaries: { en: DictionaryShape } = {
       rowActiveTools: "Active tools",
       ledgerSinceHint:
         "Ledger tracks turns since {date}. Older chats (before tracking was added, or on error paths before a recent fix) won't appear here but still show on your Anthropic console.",
-    },
-    deepgram: {
-      missingTitle: "{n} videos have no transcript",
-      missingHint: "{n} videos have no transcript",
-      ctaHint: "Total audio: {duration} · Estimated cost: {amount}",
-      ctaButton: "Transcribe all",
-      runningTitle: "Transcribing",
-      runningHint:
-        "Running on the server — safe to close this tab. Come back anytime to check progress.",
-      spentSoFar: "Spent: {amount}",
-      doneTitle: "Transcription complete",
-      doneSpent: "Spent: {amount}",
-      failed: "failed",
-      notConfiguredHint:
-        "Add your Deepgram API key in Integrations to transcribe videos without YouTube captions.",
-      goToIntegrations: "Open Integrations",
-      modalTitle: "Transcribe missing videos",
-      modalSubtitle: "Audio is streamed directly from YouTube to Deepgram — nothing is saved to your computer.",
-      modalRowVideos: "Videos",
-      modalRowDuration: "Total duration",
-      modalRowCost: "Estimated cost",
-      modalRowRemaining: "Credit remaining",
-      modalRowAfter: "After this batch",
-      overrunWarning:
-        "This batch would exceed your remaining credit. Deepgram may reject jobs partway through.",
-      firstFew: "First few videos in queue",
-      confirm: "Start transcribing",
-      cancel: "Cancel",
-      usageTitle: "Usage",
-      transcriptsCount: "{n} transcripts",
-      of: "of",
-      remainingHint: "Remaining: {amount} (~{hours}h of audio)",
-      creditLimitLabel: "Credit limit",
-      recentTitle: "Recent transcriptions",
     },
     import: {
       title: "Import",

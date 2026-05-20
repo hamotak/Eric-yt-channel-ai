@@ -144,20 +144,6 @@ function initSchema() {
       imported_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
     );
 
-    CREATE TABLE IF NOT EXISTS transcripts (
-      video_id TEXT PRIMARY KEY,
-      language TEXT,
-      text TEXT NOT NULL,
-      fetched_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-      FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
-    );
-
-    -- (Note: a transcripts_fts virtual table used to live here -- it was
-    -- created as external-content FTS5 against transcripts.text but we
-    -- never wired up index maintenance, which caused "database disk image
-    -- is malformed" errors on cascade delete. Removed in favour of plain
-    -- LIKE search in searchTranscripts. See module-level DROP below.)
-
     CREATE TABLE IF NOT EXISTS chat_sessions (
       id TEXT PRIMARY KEY,
       title TEXT,
@@ -247,18 +233,16 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_api_cache_expires ON api_cache(expires_at);
 `);
 
-// Drop `transcripts_fts` permanently — it was created as an external-content
-// FTS5 table (`content='transcripts'`) but we never index it after writes,
-// so its internal state desynchronises from `transcripts` and SQLite raises
-// "database disk image is malformed" on operations that touch it (e.g.
-// the cascade delete during channel switch). We don't actually use FTS on
-// transcripts — `searchTranscripts` does plain LIKE — so this table is
-// pure liability. Drop and let it stay gone.
-//
-// Also drop a few retired tables — fresh installs shouldn't carry
-// orphans forward.
+// Drop retired tables — fresh installs shouldn't carry orphans forward.
+// transcripts_fts was an unused external-content FTS5 table that
+// desynced and raised "database disk image is malformed" on cascade.
+// transcripts / transcription_jobs / deepgram_usage retired in the
+// May 2026 simplification pass (transcription feature removed).
 try {
   db.exec(`DROP TABLE IF EXISTS transcripts_fts`);
+  db.exec(`DROP TABLE IF EXISTS transcripts`);
+  db.exec(`DROP TABLE IF EXISTS transcription_jobs`);
+  db.exec(`DROP TABLE IF EXISTS deepgram_usage`);
   db.exec(`DROP TABLE IF EXISTS video_hooks`);
   db.exec(`DROP TABLE IF EXISTS hooks_library`);
   // T1 deletions — /chat and /outliers surfaces removed in 2026-05. Run
@@ -316,67 +300,6 @@ export function setSetting(key: string, value: string): void {
        value = excluded.value,
        updated_at = excluded.updated_at`
   ).run(key, value);
-}
-
-/* ---------- Transcripts ---------- */
-
-export function upsertTranscript(
-  videoId: string,
-  text: string,
-  language: string | null = null
-): void {
-  db.prepare(
-    `INSERT INTO transcripts (video_id, language, text, fetched_at)
-     VALUES (?, ?, ?, strftime('%s','now'))
-     ON CONFLICT(video_id) DO UPDATE SET
-       language = excluded.language,
-       text = excluded.text,
-       fetched_at = excluded.fetched_at`
-  ).run(videoId, language, text);
-}
-
-export function getTranscript(videoId: string): { text: string; language: string | null } | null {
-  const row = db
-    .prepare("SELECT text, language FROM transcripts WHERE video_id = ?")
-    .get(videoId) as { text: string; language: string | null } | undefined;
-  return row ?? null;
-}
-
-export function searchTranscripts(
-  query: string,
-  limit = 20
-): { video_id: string; snippet: string; title: string }[] {
-  const q = query.trim();
-  if (!q) return [];
-  // Scope to the active channel so transcript search doesn't pull hits from
-  // a different connected channel. JOIN through videos for the filter.
-  const activeId = getActiveChannelId();
-  try {
-    if (activeId) {
-      return db
-        .prepare(
-          `SELECT t.video_id, substr(t.text, 1, 400) as snippet, v.title
-           FROM transcripts t
-           JOIN videos v ON v.id = t.video_id
-           WHERE t.text LIKE ? AND v.channel_id = ?
-           ORDER BY v.published_at DESC NULLS LAST
-           LIMIT ?`
-        )
-        .all(`%${q}%`, activeId, limit) as { video_id: string; snippet: string; title: string }[];
-    }
-    return db
-      .prepare(
-        `SELECT t.video_id, substr(t.text, 1, 400) as snippet, v.title
-         FROM transcripts t
-         JOIN videos v ON v.id = t.video_id
-         WHERE t.text LIKE ?
-         ORDER BY v.published_at DESC NULLS LAST
-         LIMIT ?`
-      )
-      .all(`%${q}%`, limit) as { video_id: string; snippet: string; title: string }[];
-  } catch {
-    return [];
-  }
 }
 
 /* ---------- Chat sessions & messages ---------- */
@@ -1186,16 +1109,14 @@ export function setActiveChannelId(id: string): void {
 
 /**
  * Delete a single channel and every row that scopes to it: videos
- * (cascades to transcripts + comments via FK), comments_fts shadow,
- * cached analytics. If the deleted channel was active, repoint to
- * whichever channel was imported most recently (or clear the pointer
- * if none remain).
+ * (cascades to comments via FK), comments_fts shadow, cached analytics.
+ * If the deleted channel was active, repoint to whichever channel was
+ * imported most recently (or clear the pointer if none remain).
  *
  * Returns counts so the caller can surface "removed N videos" in UI.
  */
 export function removeChannel(channelId: string): {
   videos: number;
-  transcripts: number;
   comments: number;
 } {
   const tx = db.transaction((id: string) => {
@@ -1203,7 +1124,6 @@ export function removeChannel(channelId: string): {
       .prepare(`SELECT id FROM videos WHERE channel_id = ?`)
       .all(id) as { id: string }[];
 
-    let transcriptCount = 0;
     let commentCount = 0;
     if (doomed.length > 0) {
       const ids = doomed.map((r) => r.id);
@@ -1218,13 +1138,6 @@ export function removeChannel(channelId: string): {
         console.warn("[removeChannel] comments_fts cleanup failed (continuing):", err);
       }
 
-      transcriptCount = (
-        db
-          .prepare(
-            `SELECT COUNT(*) as n FROM transcripts WHERE video_id IN (${placeholders})`
-          )
-          .get(...ids) as { n: number }
-      ).n;
       commentCount = (
         db
           .prepare(
@@ -1280,7 +1193,6 @@ export function removeChannel(channelId: string): {
 
     return {
       videos: doomed.length,
-      transcripts: transcriptCount,
       comments: commentCount,
     };
   });
@@ -1288,7 +1200,7 @@ export function removeChannel(channelId: string): {
 }
 
 /**
- * Wipe every video (and its cascading transcripts / comments / FTS rows) that
+ * Wipe every video (and its cascading comments / FTS rows) that
  * doesn't belong to `keepChannelId`. Called at the start of a sync when the
  * user binds a different channel than the one currently in `settings`.
  *
@@ -1298,14 +1210,12 @@ export function removeChannel(channelId: string): {
  * hanging around and polluting every listing.
  *
  * The `comments_fts` table isn't FK-linked, so ON DELETE CASCADE from
- * `videos` doesn't reach it — we clean it explicitly. (`transcripts_fts`
- * used to be cleaned here too but was removed as a defective leftover.)
+ * `videos` doesn't reach it — we clean it explicitly.
  *
  * Returns counts so callers can surface a "cleaned up N old videos" status.
  */
 export function purgeOtherChannels(keepChannelId: string): {
   videos: number;
-  transcripts: number;
   comments: number;
   channels: number;
 } {
@@ -1323,7 +1233,7 @@ export function purgeOtherChannels(keepChannelId: string): {
       const chInfo = db
         .prepare(`DELETE FROM channels WHERE id != ?`)
         .run(keepId);
-      return { videos: 0, transcripts: 0, comments: 0, channels: chInfo.changes };
+      return { videos: 0, comments: 0, channels: chInfo.changes };
     }
 
     const ids = doomed.map((r) => r.id);
@@ -1333,9 +1243,6 @@ export function purgeOtherChannels(keepChannelId: string): {
     //    its content). Wrap in try/catch — if the FTS index is malformed
     //    we'd rather log and keep going than abort the whole channel
     //    switch and leave the user staring at a "malformed" error.
-    //    `transcripts_fts` was dropped at module init (it was an unused
-    //    external-content table that kept desynchronising), so don't
-    //    touch it here.
     try {
       db.prepare(
         `DELETE FROM comments_fts WHERE video_id IN (${placeholders})`
@@ -1346,19 +1253,14 @@ export function purgeOtherChannels(keepChannelId: string): {
     }
 
     // 3. Count what will cascade so we can report it (the DELETE on videos
-    //    below triggers ON DELETE CASCADE for transcripts + comments).
-    const transcriptCount = db
-      .prepare(
-        `SELECT COUNT(*) as n FROM transcripts WHERE video_id IN (${placeholders})`
-      )
-      .get(...ids) as { n: number };
+    //    below triggers ON DELETE CASCADE for comments).
     const commentCount = db
       .prepare(
         `SELECT COUNT(*) as n FROM comments WHERE video_id IN (${placeholders})`
       )
       .get(...ids) as { n: number };
 
-    // 4. Delete the videos — FK cascade handles transcripts + comments.
+    // 4. Delete the videos — FK cascade handles comments.
     const vidInfo = db
       .prepare(
         `DELETE FROM videos WHERE channel_id IS NULL OR channel_id != ?`
@@ -1378,7 +1280,6 @@ export function purgeOtherChannels(keepChannelId: string): {
 
     return {
       videos: vidInfo.changes,
-      transcripts: transcriptCount.n,
       comments: commentCount.n,
       channels: chInfo.changes,
     };
@@ -1685,42 +1586,11 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_logs_source ON app_logs(source);
 `);
 
-/* ---------- Deepgram transcription usage + jobs ---------- */
+/* ---------- Claude usage ledger ---------- */
 // Declared at module scope for the same reason as app_logs — survives hot
 // reloads and ensures a newly-added integration always has its tables.
 
 db.exec(`
-  -- Per-transcription ledger. One row = one video successfully transcribed
-  -- via Deepgram. Used to compute total spend and show a running cost on
-  -- the Integrations page. Cost is stored in cents to avoid float drift.
-  CREATE TABLE IF NOT EXISTS deepgram_usage (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    video_id TEXT NOT NULL,
-    duration_seconds INTEGER NOT NULL,
-    cost_cents INTEGER NOT NULL,
-    model TEXT NOT NULL,
-    transcribed_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_deepgram_usage_video ON deepgram_usage(video_id);
-  CREATE INDEX IF NOT EXISTS idx_deepgram_usage_ts ON deepgram_usage(transcribed_at DESC);
-
-  -- Batch job tracker. The "Transcribe all missing" button kicks off a
-  -- server-side background task; the UI polls this row for progress. Only
-  -- one job runs at a time — new jobs wait for the current to finish.
-  CREATE TABLE IF NOT EXISTS transcription_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    completed_at INTEGER,
-    total INTEGER NOT NULL,
-    done INTEGER NOT NULL DEFAULT 0,
-    failed INTEGER NOT NULL DEFAULT 0,
-    cost_cents INTEGER NOT NULL DEFAULT 0,
-    current_video_id TEXT,
-    status TEXT NOT NULL DEFAULT 'running',
-    last_error TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_tx_jobs_status ON transcription_jobs(status);
-
   -- Per-turn Claude spend ledger. One row = one chat turn (user message →
   -- final assistant response). Tracks tokens separately for executor and
   -- advisor so we can see where the money actually goes. Cost in
@@ -2320,13 +2190,6 @@ export type ChannelAnalytics = {
     longForm: { count: number; totalViews: number; avgViews: number };
     durationBuckets: { label: string; count: number; totalViews: number }[];
   };
-  transcripts: {
-    total: number;
-    withTranscript: number;
-    coveragePct: number;
-    avgChars: number;
-    languages: { lang: string; count: number }[];
-  };
   cadence: {
     firstUploadTs: number | null;
     lastUploadTs: number | null;
@@ -2360,9 +2223,9 @@ export type ChannelAnalytics = {
 
 /**
  * Compute a rich analytics bundle for the currently bound channel. Pure
- * aggregation over the `videos` + `transcripts` tables — no external API
- * calls. Meant for the Channel Details page where we want to surface
- * everything we can actually see, not just the 4 headline KPIs.
+ * aggregation over the `videos` table — no external API calls. Meant for
+ * the Channel Details page where we want to surface everything we can
+ * actually see, not just the 4 headline KPIs.
  */
 export function channelAnalytics(
   channelId?: string | null
@@ -2462,37 +2325,6 @@ export function channelAnalytics(
     });
     return { label: b.label, count: xs.length, totalViews: sumViews(xs) };
   });
-
-  // Transcripts coverage — scoped to the same channel id we used for
-  // videos above (active channel by default, or the explicit focus id).
-  const transcriptRows = (
-    id
-      ? db
-          .prepare(
-            `SELECT t.language, t.text
-             FROM transcripts t
-             JOIN videos v ON v.id = t.video_id
-             WHERE v.channel_id = ?`
-          )
-          .all(id)
-      : db.prepare(`SELECT language, text FROM transcripts`).all()
-  ) as { language: string | null; text: string }[];
-  const withTranscript = transcriptRows.length;
-  const coveragePct = (withTranscript / videos.length) * 100;
-  const avgChars =
-    withTranscript > 0
-      ? Math.round(
-          transcriptRows.reduce((s, r) => s + (r.text?.length ?? 0), 0) / withTranscript
-        )
-      : 0;
-  const langMap = new Map<string, number>();
-  for (const r of transcriptRows) {
-    const lang = (r.language ?? "unknown").slice(0, 10);
-    langMap.set(lang, (langMap.get(lang) ?? 0) + 1);
-  }
-  const languages = [...langMap.entries()]
-    .map(([lang, count]) => ({ lang, count }))
-    .sort((a, b) => b.count - a.count);
 
   // Cadence
   const dated = videos
@@ -2678,13 +2510,6 @@ export function channelAnalytics(
         avgViews: avgOf(longArr),
       },
       durationBuckets,
-    },
-    transcripts: {
-      total: videos.length,
-      withTranscript,
-      coveragePct,
-      avgChars,
-      languages,
     },
     cadence: {
       firstUploadTs,
@@ -2972,163 +2797,6 @@ export function claudeUsageStats(opts: { limit?: number } = {}): {
 export function clearClaudeUsage(): number {
   const info = db.prepare(`DELETE FROM claude_usage`).run();
   return info.changes;
-}
-
-/* ---------- Deepgram helpers ---------- */
-
-export type DeepgramUsageRow = {
-  id: number;
-  video_id: string;
-  duration_seconds: number;
-  cost_cents: number;
-  model: string;
-  transcribed_at: number;
-};
-
-export function recordDeepgramUsage(entry: {
-  videoId: string;
-  durationSeconds: number;
-  costCents: number;
-  model: string;
-}): void {
-  db.prepare(
-    `INSERT INTO deepgram_usage (video_id, duration_seconds, cost_cents, model)
-     VALUES (?, ?, ?, ?)`
-  ).run(entry.videoId, entry.durationSeconds, entry.costCents, entry.model);
-}
-
-export function deepgramStats(): {
-  totalCostCents: number;
-  totalSeconds: number;
-  transcriptCount: number;
-  lastUsageAt: number | null;
-  last10: DeepgramUsageRow[];
-} {
-  const agg = db
-    .prepare(
-      `SELECT COALESCE(SUM(cost_cents),0) as totalCost,
-              COALESCE(SUM(duration_seconds),0) as totalSeconds,
-              COUNT(*) as n,
-              MAX(transcribed_at) as lastAt
-       FROM deepgram_usage`
-    )
-    .get() as { totalCost: number; totalSeconds: number; n: number; lastAt: number | null };
-  const last10 = db
-    .prepare(`SELECT * FROM deepgram_usage ORDER BY transcribed_at DESC LIMIT 10`)
-    .all() as DeepgramUsageRow[];
-  return {
-    totalCostCents: agg.totalCost,
-    totalSeconds: agg.totalSeconds,
-    transcriptCount: agg.n,
-    lastUsageAt: agg.lastAt,
-    last10,
-  };
-}
-
-/**
- * Videos that need a (re-)transcription run. Matches two cases:
- *   1. No transcript row at all.
- *   2. A transcript exists but is suspiciously short relative to video
- *      duration — typically caused by CDN truncation on older runs where
- *      Deepgram only saw the first 30-60 seconds. Heuristic: English speech
- *      is ~15 chars/sec, so anything below 3 chars/sec of the source video
- *      is almost certainly a truncated (or broken) transcript worth redoing.
- * Videos without a known duration are only returned if they have no
- * transcript — we can't judge ratio without a denominator.
- */
-export function listVideosMissingTranscript(): {
-  id: string;
-  title: string;
-  duration_seconds: number | null;
-}[] {
-  const SUSPICIOUS_CHARS_PER_SEC = 3;
-  // Bulk-transcribe is initiated from the channel's transcript page, so it
-  // must only target the currently selected channel — we don't want to
-  // accidentally burn Deepgram credits on a different channel's backlog.
-  const activeId = getActiveChannelId();
-  if (activeId) {
-    return db
-      .prepare(
-        `SELECT v.id, v.title, v.duration_seconds
-         FROM videos v
-         LEFT JOIN transcripts t ON t.video_id = v.id
-         WHERE v.channel_id = ? AND (
-           t.video_id IS NULL
-           OR (
-             v.duration_seconds IS NOT NULL
-             AND v.duration_seconds > 60
-             AND (LENGTH(t.text) * 1.0 / v.duration_seconds) < ?
-           )
-         )
-         ORDER BY COALESCE(v.published_at, v.imported_at) DESC`
-      )
-      .all(activeId, SUSPICIOUS_CHARS_PER_SEC) as {
-      id: string;
-      title: string;
-      duration_seconds: number | null;
-    }[];
-  }
-  return db
-    .prepare(
-      `SELECT v.id, v.title, v.duration_seconds
-       FROM videos v
-       LEFT JOIN transcripts t ON t.video_id = v.id
-       WHERE t.video_id IS NULL
-          OR (
-            v.duration_seconds IS NOT NULL
-            AND v.duration_seconds > 60
-            AND (LENGTH(t.text) * 1.0 / v.duration_seconds) < ?
-          )
-       ORDER BY COALESCE(v.published_at, v.imported_at) DESC`
-    )
-    .all(SUSPICIOUS_CHARS_PER_SEC) as {
-    id: string;
-    title: string;
-    duration_seconds: number | null;
-  }[];
-}
-
-export type TranscriptionJob = {
-  id: number;
-  started_at: number;
-  completed_at: number | null;
-  total: number;
-  done: number;
-  failed: number;
-  cost_cents: number;
-  current_video_id: string | null;
-  status: "running" | "completed" | "failed" | "cancelled";
-  last_error: string | null;
-};
-
-export function getActiveTranscriptionJob(): TranscriptionJob | undefined {
-  return db
-    .prepare(`SELECT * FROM transcription_jobs WHERE status = 'running' ORDER BY id DESC LIMIT 1`)
-    .get() as TranscriptionJob | undefined;
-}
-
-export function getLatestTranscriptionJob(): TranscriptionJob | undefined {
-  return db
-    .prepare(`SELECT * FROM transcription_jobs ORDER BY id DESC LIMIT 1`)
-    .get() as TranscriptionJob | undefined;
-}
-
-export function createTranscriptionJob(total: number): number {
-  const info = db
-    .prepare(`INSERT INTO transcription_jobs (total, status) VALUES (?, 'running')`)
-    .run(total);
-  return info.lastInsertRowid as number;
-}
-
-export function updateTranscriptionJob(
-  id: number,
-  patch: Partial<Omit<TranscriptionJob, "id" | "started_at">>
-): void {
-  const keys = Object.keys(patch) as (keyof typeof patch)[];
-  if (keys.length === 0) return;
-  const setClause = keys.map((k) => `${k} = ?`).join(", ");
-  const values = keys.map((k) => patch[k] as unknown);
-  db.prepare(`UPDATE transcription_jobs SET ${setClause} WHERE id = ?`).run(...values, id);
 }
 
 export function clearLogs(opts: { level?: LogLevel; olderThanSec?: number } = {}): number {

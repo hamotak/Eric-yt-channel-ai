@@ -17,7 +17,6 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/lib/i18n/provider";
 import { cn } from "@/lib/utils";
-import { TranscribeAllBanner } from "@/components/transcribe-all-banner";
 
 type Video = {
   id: string;
@@ -159,8 +158,6 @@ export default function VideosPage() {
         <h1 className="text-2xl font-semibold tracking-tight">{t.videos.title}</h1>
         <p className="mt-1 text-sm text-muted-foreground">{t.videos.subtitle}</p>
       </header>
-
-      <TranscribeAllBanner />
 
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center">
         <div className="relative max-w-md flex-1">

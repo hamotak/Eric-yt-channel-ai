@@ -5,9 +5,7 @@ import {
   Calendar,
   ChevronDown,
   ChevronUp,
-  FileText,
   Hash,
-  Languages,
   Type,
 } from "lucide-react";
 import {
@@ -33,13 +31,6 @@ import { cn } from "@/lib/utils";
  * were removed in Prompt 4.8 Change 4.
  */
 export type ChannelDetailAnalytics = {
-  transcripts: {
-    total: number;
-    withTranscript: number;
-    coveragePct: number;
-    avgChars: number;
-    languages: { lang: string; count: number }[];
-  };
   themes: {
     topTags: { tag: string; count: number }[];
     topTitleWords: { word: string; count: number }[];
@@ -69,11 +60,6 @@ function fmtDate(ts: number | null | undefined): string {
   } catch {
     return "—";
   }
-}
-
-function fmtPct(n: number | null | undefined, digits = 1): string {
-  if (n === null || n === undefined) return "—";
-  return `${n.toFixed(digits)}%`;
 }
 
 export function AboutCard({ channel }: { channel: ChannelDetailChannel }) {
@@ -230,80 +216,6 @@ export function ThemesCard({
   );
 }
 
-export function TranscriptsCoverageCard({
-  analytics,
-}: {
-  analytics: ChannelDetailAnalytics;
-}) {
-  const { t } = useI18n();
-  const tr = analytics.transcripts;
-  const pct = tr.coveragePct;
-  return (
-    <Card className="mb-4">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base">
-          <FileText className="h-4 w-4 text-primary" />
-          {t.channel.transcriptsCoverageTitle}
-        </CardTitle>
-        <CardDescription>{t.channel.transcriptsCoverageDesc}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div>
-          <div className="mb-1 flex items-baseline justify-between">
-            <span className="text-sm">
-              <span className="font-semibold tabular-nums">
-                {tr.withTranscript}
-              </span>
-              <span className="text-muted-foreground"> / {tr.total}</span>
-            </span>
-            <span className="text-sm font-semibold tabular-nums">{fmtPct(pct)}</span>
-          </div>
-          <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
-            <div
-              className={cn(
-                "h-full transition-all",
-                pct >= 80
-                  ? "bg-green-500"
-                  : pct >= 40
-                    ? "bg-amber-500"
-                    : "bg-primary/60"
-              )}
-              style={{ width: `${Math.min(100, pct)}%` }}
-            />
-          </div>
-        </div>
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-          <MiniStat
-            icon={Type}
-            label={t.channel.avgTranscriptLen}
-            value={`${fmt(tr.avgChars)} ${t.channel.charsShort}`}
-          />
-          <MiniStat
-            icon={Languages}
-            label={t.channel.languagesLabel}
-            value={String(tr.languages.length)}
-          />
-        </div>
-        {tr.languages.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {tr.languages.map((l) => (
-              <span
-                key={l.lang}
-                className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs"
-              >
-                <span className="font-mono">{l.lang}</span>
-                <span className="rounded bg-primary/20 px-1 text-[10px] font-mono tabular-nums">
-                  {l.count}
-                </span>
-              </span>
-            ))}
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
 /* ---------------- Shared primitives ---------------- */
 
 function MetaRow({
@@ -336,22 +248,3 @@ function MetaRow({
   );
 }
 
-function MiniStat({
-  icon: Icon,
-  label,
-  value,
-}: {
-  icon?: React.ComponentType<{ className?: string }>;
-  label: string;
-  value: string;
-}) {
-  return (
-    <div className="rounded-md border bg-card p-3">
-      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-        {Icon && <Icon className="h-3 w-3" />}
-        {label}
-      </div>
-      <div className="mt-1 text-base font-semibold tabular-nums">{value}</div>
-    </div>
-  );
-}

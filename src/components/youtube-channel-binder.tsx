@@ -236,7 +236,7 @@ export function YouTubeChannelBinder({ hasKey }: { hasKey: boolean }) {
   const removeChannel = async (id: string, title: string | null) => {
     if (
       !confirm(
-        `Remove channel "${title ?? id}" and all its data (videos, transcripts, comments)?\nThis cannot be undone.`
+        `Remove channel "${title ?? id}" and all its data (videos, comments)?\nThis cannot be undone.`
       )
     ) {
       return;

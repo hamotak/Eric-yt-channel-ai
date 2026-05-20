@@ -4,7 +4,6 @@ import {
   getCommentAnalysis,
   getIntegration,
   getSetting,
-  getTranscript,
   listAllChannels,
   listVideos,
   setSetting,
@@ -15,7 +14,6 @@ import {
   YtAnalyticsError,
   type ChannelAudienceBundle,
 } from "@/lib/yt-analytics";
-import { providerModelId } from "@/lib/ai-provider-types";
 import { extractSection, loadMentorMethod } from "@/lib/mentor-method";
 import { log } from "@/lib/logger";
 
@@ -24,10 +22,12 @@ export const maxDuration = 60;
 
 const RATE_LIMIT_WINDOW_SEC = 5 * 60; // one analyze per channel per 5 min
 
-// v2: single-paragraph channel_description (replaces the prior 5-field
-// proposal). The data-gathering scaffolding (transcripts, demographics,
-// comment summaries) is unchanged; only the output schema + prompt
-// shrinks to one ≤1500-char description.
+// Single-paragraph channel_description — the one source of truth the rest
+// of the app's AI agents read on every job. Signal sources: recent video
+// titles + descriptions + view/like/comment counts, recent comment-analysis
+// summaries (when any), and Studio demographics (when OAuth is connected).
+// Transcripts used to feed this prompt; that backend was removed in the
+// May 2026 simplification pass.
 const DESCRIPTION_CAP = 1500;
 type Proposal = { description: string };
 
@@ -81,34 +81,9 @@ export async function POST(req: Request) {
 
   // Gather signal. listVideos() is channel-scoped via getActiveChannelId
   // internally — but the page can analyze any channel, not just the
-  // active one. We use the SQL pattern in db.ts directly via a generic
-  // listVideos() override is non-trivial; instead, pull the top 10
-  // most-recent videos for THIS channelId via a dedicated SQL helper.
-  //
-  // For simplicity in this round, fall back to listVideos() which uses
-  // the active channel. The page sets the active channel via the picker
-  // before analyzing in normal flow. This means analyzing a non-active
-  // channel will pull the active channel's videos — flag for follow-up.
+  // active one. The page sets the active channel via the picker before
+  // analyzing in normal flow.
   const recentVideos = listVideos({ limit: 10 }).slice(0, 10);
-
-  // 2-3 transcripts that fit ~5K input tokens combined (we use chars as
-  // a rough proxy: ~4 chars / token, target ~20K chars total).
-  const transcriptBudget = 20_000;
-  const transcripts: { videoId: string; title: string; text: string }[] = [];
-  let used = 0;
-  const sortedByLength = [...recentVideos]
-    .map((v) => ({ video: v, transcript: getTranscript(v.id) }))
-    .filter((x) => x.transcript && x.transcript.text.length > 0)
-    .sort((a, b) => (b.transcript?.text.length ?? 0) - (a.transcript?.text.length ?? 0));
-  for (const { video, transcript } of sortedByLength) {
-    if (!transcript) continue;
-    const remaining = transcriptBudget - used;
-    if (remaining < 1500) break;
-    const slice = transcript.text.slice(0, Math.min(transcript.text.length, remaining));
-    transcripts.push({ videoId: video.id, title: video.title, text: slice });
-    used += slice.length;
-    if (transcripts.length >= 3) break;
-  }
 
   // 2-3 comment analyses if available.
   const commentAnalyses: { videoId: string; title: string; summary: string }[] = [];
@@ -129,7 +104,7 @@ export async function POST(req: Request) {
   // Analytics (per-sub-report soft() wrapper), and unexpected throws.
   // When demographics ARE available we inject them as ground truth for
   // the Audience field; when absent the Audience instruction falls back
-  // to the original "infer from titles/transcripts" wording.
+  // to inference from titles + descriptions + comment-analysis summaries.
   let demographicsBlock = "";
   const oauth = getOAuthTokens(channelId);
   if (oauth?.refresh_token) {
@@ -173,7 +148,7 @@ export async function POST(req: Request) {
 
   const audienceLine = demographicsBlock
     ? "Cover audience grounded in the demographics block above as ground truth — top age group, top 2 countries by share. Do not speculate when the data is in front of you."
-    : "Cover audience inferred from titles + transcripts + comment-analysis summaries below — age range, region, what they're looking for.";
+    : "Cover audience inferred from titles + descriptions + comment-analysis summaries below — age range, region, what they're looking for.";
 
   // v2: a single channel_description paragraph (one source of truth that
   // the agent reads on every job). Replaces the prior 5-field proposal.
@@ -201,7 +176,7 @@ export async function POST(req: Request) {
     "- Plain words a 14-year-old reads in <2 seconds. No flowery adjectives.",
     "- 4-7 sentences total. ≤1500 characters. The shorter the better — long fluff dilutes the agent's focus.",
     "- Specific over generic. \"Slow narration, sleep-friendly pacing, no music spikes\" beats \"high production value\".",
-    "- If signal is weak for any part (e.g. small channel with thin transcripts), say what you do know and stop — don't invent.",
+    "- If signal is weak for any part (e.g. small channel with few comments analyzed), say what you do know and stop — don't invent.",
     "",
     "Return ONLY a JSON object. No prose, no markdown, no code fence. Shape:",
     "{ \"description\": string }",
@@ -215,17 +190,11 @@ export async function POST(req: Request) {
     `- Handle: ${channel.handle ?? "(none)"}`,
     `- Subscribers: ${channel.subscriber_count ?? "unknown"}`,
     "",
-    `# Recent ${recentVideos.length} video titles + descriptions`,
+    `# Recent ${recentVideos.length} videos (title — views/likes/comments — description excerpt)`,
     ...recentVideos.map((v, i) => {
-      const desc = (v.description ?? "").slice(0, 400);
-      return `${i + 1}. ${v.title}${desc ? ` — ${desc.replace(/\s+/g, " ").trim()}` : ""}`;
-    }),
-    "",
-    transcripts.length > 0
-      ? `# Sample transcripts (${transcripts.length}, truncated)`
-      : "",
-    ...transcripts.map((t) => {
-      return [`## "${t.title}"`, t.text].join("\n");
+      const desc = (v.description ?? "").slice(0, 400).replace(/\s+/g, " ").trim();
+      const stats = `${v.views ?? 0}v / ${v.likes ?? 0}l / ${v.comments ?? 0}c`;
+      return `${i + 1}. ${v.title} — ${stats}${desc ? ` — ${desc}` : ""}`;
     }),
     commentAnalyses.length > 0
       ? `\n# Recent comment-analysis summaries (${commentAnalyses.length})`
@@ -240,7 +209,7 @@ export async function POST(req: Request) {
   let proposal: Proposal | null = null;
   try {
     const resp = await client.messages.create({
-      model: providerModelId("claude"),
+      model: "claude-sonnet-4-6",
       // v2: single description paragraph ≤1500 chars ≈ ~400 tokens out.
       // 1200 max_tokens gives headroom for the JSON wrapper + thinking
       // room. Slightly tighter temperature than the prior 5-field call

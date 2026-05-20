@@ -1,16 +1,12 @@
 import {
-  getActiveTranscriptionJob,
   getIntegration,
   getSetting,
-  getTranscript,
   setActiveChannelId,
   setSetting,
   upsertChannel,
-  upsertTranscript,
   upsertVideo,
 } from "@/lib/db";
 import {
-  fetchTranscriptFree,
   fetchVideos,
   listUploadIds,
   resolveChannel,
@@ -47,32 +43,15 @@ export async function POST(req: Request) {
     );
   }
 
-  // Refuse to sync while a transcription batch is running. Concurrent
-  // writes (sync upserting videos / transcripts and the batch writing
-  // transcripts for the same rows) historically tripped SQLite's
-  // "database disk image is malformed" error. Easier to block than to
-  // orchestrate cancellation.
-  const activeJob = getActiveTranscriptionJob();
-  if (activeJob) {
-    return Response.json(
-      {
-        error:
-          "A transcription batch is currently running — wait for it to finish (or cancel it from /videos) before switching or re-syncing the channel.",
-        jobId: activeJob.id,
-      },
-      { status: 409 }
-    );
-  }
-
   const max = Math.min(5000, Math.max(1, body.max ?? 1000));
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const send = (event: object) => controller.enqueue(encodeSSE(event));
       const startedAt = Date.now();
-      // Raise a flag that `POST /api/deepgram/transcribe-batch` checks
-      // before it starts — mirror of the job-in-progress check that sync
-      // already respects. Cleared in `finally`.
+      // Marks that a sync is in flight. Cleared in `finally`. Kept around
+      // because other background jobs may want to check it before
+      // touching shared video rows.
       setSetting("sync.inProgress", "1");
       log.info("sync", "Sync started", { input, max });
       try {
@@ -82,9 +61,9 @@ export async function POST(req: Request) {
         // Multi-channel: we *append* this channel rather than purging the
         // previous one. The user may legitimately want analytics for several
         // channels at once and switch between them via the channel switcher.
-        // Every query that consumes `videos` / `transcripts` / `comments` is
-        // already scoped through `getActiveChannelId()`, so cross-channel
-        // bleed isn't possible.
+        // Every query that consumes `videos` / `comments` is already
+        // scoped through `getActiveChannelId()`, so cross-channel bleed
+        // isn't possible.
         const previousChannelId = getSetting("youtube.channelId");
         const newBinding = previousChannelId !== ch.id;
         if (newBinding) {
@@ -155,47 +134,15 @@ export async function POST(req: Request) {
           saved++;
         }
 
-        // Phase 4: auto-fetch transcripts (free path, serial with small delay to avoid throttling)
-        send({ type: "status", step: "transcripts", message: "Fetching transcripts…" });
-        let transcriptsSaved = 0;
-        let transcriptsFailed = 0;
-        for (let i = 0; i < videos.length; i++) {
-          const v = videos[i];
-          if (getTranscript(v.id)) continue; // skip already cached
-          try {
-            const t = await fetchTranscriptFree(v.id);
-            if (t) {
-              upsertTranscript(v.id, t.text, t.language);
-              transcriptsSaved++;
-            } else {
-              transcriptsFailed++;
-            }
-          } catch {
-            transcriptsFailed++;
-          }
-          if (i % 5 === 0) {
-            send({
-              type: "progress",
-              phase: "transcripts",
-              count: transcriptsSaved,
-              total: videos.length,
-            });
-          }
-          // Gentle pacing
-          await new Promise((r) => setTimeout(r, 150));
-        }
-
         send({
           type: "done",
           saved,
           total: ids.length,
-          transcripts: { saved: transcriptsSaved, failed: transcriptsFailed },
         });
         log.info("sync", "Sync completed", {
           channelId: ch.id,
           videosSaved: saved,
           idsListed: ids.length,
-          transcripts: { saved: transcriptsSaved, failed: transcriptsFailed },
           durationMs: Date.now() - startedAt,
         });
       } catch (err) {

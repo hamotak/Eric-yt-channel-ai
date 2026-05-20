@@ -7,7 +7,6 @@ import {
   listCompetitorVideos,
   setCompetitorSimilarityScore,
 } from "./db";
-import { providerModelId } from "./ai-provider-types";
 import { extractSection, loadMentorMethod } from "./mentor-method";
 import { log } from "./logger";
 
@@ -122,7 +121,7 @@ export async function scoreCompetitorSimilarity(
     ...videos.map((v) => `  - ${v.title}`),
   ].join("\n");
 
-  const model = providerModelId("claude");
+  const model = "claude-sonnet-4-6";
   let score = 0;
   let reasoning = "";
   try {

@@ -9,8 +9,8 @@ import "server-only";
  *
  * We store costs in MILLI-cents (1/1000 of a cent) to avoid rounding
  * away sub-cent turns — at Sonnet input rates a 1K-token call costs
- * $0.003 = 0.3 cents = 300 millicents, which rounds to 0 cents in
- * the naive "cost_cents" scheme used for Deepgram.
+ * $0.003 = 0.3 cents = 300 millicents, which would round to 0 cents in
+ * a naive integer-cents scheme.
  */
 
 type ModelRates = {

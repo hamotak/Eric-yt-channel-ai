@@ -8,12 +8,10 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { useI18n } from "@/lib/i18n/provider";
 import { YouTubeChannelBinder } from "@/components/youtube-channel-binder";
-import { YouTubeCookies } from "@/components/youtube-cookies";
 import { GoogleOAuthConnector } from "@/components/google-oauth-connector";
 import { ClaudeUsage } from "@/components/claude-usage";
-import { DeepgramUsage } from "@/components/deepgram-usage";
 
-type Name = "claude" | "deepgram" | "exa" | "youtube" | "google_gemini";
+type Name = "claude" | "youtube";
 
 type StatusMap = Record<
   Name,
@@ -60,45 +58,6 @@ export default function IntegrationsPage() {
         steps: t.integrations.claude.helpSteps,
         link: t.integrations.claude.helpLink,
         linkLabel: t.integrations.claude.helpLinkLabel,
-      },
-    },
-    {
-      name: "deepgram",
-      label: t.integrations.deepgram.name,
-      desc: t.integrations.deepgram.desc,
-      placeholder: t.integrations.deepgram.placeholder,
-      mode: "key",
-      help: {
-        title: t.integrations.deepgram.helpTitle,
-        steps: t.integrations.deepgram.helpSteps,
-        link: t.integrations.deepgram.helpLink,
-        linkLabel: t.integrations.deepgram.helpLinkLabel,
-      },
-    },
-    {
-      name: "google_gemini",
-      label: t.integrations.gemini.name,
-      desc: t.integrations.gemini.desc,
-      placeholder: t.integrations.gemini.placeholder,
-      mode: "key",
-      help: {
-        title: t.integrations.gemini.helpTitle,
-        steps: t.integrations.gemini.helpSteps,
-        link: t.integrations.gemini.helpLink,
-        linkLabel: t.integrations.gemini.helpLinkLabel,
-      },
-    },
-    {
-      name: "exa",
-      label: t.integrations.exa.name,
-      desc: t.integrations.exa.desc,
-      placeholder: t.integrations.exa.placeholder,
-      mode: "key",
-      help: {
-        title: t.integrations.exa.helpTitle,
-        steps: t.integrations.exa.helpSteps,
-        link: t.integrations.exa.helpLink,
-        linkLabel: t.integrations.exa.helpLinkLabel,
       },
     },
     {
@@ -285,11 +244,9 @@ function IntegrationCard({
         {name === "youtube" && (
           <>
             <YouTubeChannelBinder hasKey={!!status?.hasKey} />
-            <YouTubeCookies />
           </>
         )}
         {name === "claude" && <ClaudeUsage enabled={!!status?.hasKey} />}
-        {name === "deepgram" && <DeepgramUsage enabled={!!status?.hasKey} />}
       </CardContent>
     </Card>
   );
