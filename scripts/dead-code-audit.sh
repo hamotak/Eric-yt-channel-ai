@@ -24,7 +24,14 @@ $FIND $SRC/lib -type f -name '*.ts' -print0 | while IFS= read -r -d '' f; do
   rel=${f#$SRC/lib/}
   rel_noext=${rel%.ts}
   base=$($BASENAME "$f" .ts)
-  count=$($GREP -rlE "from ['\"]@/lib/${rel_noext}['\"]|from ['\"]\\./${base}['\"]|from ['\"]\\.\\./lib/${rel_noext}['\"]|from ['\"]\\./lib/${rel_noext}['\"]|require\\(['\"]@/lib/${rel_noext}['\"]\\)" $SRC scripts 2>/dev/null \
+  # Five forms of import we need to catch:
+  #   from "@/lib/<rel>"           (absolute alias)
+  #   from "./<base>"              (sibling)
+  #   from "../<base>"             (parent sibling — common for nested dirs
+  #                                  like src/lib/ideate/* importing ../foo)
+  #   from "../lib/<rel>"          (cross-tree)
+  #   from "./lib/<rel>"           (occasionally seen)
+  count=$($GREP -rlE "from ['\"]@/lib/${rel_noext}['\"]|from ['\"]\\./${base}['\"]|from ['\"]\\.\\./${base}['\"]|from ['\"]\\.\\./lib/${rel_noext}['\"]|from ['\"]\\./lib/${rel_noext}['\"]|require\\(['\"]@/lib/${rel_noext}['\"]\\)" $SRC scripts 2>/dev/null \
     | $GREP -v node_modules \
     | $GREP -v "^$f$" \
     | $WC -l | $TR -d ' ')

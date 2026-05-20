@@ -10,11 +10,12 @@ Workaround: prefix `npm run dev` with `DATA_DIR=/Users/hamidaliyev/Eric-yt-chann
 
 Proper fix: extend findProjectRoot() to verify the resolved root actually contains the expected sibling files (next.config.*, src/lib/db.ts, src/app/) and refuse to open a DB at a path that fails that check. Fail loud with an error message pointing to the DATA_DIR override. Optionally add a startup check that compares the resolved root against a stored canonical path (e.g. .project-root marker file written on first init).
 
-## FIX-K — Investigate Tier 3 audit candidates
+## FIX-K — Investigate Tier 3 audit candidates (RESOLVED 2026-05-21)
 
-Two candidates flagged in the PRIO-11 dead-code audit need deeper investigation before removal:
+Three sub-tasks, all closed:
 
-- Competitor sync/alerts routes: some may be hit by the sync-queued worker (itself orphan-flagged but may be polled from elsewhere). Need to trace the polling path before deciding.
-- claude-pricing.ts: verify db.ts cost-tracking still works without it before deleting. Run a generation, confirm the $cost field in the generations table is still populated.
+- ✓ `/api/competitors/sync-queued` — **alive**, called from `/api/competitors/[id]/sync/route.ts:32` via a fire-and-forget `fetch`. The audit's flag was a false negative from the earlier `[id]→empty` regex bug, fixed in the audit-script patch shipped with PRIO-11.
+- ✓ `src/lib/claude-pricing.ts` — **alive**, `costMillicents` is imported by `src/lib/ideate/pipeline.ts:10` via `from "../claude-pricing"`. Audit didn't catch parent-sibling (`../foo`) relative imports — that hole is now patched in `scripts/dead-code-audit.sh`.
+- ✓ Chat-session helpers in `src/lib/db.ts` — all 14 symbols (3 types + 11 functions) had zero non-self callers; ~246 lines deleted. `chat_sessions` and `chat_messages` CREATE TABLE blocks deleted; the existing module-init `DROP TABLE IF EXISTS` cleans residual data on next boot.
 
-Resolve as a focused 30-min audit in a future session.
+Only outstanding minor item: `formatUsdFromMillicents` is exported from `claude-pricing.ts` with zero callers. Dead export inside an otherwise live file. Not worth a follow-up ticket — pick up incidentally.
