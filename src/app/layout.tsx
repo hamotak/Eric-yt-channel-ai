@@ -4,6 +4,7 @@ import { I18nProvider } from "@/lib/i18n/provider";
 import { ThemeProvider } from "@/lib/theme-provider";
 import { Sidebar } from "@/components/sidebar";
 import { Topbar } from "@/components/topbar";
+import { SilentVideoSync } from "@/components/silent-video-sync";
 
 export const metadata: Metadata = {
   title: "YT Channel AI",
@@ -18,6 +19,7 @@ export default function RootLayout({
       <body>
         <ThemeProvider>
           <I18nProvider>
+            <SilentVideoSync />
             <div className="flex h-screen overflow-hidden">
               <Sidebar />
               <div className="flex flex-1 flex-col overflow-hidden">

@@ -1145,6 +1145,21 @@ export function listAllChannels(): Channel[] {
     .all() as Channel[];
 }
 
+/** Read the ISO-8601 timestamp of the last silent video sync for a channel,
+ * or null if never synced. Drives the 15-minute throttle in
+ * /api/sync/user-videos. */
+export function getLastUserVideosSyncAt(channelId: string): string | null {
+  const row = db
+    .prepare(`SELECT last_user_videos_sync_at FROM channels WHERE id = ?`)
+    .get(channelId) as { last_user_videos_sync_at: string | null } | undefined;
+  return row?.last_user_videos_sync_at ?? null;
+}
+
+export function setLastUserVideosSyncAt(channelId: string, iso: string): void {
+  db.prepare(`UPDATE channels SET last_user_videos_sync_at = ? WHERE id = ?`)
+    .run(iso, channelId);
+}
+
 /**
  * Active channel id — the one user-facing screens scope to. Single source
  * of truth for "which channel are we currently looking at". Persisted in
@@ -4453,13 +4468,19 @@ export function upsertCommentAnalysis(a: CommentAnalysis): void {
  *   competitors.note        — per-competitor free-form note shown on card
  * ============================================================ */
 
-// ALTER channels: add banned_topics. Idempotent via PRAGMA guard.
+// ALTER channels: add banned_topics + last_user_videos_sync_at. Idempotent
+// via PRAGMA guard. last_user_videos_sync_at stores an ISO-8601 string
+// (or NULL when never synced) — used by /api/sync/user-videos to gate
+// fresh YT pulls at 15-minute granularity per channel.
 try {
   const cols = db
     .prepare(`PRAGMA table_info(channels)`)
     .all() as { name: string }[];
   if (!cols.some((c) => c.name === "banned_topics")) {
     db.exec(`ALTER TABLE channels ADD COLUMN banned_topics TEXT`);
+  }
+  if (!cols.some((c) => c.name === "last_user_videos_sync_at")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN last_user_videos_sync_at TEXT`);
   }
 } catch {
   /* noop */

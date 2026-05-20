@@ -136,6 +136,13 @@ export function ChannelSwitcher() {
         body: JSON.stringify({ id }),
       });
       if (res.ok) {
+        // Kick the silent freshness pass for the newly-active channel
+        // before navigating. keepalive lets the request survive the
+        // upcoming reload; the server enforces a 15-minute throttle.
+        fetch("/api/sync/user-videos", {
+          method: "POST",
+          keepalive: true,
+        }).catch(() => {});
         // Hard reload — server components on every page read the active
         // channel during render. SWR-style soft invalidation isn't enough.
         window.location.reload();

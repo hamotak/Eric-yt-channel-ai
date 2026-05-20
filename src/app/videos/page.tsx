@@ -105,6 +105,33 @@ export default function VideosPage() {
     };
   }, [q, sort, duration]);
 
+  // One-shot refetch 5s after mount. The root layout kicks a silent
+  // freshness pass against the YT API as soon as the app opens; by the
+  // time it lands and upserts new rows the user has typically already
+  // arrived here. Refetching once picks up any new uploads without
+  // setting up a polling loop. No UI signal — fully silent.
+  useEffect(() => {
+    const ctrl = new AbortController();
+    const id = setTimeout(() => {
+      const url = new URL("/api/videos", window.location.origin);
+      if (q.trim()) url.searchParams.set("search", q.trim());
+      url.searchParams.set("sort", sort);
+      url.searchParams.set("duration", duration);
+      url.searchParams.set("limit", "200");
+      fetch(url, { signal: ctrl.signal })
+        .then((r) => r.json())
+        .then((d) => setVideos(d.videos ?? []))
+        .catch(() => {});
+    }, 5000);
+    return () => {
+      ctrl.abort();
+      clearTimeout(id);
+    };
+    // Intentionally empty deps — runs exactly once on mount. The primary
+    // useEffect above handles all filter changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const sortOptions: { value: Sort; label: string }[] = useMemo(
     () => [
       { value: "recent", label: t.videos.sort.recent },
