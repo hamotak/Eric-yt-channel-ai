@@ -11,8 +11,6 @@ import {
   Plus,
   Trash2,
   Tv,
-  KeyRound,
-  LogOut,
   Settings,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -73,21 +71,6 @@ export function YouTubeChannelBinder({ hasKey }: { hasKey: boolean }) {
   const [boundChannels, setBoundChannels] = useState<BoundChannel[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [pendingChannelId, setPendingChannelId] = useState<string | null>(null);
-  // Per-channel OAuth status: { [channelId]: { connected, perChannel, refreshTokenAgeDays } }
-  // refreshTokenAgeDays is critical for test-mode setups where each channel
-  // is connected via its own un-verified Google Cloud OAuth client — those
-  // refresh tokens expire after 7 days, so we surface "needs re-login"
-  // hints per row instead of only at the bottom of the OAuth panel.
-  const [oauthByChannel, setOauthByChannel] = useState<
-    Record<
-      string,
-      {
-        connected: boolean;
-        perChannel: boolean;
-        refreshTokenAgeDays: number | null;
-      }
-    >
-  >({});
   // Filter input for the connected-channels list. With 20+ channels the
   // list becomes scroll-heavy; a simple substring search saves a lot of
   // scrolling for users who actually know the channel name.
@@ -104,41 +87,13 @@ export function YouTubeChannelBinder({ hasKey }: { hasKey: boolean }) {
 
   const loadBound = useCallback(async () => {
     try {
-      const [chRes, oauthRes] = await Promise.all([
-        fetch("/api/channels", { cache: "no-store" }),
-        fetch("/api/youtube/oauth/status", { cache: "no-store" }),
-      ]);
+      const chRes = await fetch("/api/channels", { cache: "no-store" });
       const data = (await chRes.json()) as {
         channels: BoundChannel[];
         activeId: string | null;
       };
       setBoundChannels(data.channels);
       setActiveId(data.activeId);
-
-      const oauth = (await oauthRes.json()) as {
-        channels?: {
-          channelId: string;
-          connected: boolean;
-          perChannel: boolean;
-          refreshTokenAgeDays: number | null;
-        }[];
-      };
-      const map: Record<
-        string,
-        {
-          connected: boolean;
-          perChannel: boolean;
-          refreshTokenAgeDays: number | null;
-        }
-      > = {};
-      for (const c of oauth.channels ?? []) {
-        map[c.channelId] = {
-          connected: c.connected,
-          perChannel: c.perChannel,
-          refreshTokenAgeDays: c.refreshTokenAgeDays ?? null,
-        };
-      }
-      setOauthByChannel(map);
     } catch {
       /* ignore */
     }
@@ -158,76 +113,6 @@ export function YouTubeChannelBinder({ hasKey }: { hasKey: boolean }) {
       });
       // Hard refresh — every page renders against the active channel.
       window.location.reload();
-    } finally {
-      setPendingChannelId(null);
-    }
-  };
-
-  const connectGoogle = (id: string) => {
-    // Redirect-style flow — Google sends the user back to /integrations
-    // with ?oauth=connected after the handshake completes.
-    window.location.href = `/api/youtube/oauth/start?channelId=${encodeURIComponent(id)}`;
-  };
-
-  const disconnectGoogle = async (id: string, title: string | null) => {
-    if (
-      !confirm(
-        `Disconnect Google for "${title ?? id}"?\nAnalytics for this channel will stop loading until you reconnect.`
-      )
-    ) {
-      return;
-    }
-    setPendingChannelId(id);
-    try {
-      await fetch(`/api/youtube/oauth/disconnect?channelId=${encodeURIComponent(id)}`, {
-        method: "POST",
-      });
-      await loadBound();
-    } finally {
-      setPendingChannelId(null);
-    }
-  };
-
-  const verifyOAuth = async (id: string, title: string | null) => {
-    setPendingChannelId(id);
-    try {
-      const res = await fetch(
-        `/api/youtube/oauth/diagnose?channelId=${encodeURIComponent(id)}`,
-        { cache: "no-store" }
-      );
-      const data = (await res.json()) as {
-        diagnosis?: string;
-        email?: string | null;
-        hasMonetaryScope?: boolean;
-        ownsTargetChannel?: boolean;
-        ownedChannels?: { id: string; title: string }[];
-        message?: string;
-      };
-      const lines: string[] = [];
-      lines.push(`Diagnosis for "${title ?? id}":`);
-      lines.push("");
-      lines.push(data.diagnosis ?? data.message ?? "(no diagnosis returned)");
-      if (data.email) lines.push(`\nAuthorized as: ${data.email}`);
-      if (typeof data.hasMonetaryScope === "boolean") {
-        lines.push(
-          `Monetary scope granted: ${data.hasMonetaryScope ? "yes" : "no"}`
-        );
-      }
-      if (typeof data.ownsTargetChannel === "boolean") {
-        lines.push(
-          `Account owns this channel (Owner-tier): ${data.ownsTargetChannel ? "yes" : "no"}`
-        );
-      }
-      if (data.ownedChannels && data.ownedChannels.length) {
-        lines.push(
-          `\nOwned channels under this account:\n${data.ownedChannels
-            .map((c) => `  - ${c.title} (${c.id})`)
-            .join("\n")}`
-        );
-      }
-      alert(lines.join("\n"));
-    } catch (e) {
-      alert(`Diagnose call failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setPendingChannelId(null);
     }
@@ -441,38 +326,6 @@ export function YouTubeChannelBinder({ hasKey }: { hasKey: boolean }) {
                         ))}
                       </div>
                     )}
-                    {/* Per-channel OAuth status / hint */}
-                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px]">
-                      {oauthByChannel[c.id]?.connected ? (
-                        oauthByChannel[c.id]?.perChannel ? (
-                          <>
-                            <span className="text-green-600 dark:text-green-400">
-                              ✓ Dedicated Google account connected
-                            </span>
-                            <TokenAgeChip
-                              ageDays={
-                                oauthByChannel[c.id]?.refreshTokenAgeDays ?? null
-                              }
-                            />
-                          </>
-                        ) : (
-                          <span
-                            className="text-amber-600 dark:text-amber-400"
-                            title="This channel is currently using whichever Google account you last authorised. If that account doesn't own this YouTube channel, analytics will 403. Click 'Google' on the right to sign in with the right account for this channel specifically."
-                          >
-                            ⚠ Using the global Google account — click{" "}
-                            <span className="font-medium">Google</span> on the
-                            right to sign in with a dedicated account for this
-                            channel
-                          </span>
-                        )
-                      ) : (
-                        <span className="text-muted-foreground">
-                          Google not connected — click{" "}
-                          <span className="font-medium">Google</span> on the right
-                        </span>
-                      )}
-                    </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-1">
                     {!isActive && (
@@ -489,46 +342,6 @@ export function YouTubeChannelBinder({ hasKey }: { hasKey: boolean }) {
                         ) : (
                           "Switch"
                         )}
-                      </Button>
-                    )}
-                    {/* Per-channel Google OAuth */}
-                    {oauthByChannel[c.id]?.connected && oauthByChannel[c.id]?.perChannel ? (
-                      <>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => verifyOAuth(c.id, c.title)}
-                          disabled={pending || busy}
-                          className="h-7 px-2 text-[11px]"
-                          title="Verify which Google account is connected and which channels it owns"
-                        >
-                          Verify
-                        </Button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => disconnectGoogle(c.id, c.title)}
-                          disabled={pending || busy}
-                          className="h-7 px-2 text-[11px] text-amber-600"
-                          title="Disconnect Google for this channel"
-                        >
-                          <LogOut className="h-3 w-3" />
-                        </Button>
-                      </>
-                    ) : (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        onClick={() => connectGoogle(c.id)}
-                        disabled={pending || busy}
-                        className="h-7 gap-1 px-2 text-[11px]"
-                        title="Connect a dedicated Google account for this channel"
-                      >
-                        <KeyRound className="h-3 w-3" />
-                        Google
                       </Button>
                     )}
                     <Button
@@ -670,59 +483,6 @@ export function YouTubeChannelBinder({ hasKey }: { hasKey: boolean }) {
         </div>
       )}
     </div>
-  );
-}
-
-/**
- * Tiny status pill showing how old the channel's Google refresh token is.
- *
- * Why this matters: in Google Cloud "Testing" mode (which everyone is on
- * until they verify their app — and Luka uses a separate Cloud project
- * per channel by design, so verification isn't realistic), refresh
- * tokens silently expire after 7 days. Once that happens analytics
- * starts 403'ing and the user has no idea why until they scroll down to
- * the bottom of /integrations and see the "Active Google session"
- * panel.
- *
- * The chip surfaces that info per row so the user can spot which
- * channels are about to die before they actually do:
- *   0-3 days  → silent (fresh, nothing to do)
- *   4-5 days  → amber "Xd old" — re-login soon-ish
- *   6+ days   → red "Xd old, re-login" — about to expire / already dead
- *
- * `ageDays` is the value returned by getStatus().refreshTokenAgeDays —
- * which is null when the token was issued before we started tracking
- * issuedAt. In that case we just skip the chip rather than guess.
- */
-function TokenAgeChip({ ageDays }: { ageDays: number | null }) {
-  if (ageDays === null || ageDays < 0) return null;
-  if (ageDays <= 3) {
-    return (
-      <span
-        className="text-muted-foreground"
-        title={`Google refresh token issued ${ageDays}d ago. Test-mode tokens expire after 7d.`}
-      >
-        · token {ageDays}d
-      </span>
-    );
-  }
-  if (ageDays <= 5) {
-    return (
-      <span
-        className="inline-flex items-center gap-0.5 rounded bg-amber-500/15 px-1.5 py-0.5 font-medium text-amber-700 dark:text-amber-400"
-        title="Google test-mode refresh tokens expire after 7 days. Re-login soon to avoid 403s."
-      >
-        ⚠ token {ageDays}d — re-login soon
-      </span>
-    );
-  }
-  return (
-    <span
-      className="inline-flex items-center gap-0.5 rounded bg-red-500/15 px-1.5 py-0.5 font-medium text-red-700 dark:text-red-400"
-      title="Google test-mode refresh tokens expire after 7 days. This token is at or past the expiry — analytics will 403 until you re-login."
-    >
-      ✗ token {ageDays}d — re-login required
-    </span>
   );
 }
 

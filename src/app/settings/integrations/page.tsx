@@ -8,14 +8,13 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { useI18n } from "@/lib/i18n/provider";
 import { YouTubeChannelBinder } from "@/components/youtube-channel-binder";
-import { GoogleOAuthConnector } from "@/components/google-oauth-connector";
 import { ClaudeUsage } from "@/components/claude-usage";
 
-type Name = "claude" | "youtube";
+type Name = "claude" | "youtube" | "brave";
 
 type StatusMap = Record<
   Name,
-  { hasKey: boolean; masked: string; enabled: boolean }
+  { hasKey: boolean; masked: string; enabled: boolean; config?: { source?: string | null } }
 >;
 
 export default function IntegrationsPage() {
@@ -73,6 +72,23 @@ export default function IntegrationsPage() {
         linkLabel: t.integrations.youtube.helpLinkLabel,
       },
     },
+    {
+      name: "brave",
+      label: "Brave Search",
+      desc: "Reddit Web Signals via Brave Search for Auto and Reddit Angles.",
+      placeholder: "BSA...",
+      mode: "key",
+      help: {
+        title: "How to get a Brave Search API key",
+        steps: [
+          "Open Brave Search API and sign in.",
+          "Create or select a Search API plan.",
+          "Copy the generated API key and paste it here.",
+        ],
+        link: "https://brave.com/search/api/",
+        linkLabel: "Open Brave Search API",
+      },
+    },
   ];
 
   return (
@@ -96,7 +112,6 @@ export default function IntegrationsPage() {
             onSaved={load}
           />
         ))}
-        <GoogleOAuthConnector />
       </div>
     </div>
   );
@@ -118,7 +133,7 @@ function IntegrationCard({
   placeholder: string;
   mode: "key" | "oauth";
   help: { title: string; steps: string[]; link: string; linkLabel: string };
-  status?: { hasKey: boolean; masked: string; enabled: boolean };
+  status?: { hasKey: boolean; masked: string; enabled: boolean; config?: { source?: string | null } };
   onSaved: () => void;
 }) {
   const { t } = useI18n();
@@ -197,47 +212,50 @@ function IntegrationCard({
           </div>
         ) : (
           <>
-        {connected && (
-          <div className="text-xs text-muted-foreground">
-            <span className="font-mono">{status?.masked}</span>
-          </div>
-        )}
-        <div className="space-y-2">
-          <Label htmlFor={`key-${name}`}>API key</Label>
-          <div className="flex gap-2">
-            <div className="relative flex-1">
-              <Input
-                id={`key-${name}`}
-                type={show ? "text" : "password"}
-                placeholder={placeholder}
-                value={value}
-                onChange={(e) => setValue(e.target.value)}
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <button
-                type="button"
-                onClick={() => setShow((s) => !s)}
-                className="absolute inset-y-0 right-2 flex items-center text-muted-foreground hover:text-foreground"
-                aria-label={show ? t.integrations.hideKey : t.integrations.showKey}
-              >
-                {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-              </button>
+            {connected && (
+              <div className="text-xs text-muted-foreground">
+                <span className="font-mono">{status?.masked}</span>
+                {name === "brave" && status?.config?.source === "env" && (
+                  <span className="ml-2">from .env</span>
+                )}
+              </div>
+            )}
+            <div className="space-y-2">
+              <Label htmlFor={`key-${name}`}>API key</Label>
+              <div className="flex gap-2">
+                <div className="relative flex-1">
+                  <Input
+                    id={`key-${name}`}
+                    type={show ? "text" : "password"}
+                    placeholder={placeholder}
+                    value={value}
+                    onChange={(e) => setValue(e.target.value)}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShow((s) => !s)}
+                    className="absolute inset-y-0 right-2 flex items-center text-muted-foreground hover:text-foreground"
+                    aria-label={show ? t.integrations.hideKey : t.integrations.showKey}
+                  >
+                    {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
+                <Button onClick={save} disabled={saving || !value.trim()}>
+                  {saving ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : justSaved ? (
+                    <>
+                      <Check className="h-4 w-4" />
+                      {t.integrations.saved}
+                    </>
+                  ) : (
+                    t.integrations.save
+                  )}
+                </Button>
+              </div>
             </div>
-            <Button onClick={save} disabled={saving || !value.trim()}>
-              {saving ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : justSaved ? (
-                <>
-                  <Check className="h-4 w-4" />
-                  {t.integrations.saved}
-                </>
-              ) : (
-                t.integrations.save
-              )}
-            </Button>
-          </div>
-        </div>
           </>
         )}
 

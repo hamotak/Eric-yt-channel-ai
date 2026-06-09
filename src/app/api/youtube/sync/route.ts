@@ -13,6 +13,7 @@ import {
   YouTubeApiError,
 } from "@/lib/youtube";
 import { log } from "@/lib/logger";
+import { fallbackYouTubeThumbnailUrl } from "@/lib/youtube-thumbnail";
 
 export const runtime = "nodejs";
 
@@ -129,7 +130,7 @@ export async function POST(req: Request) {
             views: v.views,
             likes: v.likes,
             comments: v.comments,
-            thumbnail_url: v.thumbnail,
+            thumbnail_url: v.thumbnail ?? fallbackYouTubeThumbnailUrl(v.id),
             tags: v.tags.length ? JSON.stringify(v.tags) : null,
           });
           saved++;

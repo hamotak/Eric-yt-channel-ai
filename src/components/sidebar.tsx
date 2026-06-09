@@ -4,8 +4,6 @@ import { Fragment, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  LayoutDashboard,
-  Video,
   Settings,
   PlaySquare,
   Search,
@@ -129,7 +127,7 @@ export function Sidebar() {
   type NavItem = {
     href: string;
     label: string;
-    icon: typeof LayoutDashboard;
+    icon: typeof Sparkles;
     badge?: number;
   };
   type NavSection = {
@@ -141,9 +139,6 @@ export function Sidebar() {
   };
   const sections: NavSection[] = [
     {
-      items: [{ href: "/", label: t.nav.dashboard, icon: LayoutDashboard }],
-    },
-    {
       label: "CREATE",
       items: [{ href: "/ideate", label: "Ideate", icon: Sparkles }],
     },
@@ -151,7 +146,6 @@ export function Sidebar() {
       label: "CHANNEL",
       items: [
         { href: "/channel-info", label: "Channel Info", icon: Users },
-        { href: "/videos", label: t.nav.videos, icon: Video },
         { href: "/competitors", label: "Competitors", icon: Search },
       ],
     },

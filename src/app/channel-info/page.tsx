@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import { Check, Loader2, Sparkles, X } from "lucide-react";
+import { Check, Loader2, RefreshCw, Sparkles, X } from "lucide-react";
 import {
   Card,
   CardContent,
@@ -11,16 +11,14 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { ChannelAudience } from "@/components/channel-audience";
-import { ChannelRevenue } from "@/components/channel-revenue";
-import { MetaCard } from "@/components/channel-detail-widgets";
-import { ContentThemesCard } from "@/components/content-themes-card";
 import {
   BannedTopicsEditor,
   DescriptionEditor,
   IdeationRulesEditor,
+  RedditSourcesEditor,
 } from "@/components/agent-brain-editors";
 import { LearnedRulesPanel } from "@/components/learned-rules-panel";
+import { YouTubeThumbnail } from "@/components/youtube-thumbnail";
 
 // Wire shape for the redesigned 2-field model. Legacy fields preserved
 // so older clients reading the GET response don't break; the page no
@@ -36,12 +34,24 @@ type ChannelContext = {
   channelDescription: string;
   ideationRules: string;
   bannedTopics: string;
+  redditSources: string;
   // Legacy — kept for type completeness, never rendered.
   niche: string;
   positioning: string;
   audience: string;
   voice: string;
   externalSources: string;
+};
+
+type ChannelVideo = {
+  id: string;
+  title: string;
+  views: number | null;
+  likes: number | null;
+  comments: number | null;
+  published_at: number | null;
+  duration_seconds: number | null;
+  thumbnail_url: string | null;
 };
 
 // v2 cache key — flips when the proposal shape went from {niche,…} to
@@ -177,14 +187,6 @@ function SingleChannelCard({
     return () => window.clearTimeout(id);
   }, [savedToast]);
 
-  const detailChannel = {
-    id: channel.channelId,
-    title: channel.title,
-    handle: channel.handle,
-    description: null, // /api/channel-info doesn't include description today
-    imported_at: 0,
-  };
-
   const initial = (channel.title ?? channel.handle ?? "?").slice(0, 1).toUpperCase();
 
   const cacheKey = `analyze_ai_${ANALYZE_CACHE_VERSION}.cache.${channel.channelId}`;
@@ -298,7 +300,7 @@ function SingleChannelCard({
   // server-side so derived state (e.g. analytics widget channel info)
   // stays in sync.
   const handleFieldSaved = useCallback(
-    (field: "channelDescription" | "ideationRules" | "bannedTopics", value: string) => {
+    (field: "channelDescription" | "ideationRules" | "bannedTopics" | "redditSources", value: string) => {
       const next: ChannelContext = { ...channel, [field]: value };
       onUpdated(next);
       setSavedToast("Saved — the agent will use this on the next message.");
@@ -407,8 +409,23 @@ function SingleChannelCard({
               onSaved={(v) => handleFieldSaved("ideationRules", v)}
             />
           </div>
+          <div>
+            <div className="mb-1 flex items-baseline justify-between gap-2">
+              <h3 className="text-sm font-semibold">Reddit sources</h3>
+            </div>
+            <p className="mb-2 text-xs text-muted-foreground">
+              One subreddit per line. Auto and Reddit Angles use Brave Search to find dated web signals from these communities.
+            </p>
+            <RedditSourcesEditor
+              channelId={channel.channelId}
+              initialValue={channel.redditSources}
+              onSaved={(v) => handleFieldSaved("redditSources", v)}
+            />
+          </div>
         </CardContent>
       </Card>
+
+      <CurrentVideosPanel channelId={channel.channelId} />
 
       <SectionDivider label="Learned rules" />
       <div className="rounded-lg border border-border bg-card p-6">
@@ -417,12 +434,6 @@ function SingleChannelCard({
         </p>
         <LearnedRulesPanel channelId={channel.channelId} />
       </div>
-
-      <SectionDivider label="Channel details" />
-      <MetaCard channel={detailChannel} />
-      <ChannelAudience channelId={channel.channelId} />
-      <ChannelRevenue channelId={channel.channelId} />
-      <ContentThemesCard channelId={channel.channelId} />
 
       {aiOpen && (
         <AnalyzeModal
@@ -437,6 +448,168 @@ function SingleChannelCard({
       )}
     </>
   );
+}
+
+function CurrentVideosPanel({ channelId }: { channelId: string }) {
+  const [videos, setVideos] = useState<ChannelVideo[] | null>(null);
+  const [lastSyncAt, setLastSyncAt] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const loadVideos = useCallback(async () => {
+    try {
+      const r = await fetch("/api/channel-videos?limit=50", { cache: "no-store" });
+      const d = (await r.json().catch(() => ({}))) as {
+        videos?: ChannelVideo[];
+        lastSyncAt?: string | null;
+        error?: string;
+      };
+      if (!r.ok) {
+        setError(d.error ?? `HTTP ${r.status}`);
+        setVideos([]);
+        return;
+      }
+      setVideos(d.videos ?? []);
+      setLastSyncAt(d.lastSyncAt ?? null);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load videos.");
+      setVideos([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadVideos();
+  }, [channelId, loadVideos]);
+
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    setError(null);
+    try {
+      await fetch("/api/sync/user-videos", { method: "POST" });
+      await loadVideos();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Refresh failed.");
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadVideos]);
+
+  return (
+    <>
+      <SectionDivider label="Current videos" />
+      <div className="mb-4 rounded-lg border border-border bg-card p-4">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold">Current channel videos</h3>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Synced public uploads used as your own-channel source material.
+              {lastSyncAt ? ` Last synced ${formatDateTime(lastSyncAt)}.` : ""}
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={refresh}
+            disabled={refreshing}
+            className="shrink-0 gap-1.5"
+          >
+            {refreshing ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" />
+            )}
+            Refresh
+          </Button>
+        </div>
+
+        {error && (
+          <div className="mb-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {error}
+          </div>
+        )}
+
+        {videos === null ? (
+          <div className="space-y-2">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="h-[68px] animate-pulse rounded bg-muted/50" />
+            ))}
+          </div>
+        ) : videos.length === 0 ? (
+          <p className="rounded-md bg-muted/25 px-3 py-3 text-sm text-muted-foreground">
+            No videos synced yet. Use Refresh, or re-sync the channel from Integrations.
+          </p>
+        ) : (
+          <ul className="max-h-[420px] space-y-2 overflow-y-auto pr-1">
+            {videos.map((video) => (
+              <li key={video.id}>
+                <a
+                  href={`https://www.youtube.com/watch?v=${video.id}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex gap-3 rounded-md p-2 transition-colors hover:bg-muted/35"
+                >
+                  <YouTubeThumbnail
+                    videoId={video.id}
+                    src={video.thumbnail_url}
+                    className="h-[56px] rounded"
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="line-clamp-2 text-sm font-medium leading-snug text-foreground">
+                      {video.title}
+                    </span>
+                    <span className="mt-1 block text-xs text-muted-foreground">
+                      {videoMeta(video).join(" · ")}
+                    </span>
+                  </span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </>
+  );
+}
+
+function compactCount(value: number | null): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return new Intl.NumberFormat("en", {
+    notation: "compact",
+    maximumFractionDigits: value >= 1_000_000 ? 1 : 0,
+  }).format(value);
+}
+
+function formatPublishedAt(value: number | null): string | null {
+  if (!value || value <= 0) return null;
+  return new Intl.DateTimeFormat("en", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(new Date(value * 1000));
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return value;
+  return new Intl.DateTimeFormat("en", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function videoMeta(video: ChannelVideo): string[] {
+  const parts: string[] = [];
+  const views = compactCount(video.views);
+  const comments = compactCount(video.comments);
+  const date = formatPublishedAt(video.published_at);
+  if (views) parts.push(`${views} views`);
+  if (comments) parts.push(`${comments} comments`);
+  if (date) parts.push(date);
+  return parts.length ? parts : ["No public stats yet"];
 }
 
 function SectionDivider({ label }: { label: string }) {

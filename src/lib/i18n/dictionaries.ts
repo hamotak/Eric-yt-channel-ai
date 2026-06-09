@@ -582,7 +582,7 @@ export const dictionaries: { en: DictionaryShape } = {
     },
     integrations: {
       title: "Integrations",
-      subtitle: "Connect external services to enable AI analysis",
+      subtitle: "Connect the services used by ideation",
       save: "Save",
       saved: "Saved",
       showKey: "Show",
@@ -595,7 +595,7 @@ export const dictionaries: { en: DictionaryShape } = {
       },
       claude: {
         name: "Claude (Anthropic)",
-        desc: "Required. Powers every AI analysis and chat turn. Without this key the app is a read-only dashboard.",
+        desc: "Required. Powers ideation, validation, and channel-context drafting.",
         placeholder: "sk-ant-...",
         helpTitle: "How to get a Claude API key",
         helpSteps: [
@@ -670,7 +670,7 @@ export const dictionaries: { en: DictionaryShape } = {
     youtube: {
       bindTitle: "Bind your channel",
       bindDesc:
-        "Paste a @handle, channel URL, or channel ID. We'll pull channel stats, videos, views/likes/comments via the YouTube Data API.",
+        "Paste a @handle, channel URL, or channel ID. We'll pull public video data used by ideation.",
       inputLabel: "Channel",
       sync: "Sync",
       needKey: "Set a YouTube API key above to enable binding.",

@@ -1,10 +1,17 @@
 import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
+import { jsonSchemaOutputFormat } from "@anthropic-ai/sdk/helpers/json-schema";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
-import { db, getIntegration } from "../db";
+import { db, getIntegration, getSetting } from "../db";
+import {
+  collectRedditResearch,
+  hasRedditSignalProvider,
+  parseSubredditSources,
+  type RedditResearchItem,
+} from "../reddit";
 import { listUploadIds, fetchVideos, YouTubeApiError } from "../youtube";
 import { log } from "../logger";
 import { costMillicents } from "../claude-pricing";
@@ -18,7 +25,7 @@ export const IDEATION_MODEL_VALIDATE = "claude-sonnet-4-6";
 export const IDEATION_MODEL_DISTILL = "claude-sonnet-4-6";
 
 export const IDEATION_THINKING_BUDGET = 24000;
-export const IDEATION_COMPOSE_MAX_TOKENS = 32000;
+export const IDEATION_COMPOSE_MAX_TOKENS = 18000;
 export const IDEATION_VALIDATE_MAX_TOKENS = 4000;
 export const IDEATION_DISTILL_MAX_TOKENS = 2000;
 
@@ -41,18 +48,27 @@ export const MAX_COMPOSE_RETRIES = 3;
 export const MAX_VALIDATE_RETRIES = 2;
 export const MAX_DISTILL_RETRIES = 1;
 export const MAX_QUEUED_GENERATIONS = 2;
-export const DAILY_IDEATION_BUDGET_MILLICENTS = 500_000;
 
 export const OUTLIER_AGE_DAYS = 90;
+export const TOPIC_RECENCY_DAYS = 30;
 export const OUTLIER_MULTIPLIER = 2.0;
 export const RECENT_UPLOAD_VIDEOS_PER_COMPETITOR = 50;
-// Compose overshoot — we ask the model for count * factor candidates so
-// validate has slack after the fit_score >= 7 filter. Raised from 1.5 to
-// 1.7 on 2026-05-20 after smoke showed 9-of-10 outcome at 1.5.
-export const COMPOSE_OVERSHOOT_FACTOR = 1.7;
+export const USED_TITLE_COOLDOWN_DAYS = 14;
+// The UI now shows validation quality inline instead of hiding weak ideas,
+// so the model should produce exactly the requested count. Keeping this at
+// 1.0 also keeps Sonnet output cost predictable for 10-title runs.
+export const COMPOSE_OVERSHOOT_FACTOR = 1.0;
+export const MAX_COMPOSE_TARGET_IDEAS_PER_CALL = 5;
 export const FIT_SCORE_PASS_THRESHOLD = 7;
+export const MAX_IDEAS_PER_TOPIC_PER_RUN = 3;
+export const TITLE_IDEAL_MIN_CHARS = 50;
+export const TITLE_IDEAL_MAX_CHARS = 70;
+export const TITLE_MAX_CHARS = 80;
+export const TITLE_MAX_WORDS = 12;
+export const IDEATION_TITLE_RULES_SETTING = "ideate.title_rules";
+export const IDEATION_TITLE_RULES_CAP = 4000;
 
-const FORBIDDEN_WORDS = [
+export const FORBIDDEN_WORDS = [
   "cinematic",
   "sensory",
   "visceral",
@@ -62,9 +78,73 @@ const FORBIDDEN_WORDS = [
   "physically impossible",
 ];
 
-const TITLE_LEN_HARD_MAX = 80;
-const TITLE_LEN_SOFT_MAX = 70;
-const TITLE_LEN_MIN = 30;
+export const DEFAULT_IDEATION_TITLE_RULES = [
+  "Write for a smart 14-year-old space enthusiast.",
+  "Make the title easy to read in one breath.",
+  "Prefer concrete nouns and simple verbs.",
+  "Use one clear idea per title.",
+  "Avoid stacked abstract phrases unless the meaning is immediately clear.",
+  "Stay as easy to understand as the viral source title; never make the wording harder.",
+  "Borrow the simplicity of viral space outliers: short subject, clear danger/mystery, no tangled clauses.",
+  "Title length is a hard rule: 50-70 characters is ideal because it displays fully in search and on mobile.",
+  "70-80 characters is acceptable only if the emotional hook lands before the cutoff.",
+  "Avoid 80+ character titles because the punchline risks being cut off in search results.",
+  "Over 80 characters or over 12 words is not acceptable.",
+  "No clickbait that does not deliver; curiosity gaps must resolve in the video.",
+] as const;
+
+const HARD_TITLE_LENGTH_RULES = [
+  "Title length is a hard rule: 50-70 characters is ideal because it displays fully in search and on mobile.",
+  "70-80 characters is acceptable only if the emotional hook lands before the cutoff.",
+  "Avoid 80+ character titles because the punchline risks being cut off in search results.",
+  "Over 80 characters or over 12 words is not acceptable.",
+] as const;
+
+function normalizeIdeationTitleRuleLine(line: string): string[] {
+  if (
+    /\b45\s*-\s*68\b|\b30\s*-\s*80\b|\bmax\s*80\b|natural title length and rhythm/i.test(
+      line
+    )
+  ) {
+    return [...HARD_TITLE_LENGTH_RULES];
+  }
+  return [line];
+}
+
+export function normalizeIdeationTitleRulesText(value: string): string {
+  const seen = new Set<string>();
+  return [
+    ...value
+      .split(/\r?\n/)
+      .map((line) => line.trim().replace(/^[-*]\s+/, "").trim())
+      .flatMap((line) => normalizeIdeationTitleRuleLine(line)),
+    ...HARD_TITLE_LENGTH_RULES,
+  ]
+    .filter((line) => line.length > 0)
+    .map((line) => (/[.!?]$/.test(line) ? line : `${line}.`))
+    .filter((line) => {
+      const key = line.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .join("\n");
+}
+
+export function defaultIdeationTitleRulesText(): string {
+  return DEFAULT_IDEATION_TITLE_RULES.join("\n");
+}
+
+export function getIdeationTitleRulesText(): string {
+  const saved = getSetting(IDEATION_TITLE_RULES_SETTING);
+  return normalizeIdeationTitleRulesText(saved?.trim() ? saved : defaultIdeationTitleRulesText());
+}
+
+export function getIdeationTitleRules(): string[] {
+  return getIdeationTitleRulesText().split("\n").filter((line) => line.trim().length > 0);
+}
+
+export const IDEATION_TITLE_RULES = DEFAULT_IDEATION_TITLE_RULES;
 
 const FORMULA_FAMILIES = [
   ["Specific Numbers", "I Spent 7 Days Tracking the Voyager Probe"],
@@ -80,7 +160,7 @@ const FORMULA_FAMILIES = [
 /* Types                                                          */
 /* ------------------------------------------------------------ */
 
-export type Mode = "auto" | "new_angles" | "title_tweaks";
+export type Mode = "auto" | "new_angles" | "title_tweaks" | "reddit_angles";
 
 export interface ChannelContext {
   id: string;
@@ -91,8 +171,10 @@ export interface ChannelContext {
   voice: string | null;
   external_sources: string | null;
   banned_topics: string | null;
+  reddit_sources: string | null;
   channel_description: string | null;
   ideation_rules_text: string | null;
+  topic_analysis_json: string | null;
 }
 
 export interface LearnedRule {
@@ -106,6 +188,13 @@ export interface OwnUpload {
   title: string;
   views: number;
   published_at: number | null;
+  thumbnail_url: string | null;
+}
+
+export interface UsedTitleCooldown {
+  id: string;
+  title: string;
+  used_at: string | null;
 }
 
 export interface VideoEntry {
@@ -115,6 +204,8 @@ export interface VideoEntry {
   multiplier: number;
   age_days: number;
   is_outlier: boolean;
+  published_at: number | null;
+  thumbnail_url: string | null;
 }
 
 export interface CompetitorPayload {
@@ -134,6 +225,7 @@ export interface GatherResult {
   own_recent_uploads: OwnUpload[];
   own_median_views: number;
   competitors: CompetitorPayload[];
+  used_title_cooldowns: UsedTitleCooldown[];
   yt_calls_made: number;
   dropped_competitors: { channel_id: string; reason: string }[];
 }
@@ -144,22 +236,27 @@ export interface SourceVideo {
   channel_name: string;
   channel_handle: string | null;
   multiplier: number | null;
+  thumbnail_url?: string | null;
+  views?: number | null;
+  published_at?: number | null;
+  age_days?: number | null;
 }
 
 /**
  * Which compose path produced the idea — surfaced as a badge next to FIT.
  *  - new_angle  : two-outlier mashup (topic from outlier A, format from outlier B)
  *  - title_tweak: same topic as an existing high-performer, fresh title/hook
- *  - fresh      : neither — a real-event grounding or pure ideation path
+ *  - reddit_angle: topic demand from Reddit web signals + YouTube format proof
  *
  * Old rows (pre-2026-05) have no method on disk; the UI renders "—" in
  * that case. parseComposeJson hard-fails an idea whose method is set
  * but invalid; missing-method is allowed for read-side back-compat.
  */
-export type IdeaMethod = "new_angle" | "title_tweak" | "fresh";
+export type IdeaMethod = "new_angle" | "title_tweak" | "reddit_angle" | "fresh";
 const VALID_METHODS: ReadonlySet<string> = new Set([
   "new_angle",
   "title_tweak",
+  "reddit_angle",
   "fresh",
 ]);
 
@@ -167,14 +264,34 @@ export interface SourceAttribution {
   family: string;
   topic_source: SourceVideo | null;
   format_source: SourceVideo | null;
+  topic_evidence_sources: SourceVideo[];
   reasoning: string;
   method?: IdeaMethod;
+}
+
+export interface IdeaSourceLink {
+  type: "youtube" | "reddit";
+  label: string;
+  url: string;
+  date?: string | null;
+}
+
+export interface IdeaProof {
+  source_signal: string;
+  fit: string;
+  execution: string;
+  whats_going_on?: string | null;
+  weak_proof?: string | null;
+  sources: IdeaSourceLink[];
 }
 
 export interface ComposedIdea {
   title: string;
   description: string;
   source_attribution: SourceAttribution;
+  proof: IdeaProof;
+  confidence_level: "high" | "medium" | "low";
+  research_sources: IdeaSourceLink[];
 }
 
 export interface ValidatedIdea {
@@ -182,10 +299,177 @@ export interface ValidatedIdea {
   title: string;
   description: string;
   source_attribution: SourceAttribution;
+  proof: IdeaProof;
+  confidence_level: "high" | "medium" | "low";
+  research_sources: IdeaSourceLink[];
   validation_status: "passed" | "rejected";
   validation_reason: string | null;
   fit_score: number | null;
+  fit_reason: string | null;
 }
+
+export interface IdeaAllocation {
+  method: Exclude<IdeaMethod, "fresh">;
+  count: number;
+}
+
+type ComposeStructuredOutput = {
+  ideas: Array<{
+    title: string;
+    description: string;
+    confidence_level: "high" | "medium" | "low";
+    source_attribution: {
+      family: string;
+      topic_source: SourceVideo | null;
+      format_source: SourceVideo | null;
+      topic_evidence_sources: SourceVideo[];
+      reasoning: string;
+      method: IdeaMethod;
+    };
+    proof: IdeaProof;
+    research_sources?: IdeaSourceLink[];
+  }>;
+};
+
+type ValidateStructuredOutput = {
+  ideas: Array<{
+    idx: number;
+    fit_score: number;
+    dup_of: number;
+    fit_reason: string;
+    weak_proof: string;
+  }>;
+};
+
+const SOURCE_VIDEO_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["video_id", "title", "channel_name", "channel_handle", "multiplier"],
+  properties: {
+    video_id: { type: "string" },
+    title: { type: "string" },
+    channel_name: { type: "string" },
+    channel_handle: { type: "string" },
+    multiplier: { type: "number" },
+    thumbnail_url: { type: "string" },
+    views: { type: "number" },
+    published_at: { type: "number" },
+    age_days: { type: "number" },
+  },
+} as const;
+
+const SOURCE_LINK_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["type", "label", "url", "date"],
+  properties: {
+    type: { type: "string", enum: ["youtube", "reddit"] },
+    label: { type: "string" },
+    url: { type: "string" },
+    date: { type: "string" },
+  },
+} as const;
+
+const COMPOSE_OUTPUT_FORMAT = jsonSchemaOutputFormat({
+  type: "object",
+  additionalProperties: false,
+  required: ["ideas"],
+  properties: {
+    ideas: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "title",
+          "description",
+          "confidence_level",
+          "source_attribution",
+          "proof",
+          "research_sources",
+        ],
+        properties: {
+          title: { type: "string" },
+          description: { type: "string" },
+          confidence_level: { type: "string", enum: ["high", "medium", "low"] },
+          source_attribution: {
+            type: "object",
+            additionalProperties: false,
+            required: [
+              "family",
+              "topic_source",
+              "format_source",
+              "topic_evidence_sources",
+              "reasoning",
+              "method",
+            ],
+            properties: {
+              family: { type: "string" },
+              topic_source: SOURCE_VIDEO_SCHEMA,
+              format_source: SOURCE_VIDEO_SCHEMA,
+              topic_evidence_sources: {
+                type: "array",
+                items: SOURCE_VIDEO_SCHEMA,
+              },
+              reasoning: { type: "string" },
+              method: {
+                type: "string",
+                enum: ["new_angle", "title_tweak", "reddit_angle"],
+              },
+            },
+          },
+          proof: {
+            type: "object",
+            additionalProperties: false,
+            required: [
+              "source_signal",
+              "fit",
+              "execution",
+              "whats_going_on",
+              "weak_proof",
+              "sources",
+            ],
+            properties: {
+              source_signal: { type: "string" },
+              fit: { type: "string" },
+              execution: { type: "string" },
+              whats_going_on: { type: "string" },
+              weak_proof: { type: "string" },
+              sources: { type: "array", items: SOURCE_LINK_SCHEMA },
+            },
+          },
+          research_sources: {
+            type: "array",
+            items: SOURCE_LINK_SCHEMA,
+          },
+        },
+      },
+    },
+  },
+} as const);
+
+const VALIDATE_OUTPUT_FORMAT = jsonSchemaOutputFormat({
+  type: "object",
+  additionalProperties: false,
+  required: ["ideas"],
+  properties: {
+    ideas: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["idx", "fit_score", "dup_of", "fit_reason", "weak_proof"],
+        properties: {
+          idx: { type: "number" },
+          fit_score: { type: "number" },
+          dup_of: { type: "number" },
+          fit_reason: { type: "string" },
+          weak_proof: { type: "string" },
+        },
+      },
+    },
+  },
+} as const);
 
 /* ------------------------------------------------------------ */
 /* Anthropic call dispatcher — stream when max_tokens forces it  */
@@ -198,11 +482,17 @@ async function callAnthropic(
   params: StreamParams
 ): Promise<Anthropic.Message> {
   // SDK gates non-streaming requests when max_tokens > ANTHROPIC_STREAM_THRESHOLD
-  // (~21333). For compose with 24K thinking + 8K JSON room we sit at 32K
-  // and MUST stream. validate/distill are well below and use the plain path.
+  // (~21333). Keep compose below this when possible so structured outputs
+  // can use messages.parse instead of a fragile very-long stream. validate
+  // and distill are well below and use the plain path.
   // See note next to ANTHROPIC_STREAM_THRESHOLD for the math.
   if (typeof params.max_tokens === "number" && params.max_tokens > ANTHROPIC_STREAM_THRESHOLD) {
     return await client.messages.stream(params).finalMessage();
+  }
+  if (params.output_config?.format) {
+    return (await client.messages.parse(
+      params as Parameters<Anthropic["messages"]["parse"]>[0]
+    )) as Anthropic.Message;
   }
   return (await client.messages.create(
     params as Parameters<Anthropic["messages"]["create"]>[0]
@@ -273,27 +563,53 @@ export function estimateCostMillicents(count: number): number {
   return 50_000 + (clamped - 10) * 700;
 }
 
-export function dailyBudgetSpentMillicents(): number {
-  const row = db
-    .prepare(
-      `SELECT COALESCE(SUM(estimated_cost_millicents), 0) AS spent
-       FROM generations
-       WHERE started_at >= datetime('now', '-1 day')`
-    )
-    .get() as { spent: number };
-  return row.spent;
+export function allocateIdeaBuckets(
+  mode: Mode,
+  count: number,
+  options: { redditAvailable?: boolean } = {}
+): IdeaAllocation[] {
+  const clamped = Math.max(1, Math.floor(count));
+  if (mode === "new_angles") return [{ method: "new_angle", count: clamped }];
+  if (mode === "title_tweaks") return [{ method: "title_tweak", count: clamped }];
+  if (mode === "reddit_angles") return [{ method: "reddit_angle", count: clamped }];
+
+  const methods: IdeaAllocation["method"][] =
+    options.redditAvailable === false
+      ? ["new_angle", "title_tweak"]
+      : ["new_angle", "title_tweak", "reddit_angle"];
+  const base = Math.floor(clamped / methods.length);
+  let remainder = clamped % methods.length;
+  return methods.map((method) => {
+    const extra = remainder > 0 ? 1 : 0;
+    remainder -= extra;
+    return { method, count: base + extra };
+  });
 }
 
-export function dailyBudgetResetIso(): string {
-  const row = db
-    .prepare(
-      `SELECT MIN(started_at) AS earliest
-       FROM generations
-       WHERE started_at >= datetime('now', '-1 day')`
-    )
-    .get() as { earliest: string | null };
-  if (!row.earliest) return new Date(Date.now() + 24 * 3600 * 1000).toISOString();
-  return new Date(new Date(row.earliest).getTime() + 24 * 3600 * 1000).toISOString();
+function overshootAllocations(allocations: IdeaAllocation[]): IdeaAllocation[] {
+  return allocations.map((a) => ({
+    method: a.method,
+    count: Math.max(a.count, Math.ceil(a.count * COMPOSE_OVERSHOOT_FACTOR)),
+  }));
+}
+
+function modeForMethod(method: IdeaAllocation["method"]): Mode {
+  if (method === "new_angle") return "new_angles";
+  if (method === "title_tweak") return "title_tweaks";
+  return "reddit_angles";
+}
+
+function splitComposeAllocations(allocations: IdeaAllocation[]): IdeaAllocation[] {
+  const chunks: IdeaAllocation[] = [];
+  for (const allocation of allocations) {
+    let remaining = allocation.count;
+    while (remaining > 0) {
+      const count = Math.min(MAX_COMPOSE_TARGET_IDEAS_PER_CALL, remaining);
+      chunks.push({ method: allocation.method, count });
+      remaining -= count;
+    }
+  }
+  return chunks;
 }
 
 export function countProcessingGenerations(): number {
@@ -377,7 +693,7 @@ export async function gather(
   const channelRow = db
     .prepare(
       `SELECT id, title, handle, niche, audience, voice, external_sources, banned_topics,
-              channel_description, ideation_rules
+              reddit_sources, channel_description, ideation_rules, topic_analysis_json
        FROM channels WHERE id = ?`
     )
     .get(userChannelId) as
@@ -390,8 +706,10 @@ export async function gather(
         voice: string | null;
         external_sources: string | null;
         banned_topics: string | null;
+        reddit_sources: string | null;
         channel_description: string | null;
         ideation_rules: string | null;
+        topic_analysis_json: string | null;
       }
     | undefined;
   if (!channelRow) throw new Error(`channel not found: ${userChannelId}`);
@@ -405,8 +723,10 @@ export async function gather(
     voice: channelRow.voice,
     external_sources: channelRow.external_sources,
     banned_topics: channelRow.banned_topics,
+    reddit_sources: channelRow.reddit_sources,
     channel_description: channelRow.channel_description,
     ideation_rules_text: channelRow.ideation_rules,
+    topic_analysis_json: channelRow.topic_analysis_json,
   };
 
   const learned_rules = db
@@ -419,7 +739,7 @@ export async function gather(
 
   const own_recent_uploads = db
     .prepare(
-      `SELECT id AS video_id, title, views, published_at
+      `SELECT id AS video_id, title, views, published_at, thumbnail_url
        FROM videos WHERE channel_id = ?
        ORDER BY published_at DESC LIMIT 20`
     )
@@ -433,6 +753,20 @@ export async function gather(
     ownSortedViews.length > 0
       ? ownSortedViews[Math.floor(ownSortedViews.length / 2)]
       : 0;
+
+  const used_title_cooldowns = db
+    .prepare(
+      `SELECT i.id, i.title, i.used_at
+       FROM ideas i
+       JOIN generations g ON g.id = i.generation_id
+       WHERE g.user_channel_id = ?
+         AND i.used_by_user = 1
+         AND i.title IS NOT NULL
+         AND datetime(COALESCE(i.used_at, i.created_at)) >= datetime('now', ?)
+       ORDER BY COALESCE(i.used_at, i.created_at) DESC
+       LIMIT 100`
+    )
+    .all(userChannelId, `-${USED_TITLE_COOLDOWN_DAYS} days`) as UsedTitleCooldown[];
 
   const competitorLimit = options.competitorLimit ?? -1;
   const competitorsQuery =
@@ -538,7 +872,12 @@ export async function gather(
 
   const videoMeta = new Map<
     string,
-    { title: string; views: number; publishedAt: number }
+    {
+      title: string;
+      views: number;
+      publishedAt: number;
+      thumbnailUrl: string | null;
+    }
   >();
   for (let i = 0; i < allVideoIds.length; i += 50) {
     if (yt_calls_made >= MAX_YT_CALLS_PER_GATHER) {
@@ -557,6 +896,7 @@ export async function gather(
           title: v.title,
           views: v.views,
           publishedAt: v.publishedAt,
+          thumbnailUrl: v.thumbnail,
         });
       }
     } catch (err) {
@@ -580,9 +920,27 @@ export async function gather(
         if (!meta) return null;
         const ageSec = meta.publishedAt > 0 ? nowSec - meta.publishedAt : Number.POSITIVE_INFINITY;
         const age_days = Math.floor(ageSec / 86400);
-        return { id, title: meta.title, views: meta.views, age_days };
+        return {
+          id,
+          title: meta.title,
+          views: meta.views,
+          age_days,
+          published_at: meta.publishedAt,
+          thumbnail_url: meta.thumbnailUrl,
+        };
       })
-      .filter((x): x is { id: string; title: string; views: number; age_days: number } => x !== null);
+      .filter(
+        (
+          x
+        ): x is {
+          id: string;
+          title: string;
+          views: number;
+          age_days: number;
+          published_at: number;
+          thumbnail_url: string | null;
+        } => x !== null
+      );
 
     const allViews = allEntries
       .map((e) => e.views)
@@ -591,7 +949,6 @@ export async function gather(
     const median = allViews.length > 0 ? allViews[Math.floor(allViews.length / 2)] : 0;
 
     const videos: VideoEntry[] = allEntries
-      .filter((e) => e.age_days <= OUTLIER_AGE_DAYS)
       .map((e) => ({
         video_id: e.id,
         title: e.title,
@@ -599,6 +956,8 @@ export async function gather(
         multiplier: median > 0 ? Number((e.views / median).toFixed(2)) : 0,
         age_days: e.age_days,
         is_outlier: median > 0 && e.views >= OUTLIER_MULTIPLIER * median,
+        published_at: e.published_at,
+        thumbnail_url: e.thumbnail_url,
       }))
       .sort((a, b) => b.multiplier - a.multiplier);
 
@@ -622,6 +981,7 @@ export async function gather(
     own_recent_uploads,
     own_median_views,
     competitors: competitorPayloads,
+    used_title_cooldowns,
     yt_calls_made,
     dropped_competitors: dropped,
   };
@@ -633,6 +993,7 @@ export async function gather(
 
 function buildComposeSystemPrompt(): string {
   const mentor = readMentorMethod();
+  const titleRules = getIdeationTitleRules();
   const families = FORMULA_FAMILIES.map(
     ([name, example]) => `  - ${name}: e.g. "${example}"`
   ).join("\n");
@@ -643,7 +1004,7 @@ function buildComposeSystemPrompt(): string {
     "outliers, and learned-rule constraints — strictly following the method below.",
     "",
     "## METHOD (verbatim, from MENTOR_METHOD.md)",
-    mentor || "(method file unavailable — fall back to: outlier-driven, plain-language titles 50-70 chars, grounded in real events)",
+    mentor || "(method file unavailable — fall back to: outlier-driven, plain-language, one-breath titles grounded in real events)",
     "",
     "## PROVEN FORMULA FAMILIES",
     "Every title you propose MUST map to exactly one of these 7 families. State",
@@ -651,10 +1012,9 @@ function buildComposeSystemPrompt(): string {
     families,
     "",
     "## TITLE RULES (HARD)",
-    "- Length: 50-70 characters strongly preferred; 30-80 acceptable.",
+    ...titleRules.map((rule) => `- ${rule}`),
     "- Plain language. Banned forbidden adjectives (will be auto-rejected):",
     `  ${FORBIDDEN_WORDS.map((w) => `"${w}"`).join(", ")}`,
-    "- No clickbait that does not deliver. Curiosity gap must resolve in the video.",
     "",
     "## DESCRIPTION RULES (HARD)",
     "- 2 short sentences: where the idea came from + why it works for THIS channel.",
@@ -665,23 +1025,46 @@ function buildComposeSystemPrompt(): string {
     "",
     "## ATTRIBUTION RULES (HARD)",
     "- topic_source: the competitor outlier (or own upload, for Title Tweaks) whose TOPIC you reused.",
-    "- format_source: the DIFFERENT video whose title STRUCTURE you reused. null for Title Tweaks (no second source).",
-    "- Both source objects carry { video_id, title, channel_name, channel_handle, multiplier }.",
-    "- video_id MUST be picked from the competitor outliers or own uploads block in the user prompt — do not invent IDs.",
+    "- format_source: the DIFFERENT video whose title STRUCTURE you reused. Use an empty source object for Title Tweaks (no second source).",
+    "- topic_evidence_sources: additional YouTube outliers on the SAME topic, excluding topic_source. Use [] when there is no second same-topic signal.",
+    "- Both source objects carry { video_id, title, channel_name, channel_handle, multiplier }, plus optional thumbnail_url, views, published_at, and age_days when known.",
+    "- Empty source object means { video_id: \"\", title: \"\", channel_name: \"\", channel_handle: \"\", multiplier: 0 }.",
+    "- video_id MUST be picked from the competitor source bank or own uploads block in the user prompt — do not invent IDs.",
     "",
     "## METHOD TAG (HARD)",
     "Every idea MUST include source_attribution.method, set to ONE of:",
     "  - \"new_angle\"   : a two-outlier mashup. Topic from one competitor outlier,",
     "                    title format from a DIFFERENT competitor outlier. Both",
-    "                    source video_ids MUST come from the competitor_outliers",
-    "                    block and BOTH outliers MUST have multiplier ≥ 2.0.",
+    "                    source video_ids MUST come from the competitor source bank",
+    "                    and BOTH sources MUST be marked as outliers with multiplier ≥ 2.0.",
     "                    topic_source and format_source must reference DIFFERENT video_ids.",
+    `                    Primary topic_source MUST be uploaded within ${TOPIC_RECENCY_DAYS} days.`,
+    "                    Older same-topic videos are historical proof only; put them in topic_evidence_sources, never as primary topic_source.",
+    "                    Prefer topics that recently went viral more than once.",
+    "                    Format source may be older because title structures are evergreen.",
+    "                    Stay close to the readable structure of the format source, but simplify the words.",
     "                    If you cannot satisfy ALL of these constraints for a candidate,",
-    "                    do NOT propose it as new_angle — propose it as \"fresh\" instead.",
+    "                    do NOT propose it.",
     "  - \"title_tweak\" : same topic as an existing high-performer (competitor or own",
-    "                    upload), restructured with a fresh hook/title format.",
-    "  - \"fresh\"       : neither — a real-event grounding, originality-driven pitch,",
-    "                    or any idea that doesn't tie back to two outliers.",
+    "                    upload), with only small wording/synonym/clarity changes.",
+    "                    Do not swap the main subject, add a new premise, or change the topic.",
+    "  - \"reddit_angle\": demand signal from Reddit web signals, paired with a",
+    "                    YouTube outlier or own winner as the format_source. topic_source",
+    "                    may be the empty source object because Reddit supplies the topic; proof.sources",
+    "                    MUST include at least one Reddit link and one YouTube link.",
+    "",
+    "## PROOF RULES (HARD)",
+    "- Every idea includes proof: { source_signal, fit, execution, whats_going_on, weak_proof, sources }.",
+    "- source_signal: compact evidence, including outlier multipliers or Reddit web-search snippets.",
+    "- fit: why this channel's audience and voice can own the topic.",
+    "- execution: the actual video treatment, not vague strategy.",
+    "- whats_going_on: empty string unless Reddit is involved. For Reddit ideas, 3-4 short sentences max with concrete dates from the Reddit web signals.",
+    "- weak_proof: empty string for strong evidence; otherwise name the weak link while keeping the idea usable.",
+    "- sources: source links used by the proof. Use YouTube watch links and Reddit permalinks.",
+    "- Use an empty string for unknown source-link dates.",
+    "- Keep source_signal, fit, and execution to one sentence each. Keep each idea compact.",
+    `- Confidence rule: high only when fit is very strong and the topic has 2+ same-topic outliers within ${TOPIC_RECENCY_DAYS} days.`,
+    "- Use medium for one recent topic source or repeated older evidence with weaker fit. Use low for old-only, single weak, or uncertain topic proof.",
     "",
     "## OUTPUT",
     'Return ONLY a single JSON object: { "ideas": [...] }. No prose, no markdown.',
@@ -706,22 +1089,79 @@ function buildComposeSystemPrompt(): string {
     '      "channel_handle": "@late_science",',
     '      "multiplier": 8.8',
     '    },',
+    '    "topic_evidence_sources": [],',
     '    "reasoning": "Topic from Milky Stellar 5.0× × Late Science\'s own 8.8× format structure.",',
     '    "method": "new_angle"',
-    "  }",
+    "  },",
+    '  "confidence_level": "high",',
+    '  "proof": {',
+    '    "source_signal": "Milky Stellar hit 5.0× on Voyager-signal curiosity; Late Science hit 8.8× with quiet-panic framing.",',
+    '    "fit": "The channel already converts space-anomaly stories when the audience gets a clear technical hook.",',
+    '    "execution": "Open with the timestamped signal anomaly, explain the possible causes, then rank what scientists can actually verify.",',
+    '    "whats_going_on": "",',
+    '    "weak_proof": "",',
+    '    "sources": [',
+    '      { "type": "youtube", "label": "Voyager topic outlier", "url": "https://www.youtube.com/watch?v=Wtb1uMbllgg", "date": "" },',
+    '      { "type": "youtube", "label": "Quiet-panic format outlier", "url": "https://www.youtube.com/watch?v=j_F0S4nPoxk", "date": "" }',
+    "    ]",
+    "  },",
+    '  "research_sources": []',
     "}",
     "```",
-    "Set format_source to null (the literal JSON null) for Title Tweaks where you only borrow a topic.",
+    "Set format_source to the empty source object for Title Tweaks where you only borrow a topic.",
   ].join("\n");
 }
 
-function buildComposeUserPrompt(gathered: GatherResult, mode: Mode, count: number): string {
+function allocationLabel(method: IdeaAllocation["method"]): string {
+  if (method === "new_angle") return "New Angles";
+  if (method === "title_tweak") return "Title Tweaks";
+  return "Reddit Angles";
+}
+
+function buildResearchContext(redditResearch: RedditResearchItem[]): string[] {
+  if (redditResearch.length === 0) return ["(none)"];
+  return redditResearch.map((item) => {
+    const date = item.created_utc
+      ? new Date(item.created_utc * 1000).toISOString().slice(0, 10)
+      : "unknown date";
+    const reuse = item.reused ? "reused library signal" : "new signal";
+    const metric =
+      item.score > 0 || item.comments > 0
+        ? `${item.score} upvotes | ${item.comments} comments`
+        : "Brave web signal";
+    return [
+      `- topic=${item.topic} | r/${item.subreddit} | ${date} | ${metric} | ${reuse}`,
+      `  title: ${item.title}`,
+      `  summary: ${item.summary}`,
+      `  permalink: ${item.permalink}`,
+    ].join("\n");
+  });
+}
+
+function buildComposeUserPrompt(
+  gathered: GatherResult,
+  mode: Mode,
+  count: number,
+  redditResearch: RedditResearchItem[],
+  redditAvailable = true
+): string {
   const ctx = gathered.channel_context;
-  const overshoot = Math.ceil(count * COMPOSE_OVERSHOOT_FACTOR);
+  const targetAllocations = allocateIdeaBuckets(mode, count, { redditAvailable });
+  const composeAllocations = overshootAllocations(targetAllocations);
+  const composeCount = composeAllocations.reduce((sum, a) => sum + a.count, 0);
 
   const lines: string[] = [];
-  lines.push(`# Target — generate ${overshoot} ideas (caller will select top ${count})`);
+  lines.push(`# Target - generate exactly ${composeCount} ideas`);
   lines.push(`Mode: ${mode}`);
+  lines.push("Exact candidate mix:");
+  for (const a of composeAllocations) {
+    lines.push(`- ${allocationLabel(a.method)} (${a.method}): ${a.count}`);
+  }
+  lines.push("Final selected mix target:");
+  for (const a of targetAllocations) {
+    lines.push(`- ${allocationLabel(a.method)} (${a.method}): ${a.count}`);
+  }
+  lines.push(`Hard variety cap: no more than ${MAX_IDEAS_PER_TOPIC_PER_RUN} ideas may use the same topic/source topic in this run.`);
   lines.push("");
   lines.push("## Channel context");
   lines.push(`- name: ${ctx.title}`);
@@ -729,11 +1169,16 @@ function buildComposeUserPrompt(gathered: GatherResult, mode: Mode, count: numbe
   if (ctx.audience) lines.push(`- audience: ${ctx.audience}`);
   if (ctx.voice) lines.push(`- voice: ${ctx.voice}`);
   if (ctx.external_sources) lines.push(`- external sources: ${ctx.external_sources}`);
+  if (ctx.reddit_sources) lines.push(`- curated Reddit web-signal sources: ${ctx.reddit_sources}`);
   if (ctx.channel_description) lines.push(`- description: ${ctx.channel_description}`);
   if (ctx.banned_topics) lines.push(`- BANNED TOPICS (hard reject — do not propose ideas on these): ${ctx.banned_topics}`);
   lines.push("");
 
-  lines.push("## HAmo's hand-written rules (channel.ideation_rules)");
+  lines.push("## Reddit web-signal research library");
+  lines.push(...buildResearchContext(redditResearch));
+  lines.push("");
+
+  lines.push("## Channel-specific ideation rules (/channel-info)");
   lines.push(ctx.ideation_rules_text?.trim() || "(none)");
   lines.push("");
 
@@ -743,6 +1188,20 @@ function buildComposeUserPrompt(gathered: GatherResult, mode: Mode, count: numbe
   } else {
     for (const r of gathered.learned_rules) {
       lines.push(`- [${r.rule_type}] ${r.rule_value}`);
+    }
+  }
+  lines.push("");
+
+  lines.push(`## Used title cooldown (${USED_TITLE_COOLDOWN_DAYS} days)`);
+  const usedCooldownTitles = uniqueUsedTitleCooldowns(gathered.used_title_cooldowns).slice(0, 30);
+  if (usedCooldownTitles.length === 0) {
+    lines.push("(none)");
+  } else {
+    lines.push("The user copied/marked these titles green, so they are likely being used.");
+    lines.push("Do not propose the exact same title or a very similar title. The topic can return later only with clearly different wording and structure.");
+    for (const item of usedCooldownTitles) {
+      const date = item.used_at ? item.used_at.slice(0, 10) : "unknown date";
+      lines.push(`- ${date} | ${item.title}`);
     }
   }
   lines.push("");
@@ -766,7 +1225,7 @@ function buildComposeUserPrompt(gathered: GatherResult, mode: Mode, count: numbe
   }
   lines.push("");
 
-  lines.push("## Competitor outliers (sorted by multiplier within each competitor)");
+  lines.push("## Competitor source bank (recent topics + evergreen formats, sorted by multiplier)");
   for (const comp of gathered.competitors) {
     const handleLabel = comp.handle ?? comp.channel_id;
     lines.push(
@@ -785,30 +1244,46 @@ function buildComposeUserPrompt(gathered: GatherResult, mode: Mode, count: numbe
 
   // Mode-specific instruction
   if (mode === "auto") {
-    lines.push(
-      "## Mode = auto",
-      "Compose a balanced mix:",
-      "- ~40% New Angles: Topic from one competitor outlier × format/structure from a different competitor outlier.",
-      "- ~30% Fresh proposals grounded in channel context + a single competitor outlier.",
-      "- ~30% Title Tweaks: take a recent winning title (own upload above-median OR competitor outlier 3×+), swap 1-2 keywords, keep structure.",
-      "Every idea MUST cite the source video_id(s) it draws from."
-    );
+    lines.push("## Mode = auto");
+    if (redditAvailable) {
+      lines.push("Compose the exact candidate mix above across new_angle, title_tweak, and reddit_angle.");
+    } else {
+      lines.push("Compose the exact candidate mix above across new_angle and title_tweak only.");
+      lines.push("Reddit web signals are unavailable for this run; do not produce reddit_angle ideas.");
+    }
+    lines.push("No fresh ideas in Auto. Every idea MUST cite nested source objects and proof.sources.");
+    lines.push(`Do not create more than ${MAX_IDEAS_PER_TOPIC_PER_RUN} candidates from the same topic source, same Reddit topic, or same main subject.`);
   } else if (mode === "new_angles") {
     lines.push(
       "## Mode = new_angles",
       "EVERY idea uses Method B (Topic × Format mix).",
-      "Pick a TOPIC from one competitor's outlier, then a TITLE STRUCTURE from a DIFFERENT competitor's outlier.",
-      "Both source video_ids MUST appear in source_attribution.topic_source_video_id and format_source_video_id."
+      `Pick a TOPIC from a competitor outlier uploaded within ${TOPIC_RECENCY_DAYS} days.`,
+      "Prefer topics that recently went viral more than once; put additional same-topic outliers in topic_evidence_sources.",
+      `Use any one primary topic source for at most ${MAX_IDEAS_PER_TOPIC_PER_RUN} ideas in this run.`,
+      "Pick a TITLE STRUCTURE from a DIFFERENT proven outlier. This format source may be older because formats are evergreen.",
+      "Stay close to the simple readable structure of the format source, but use simpler words.",
+      "Both source video_ids MUST appear as nested source_attribution.topic_source and source_attribution.format_source objects."
     );
   } else if (mode === "title_tweaks") {
     lines.push(
       "## Mode = title_tweaks",
-      "Take a recent winning title (own upload above-median OR competitor outlier ≥ 3× median) and swap 1-2 keywords while preserving structure. Produce A/B variants.",
-      "The source title MUST appear in source_attribution.topic_source_video_id (the upload/outlier you tweaked)."
+      "Take a winning title (own upload above-median OR competitor outlier ≥ 3× median) and make a small same-topic tweak.",
+      `Use any one source title/topic for at most ${MAX_IDEAS_PER_TOPIC_PER_RUN} tweaks in this run.`,
+      "Keep the exact same main subject and premise. Change only a few words for clarity, synonyms, or one-breath readability.",
+      "Reject your own candidate if it swaps the subject, adds an abstract premise, or becomes harder to read than the source.",
+      "The source title MUST appear as nested source_attribution.topic_source. format_source must be the empty source object."
+    );
+  } else if (mode === "reddit_angles") {
+    lines.push(
+      "## Mode = reddit_angles",
+      "EVERY idea uses reddit_angle.",
+      "Use Reddit web signals as the topic signal and a YouTube outlier or own winner as format_source.",
+      `Use any one Reddit topic/source theme for at most ${MAX_IDEAS_PER_TOPIC_PER_RUN} ideas in this run.`,
+      "topic_source may be the empty source object. proof.sources and research_sources MUST include Reddit permalinks."
     );
   }
   lines.push("");
-  lines.push(`Return JSON only. ${overshoot} ideas, all valid per the rules above.`);
+  lines.push(`Return JSON only. Exactly ${composeCount} ideas, all valid per the rules above.`);
   return lines.join("\n");
 }
 
@@ -825,7 +1300,73 @@ function parseSourceVideo(v: unknown): SourceVideo | null {
     channel_name: rec.channel_name,
     channel_handle: typeof rec.channel_handle === "string" ? rec.channel_handle : null,
     multiplier: typeof rec.multiplier === "number" ? rec.multiplier : null,
+    thumbnail_url: typeof rec.thumbnail_url === "string" ? rec.thumbnail_url : null,
+    views: typeof rec.views === "number" ? rec.views : null,
+    published_at: typeof rec.published_at === "number" ? rec.published_at : null,
+    age_days: typeof rec.age_days === "number" ? rec.age_days : null,
   };
+}
+
+function parseSourceVideoArray(v: unknown): SourceVideo[] {
+  if (!Array.isArray(v)) return [];
+  const out: SourceVideo[] = [];
+  const seen = new Set<string>();
+  for (const item of v) {
+    const source = parseSourceVideo(item);
+    if (!source || seen.has(source.video_id)) continue;
+    seen.add(source.video_id);
+    out.push(source);
+  }
+  return out;
+}
+
+function parseSourceLink(v: unknown): IdeaSourceLink | null {
+  if (!v || typeof v !== "object") return null;
+  const rec = v as Record<string, unknown>;
+  const type = rec.type === "youtube" || rec.type === "reddit" ? rec.type : null;
+  if (!type || typeof rec.label !== "string" || typeof rec.url !== "string") return null;
+  const date = typeof rec.date === "string" && rec.date.trim().length > 0
+    ? rec.date
+    : null;
+  return {
+    type,
+    label: rec.label,
+    url: rec.url,
+    date,
+  };
+}
+
+function parseProof(v: unknown): IdeaProof | null {
+  if (!v || typeof v !== "object") return null;
+  const rec = v as Record<string, unknown>;
+  if (
+    typeof rec.source_signal !== "string" ||
+    typeof rec.fit !== "string" ||
+    typeof rec.execution !== "string"
+  ) {
+    return null;
+  }
+  const sources = Array.isArray(rec.sources)
+    ? rec.sources.map(parseSourceLink).filter((s): s is IdeaSourceLink => !!s)
+    : [];
+  return {
+    source_signal: rec.source_signal,
+    fit: rec.fit,
+    execution: rec.execution,
+    whats_going_on:
+      typeof rec.whats_going_on === "string" && rec.whats_going_on.trim().length > 0
+        ? rec.whats_going_on
+        : null,
+    weak_proof:
+      typeof rec.weak_proof === "string" && rec.weak_proof.trim().length > 0
+        ? rec.weak_proof
+        : null,
+    sources,
+  };
+}
+
+function normalizeConfidence(v: unknown): "high" | "medium" | "low" {
+  return v === "high" || v === "medium" || v === "low" ? v : "medium";
 }
 
 export function parseComposeJson(raw: string): ComposedIdea[] | null {
@@ -853,6 +1394,13 @@ export function parseComposeJson(raw: string): ComposedIdea[] | null {
     if (typeof ii.title !== "string" || typeof ii.description !== "string") continue;
     const attr = ii.source_attribution as Record<string, unknown> | undefined;
     if (!attr || typeof attr.family !== "string" || typeof attr.reasoning !== "string") continue;
+    const proof = parseProof(ii.proof);
+    if (!proof) continue;
+    const researchSources = Array.isArray(ii.research_sources)
+      ? ii.research_sources
+          .map(parseSourceLink)
+          .filter((s): s is IdeaSourceLink => !!s)
+      : [];
     // Fail loud on old shape — the bare *_video_id strings instead of nested
     // SourceVideo objects. Catching this here forces the system-prompt change
     // to actually bite; otherwise stale output silently passes.
@@ -862,6 +1410,7 @@ export function parseComposeJson(raw: string): ComposedIdea[] | null {
     }
     const topicSource = parseSourceVideo(attr.topic_source);
     const formatSource = parseSourceVideo(attr.format_source);
+    const topicEvidenceSources = parseSourceVideoArray(attr.topic_evidence_sources);
     // method is required on new output; if the model returned something
     // unrecognised, drop the idea outright — better to ship 9 valid ones
     // than 10 with a junk badge. Missing entirely is also rejected
@@ -879,9 +1428,13 @@ export function parseComposeJson(raw: string): ComposedIdea[] | null {
         family: attr.family,
         topic_source: topicSource,
         format_source: formatSource,
+        topic_evidence_sources: topicEvidenceSources,
         reasoning: attr.reasoning,
         method,
       },
+      proof,
+      confidence_level: normalizeConfidence(ii.confidence_level),
+      research_sources: researchSources,
     });
   }
   if (oldShapeCount > 0) {
@@ -911,6 +1464,10 @@ function buildVideoIndex(gathered: GatherResult): Map<string, SourceVideo> {
         channel_name: comp.channel_name,
         channel_handle: comp.handle,
         multiplier: v.multiplier,
+        thumbnail_url: v.thumbnail_url,
+        views: v.views,
+        published_at: v.published_at,
+        age_days: v.age_days,
       });
     }
   }
@@ -926,6 +1483,12 @@ function buildVideoIndex(gathered: GatherResult): Map<string, SourceVideo> {
         channel_handle: ownChannelHandle,
         multiplier:
           ownMedian > 0 ? Number((own.views / ownMedian).toFixed(2)) : null,
+        thumbnail_url: own.thumbnail_url,
+        views: own.views,
+        published_at: own.published_at,
+        age_days: own.published_at
+          ? Math.max(0, Math.floor((Date.now() / 1000 - own.published_at) / 86400))
+          : null,
       });
     }
   }
@@ -948,16 +1511,45 @@ function reconcileSourceVideo(
   return null;
 }
 
+function reconcileSourceVideoArray(
+  raw: SourceVideo[],
+  index: Map<string, SourceVideo>,
+  excludeIds: Iterable<string | null | undefined> = []
+): SourceVideo[] {
+  const excluded = new Set(
+    [...excludeIds].filter((id): id is string => typeof id === "string" && id.length > 0)
+  );
+  const seen = new Set<string>();
+  const out: SourceVideo[] = [];
+  for (const item of raw) {
+    if (excluded.has(item.video_id) || seen.has(item.video_id)) continue;
+    const reconciled = reconcileSourceVideo(item, index);
+    if (!reconciled) continue;
+    seen.add(reconciled.video_id);
+    out.push(reconciled);
+  }
+  return out;
+}
+
 function reconcileIdeas(ideas: ComposedIdea[], gathered: GatherResult): ComposedIdea[] {
   const index = buildVideoIndex(gathered);
-  return ideas.map((idea) => ({
-    ...idea,
-    source_attribution: {
-      ...idea.source_attribution,
-      topic_source: reconcileSourceVideo(idea.source_attribution.topic_source, index),
-      format_source: reconcileSourceVideo(idea.source_attribution.format_source, index),
-    },
-  }));
+  return ideas.map((idea) => {
+    const topicSource = reconcileSourceVideo(idea.source_attribution.topic_source, index);
+    const formatSource = reconcileSourceVideo(idea.source_attribution.format_source, index);
+    return {
+      ...idea,
+      source_attribution: {
+        ...idea.source_attribution,
+        topic_source: topicSource,
+        format_source: formatSource,
+        topic_evidence_sources: reconcileSourceVideoArray(
+          idea.source_attribution.topic_evidence_sources ?? [],
+          index,
+          [topicSource?.video_id, formatSource?.video_id]
+        ),
+      },
+    };
+  });
 }
 
 interface ComposeCallResult {
@@ -973,22 +1565,46 @@ async function callCompose(
 ): Promise<ComposeCallResult> {
   const userContent = attempt === 0
     ? userPrompt
-    : `${userPrompt}\n\n[Retry ${attempt}] Your previous output was not valid JSON matching { "ideas": [{ title, description, source_attribution: { family, reasoning, ... } }] }. Return ONLY the JSON object, no prose, no markdown fences.`;
+    : `${userPrompt}\n\n[Retry ${attempt}] Your previous output did not produce valid parsed ideas. Return ONLY compact JSON matching { "ideas": [{ title, description, confidence_level, source_attribution: { family, topic_source, format_source, topic_evidence_sources, reasoning, method }, proof, research_sources }] }. No prose, no markdown fences. Keep every proof field to one sentence. Use [] for topic_evidence_sources when there is no second topic signal. Use empty strings and empty source objects instead of null.`;
 
   const resp = await callAnthropic(client, {
     model: IDEATION_MODEL_COMPOSE,
     max_tokens: IDEATION_COMPOSE_MAX_TOKENS,
     system: systemPrompt,
     messages: [{ role: "user", content: userContent }],
-    thinking: { type: "enabled", budget_tokens: IDEATION_THINKING_BUDGET },
+    thinking: { type: "adaptive", display: "omitted" },
+    output_config: { format: COMPOSE_OUTPUT_FORMAT, effort: "low" },
   });
 
+  const parsedResp = resp as Anthropic.Message & {
+    parsed_output?: ComposeStructuredOutput | null;
+  };
+  const parsedContent = resp.content as Array<{
+    type: string;
+    text?: string;
+    parsed_output?: ComposeStructuredOutput | null;
+  }>;
+  const structured =
+    parsedResp.parsed_output ??
+    parsedContent.find((b) => b.type === "text" && b.parsed_output)?.parsed_output ??
+    null;
   const raw = resp.content
     .filter((b) => b.type === "text")
     .map((b) => (b as { text: string }).text)
     .join("\n")
     .trim();
-  const parsed = parseComposeJson(raw);
+  const parsed = structured
+    ? parseComposeJson(JSON.stringify(structured))
+    : parseComposeJson(raw);
+  if (!parsed || parsed.length === 0) {
+    log.warn("ideate", "compose parse produced zero usable ideas", {
+      attempt,
+      structuredPresent: !!structured,
+      rawLength: raw.length,
+      contentTypes: resp.content.map((b) => b.type),
+      rawPreview: raw.slice(0, 300),
+    });
+  }
   return {
     ideas: parsed ?? [],
     rawTokens: {
@@ -1008,38 +1624,73 @@ export async function compose(
   gathered: GatherResult,
   mode: Mode,
   count: number,
-  clientOverride?: Anthropic
+  redditResearch: RedditResearchItem[] = [],
+  clientOverride?: Anthropic,
+  redditAvailable = true
 ): Promise<{ ideas: ComposedIdea[]; tokensUsed: { input: number; output: number } }> {
   const client = clientOverride ?? getAnthropicClient();
   const systemPrompt = buildComposeSystemPrompt();
-  const userPrompt = buildComposeUserPrompt(gathered, mode, count);
-
   let tokensUsed = { input: 0, output: 0 };
-  let lastErr: unknown = null;
+  const ideas: ComposedIdea[] = [];
+  const allocations = allocateIdeaBuckets(mode, count, { redditAvailable });
+  const chunks = splitComposeAllocations(allocations);
 
-  for (let attempt = 0; attempt <= MAX_COMPOSE_RETRIES; attempt++) {
-    try {
-      const result = await callCompose(client, systemPrompt, userPrompt, attempt);
-      tokensUsed = {
-        input: tokensUsed.input + result.rawTokens.input,
-        output: tokensUsed.output + result.rawTokens.output,
-      };
-      if (result.ideas.length > 0) {
-        const reconciled = reconcileIdeas(result.ideas, gathered);
-        return { ideas: reconciled, tokensUsed };
+  for (const chunk of chunks) {
+    const chunkMode = modeForMethod(chunk.method);
+    const userPrompt = buildComposeUserPrompt(
+      gathered,
+      chunkMode,
+      chunk.count,
+      chunk.method === "reddit_angle" ? redditResearch : [],
+      chunk.method === "reddit_angle"
+    );
+    let lastErr: unknown = null;
+    let chunkIdeas: ComposedIdea[] = [];
+
+    log.info("ideate", "compose chunk start", {
+      method: chunk.method,
+      target: chunk.count,
+    });
+
+    for (let attempt = 0; attempt <= MAX_COMPOSE_RETRIES; attempt++) {
+      try {
+        const result = await callCompose(client, systemPrompt, userPrompt, attempt);
+        tokensUsed = {
+          input: tokensUsed.input + result.rawTokens.input,
+          output: tokensUsed.output + result.rawTokens.output,
+        };
+        if (result.ideas.length > 0) {
+          chunkIdeas = reconcileIdeas(result.ideas, gathered).slice(0, chunk.count);
+          break;
+        }
+        log.warn("ideate", "compose returned no valid ideas, retrying", {
+          attempt,
+          method: chunk.method,
+        });
+      } catch (err) {
+        lastErr = err;
+        log.warn("ideate", "compose call failed", {
+          attempt,
+          method: chunk.method,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
-      log.warn("ideate", "compose returned no valid ideas, retrying", { attempt });
-    } catch (err) {
-      lastErr = err;
-      log.warn("ideate", "compose call failed", {
-        attempt,
-        error: err instanceof Error ? err.message : String(err),
-      });
     }
+
+    if (chunkIdeas.length === 0) {
+      throw new Error(
+        `compose ${chunk.method} chunk exhausted (${MAX_COMPOSE_RETRIES + 1} attempts): ${lastErr instanceof Error ? lastErr.message : String(lastErr ?? "no valid JSON")}`
+      );
+    }
+
+    ideas.push(...chunkIdeas);
+    log.info("ideate", "compose chunk complete", {
+      method: chunk.method,
+      ideas_returned: chunkIdeas.length,
+    });
   }
-  throw new Error(
-    `compose retries exhausted (${MAX_COMPOSE_RETRIES + 1} attempts): ${lastErr instanceof Error ? lastErr.message : String(lastErr ?? "no valid JSON")}`
-  );
+
+  return { ideas, tokensUsed };
 }
 
 /* ------------------------------------------------------------ */
@@ -1051,16 +1702,282 @@ interface HardRuleVerdict {
   reason: string | null;
 }
 
+function sourceAgeDays(source: SourceVideo | null | undefined): number | null {
+  if (!source) return null;
+  if (typeof source.age_days === "number" && Number.isFinite(source.age_days)) {
+    return source.age_days;
+  }
+  if (typeof source.published_at === "number" && source.published_at > 0) {
+    return Math.max(0, Math.floor((Date.now() / 1000 - source.published_at) / 86400));
+  }
+  return null;
+}
+
+function topicEvidenceSources(idea: Pick<ComposedIdea, "source_attribution">): SourceVideo[] {
+  const out: SourceVideo[] = [];
+  const seen = new Set<string>();
+  const add = (source: SourceVideo | null | undefined) => {
+    if (!source || seen.has(source.video_id)) return;
+    seen.add(source.video_id);
+    out.push(source);
+  };
+  add(idea.source_attribution.topic_source);
+  for (const source of idea.source_attribution.topic_evidence_sources ?? []) add(source);
+  return out;
+}
+
+function hasRecentTopicSignal(sources: SourceVideo[]): boolean {
+  return sources.some((source) => {
+    const age = sourceAgeDays(source);
+    return age !== null && age <= TOPIC_RECENCY_DAYS;
+  });
+}
+
+function recentTopicSignalCount(sources: SourceVideo[]): number {
+  return sources.reduce((count, source) => {
+    const age = sourceAgeDays(source);
+    return age !== null && age <= TOPIC_RECENCY_DAYS ? count + 1 : count;
+  }, 0);
+}
+
+const TITLE_TWEAK_STOPWORDS = new Set([
+  "about",
+  "after",
+  "also",
+  "before",
+  "between",
+  "could",
+  "every",
+  "finally",
+  "from",
+  "have",
+  "human",
+  "humans",
+  "just",
+  "like",
+  "really",
+  "that",
+  "their",
+  "there",
+  "this",
+  "through",
+  "what",
+  "when",
+  "where",
+  "will",
+  "with",
+  "would",
+  "your",
+]);
+
+function contentWords(value: string): string[] {
+  return value
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length > 3 && !TITLE_TWEAK_STOPWORDS.has(w));
+}
+
+function normalizeCooldownTitle(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function uniqueUsedTitleCooldowns(items: UsedTitleCooldown[]): UsedTitleCooldown[] {
+  const seen = new Set<string>();
+  const out: UsedTitleCooldown[] = [];
+  for (const item of items) {
+    const key = normalizeCooldownTitle(item.title);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+export function usedTitleSimilarityScore(title: string, usedTitle: string): number {
+  const normalizedTitle = normalizeCooldownTitle(title);
+  const normalizedUsed = normalizeCooldownTitle(usedTitle);
+  if (!normalizedTitle || !normalizedUsed) return 0;
+  if (normalizedTitle === normalizedUsed) return 1;
+
+  const a = new Set(contentWords(normalizedTitle));
+  const b = new Set(contentWords(normalizedUsed));
+  if (a.size === 0 || b.size === 0) return 0;
+
+  let overlap = 0;
+  for (const word of a) if (b.has(word)) overlap++;
+  const minSize = Math.min(a.size, b.size);
+  const unionSize = new Set([...a, ...b]).size;
+  const containment = overlap / Math.max(1, minSize);
+  const jaccard = overlap / Math.max(1, unionSize);
+
+  if (overlap >= 4 && containment >= 0.8) return containment;
+  return jaccard;
+}
+
+function usedTitleCooldownReason(
+  title: string,
+  usedTitles: UsedTitleCooldown[]
+): string | null {
+  const normalizedTitle = normalizeCooldownTitle(title);
+  for (const item of uniqueUsedTitleCooldowns(usedTitles)) {
+    const normalizedUsed = normalizeCooldownTitle(item.title);
+    if (!normalizedUsed) continue;
+    if (normalizedTitle === normalizedUsed) {
+      return `cooldown: exact copied title already used: ${item.title}`;
+    }
+    const score = usedTitleSimilarityScore(title, item.title);
+    if (score >= 0.8) {
+      return `cooldown: too similar to copied title: ${item.title}`;
+    }
+  }
+  return null;
+}
+
+function topicCapSignal(
+  idea: Pick<ComposedIdea, "title" | "source_attribution" | "proof" | "research_sources">
+): { label: string; sourceIds: Set<string> } | null {
+  const sources = topicEvidenceSources(idea);
+  const sourceIds = new Set(
+    sources
+      .map((source) => source.video_id)
+      .filter((id) => id && id.trim().length > 0)
+  );
+  const primaryLabel = sources.find((source) => source.title?.trim())?.title?.trim();
+  if (primaryLabel) return { label: primaryLabel, sourceIds };
+
+  const redditSource =
+    idea.proof.sources.find((source) => source.type === "reddit") ??
+    idea.research_sources.find((source) => source.type === "reddit");
+  if (redditSource?.label?.trim()) {
+    return { label: redditSource.label.trim(), sourceIds };
+  }
+
+  const signal = idea.proof.source_signal?.trim();
+  if (signal) return { label: signal, sourceIds };
+  return idea.title.trim() ? { label: idea.title.trim(), sourceIds } : null;
+}
+
+function sourceIdsOverlap(a: Set<string>, b: Set<string>): boolean {
+  if (a.size === 0 || b.size === 0) return false;
+  for (const id of a) if (b.has(id)) return true;
+  return false;
+}
+
+function enforceTopicCap(verdicts: ValidatedIdea[]): void {
+  const clusters: Array<{
+    representative: string;
+    label: string;
+    sourceIds: Set<string>;
+    count: number;
+  }> = [];
+  const ordered = verdicts
+    .map((idea, idx) => ({ idea, idx, rank: validatedIdeaRank(idea) }))
+    .filter((item) => item.idea.validation_status === "passed")
+    .sort((a, b) => b.rank - a.rank);
+
+  for (const item of ordered) {
+    const signal = topicCapSignal(item.idea);
+    if (!signal) continue;
+    let cluster = clusters.find(
+      (candidate) =>
+        sourceIdsOverlap(candidate.sourceIds, signal.sourceIds) ||
+        usedTitleSimilarityScore(candidate.representative, signal.label) >= 0.68
+    );
+    if (!cluster) {
+      cluster = {
+        representative: signal.label,
+        label: signal.label,
+        sourceIds: new Set(signal.sourceIds),
+        count: 0,
+      };
+      clusters.push(cluster);
+    }
+    if (cluster.count >= MAX_IDEAS_PER_TOPIC_PER_RUN) {
+      verdicts[item.idx].validation_status = "rejected";
+      verdicts[item.idx].validation_reason =
+        `topic cap: more than ${MAX_IDEAS_PER_TOPIC_PER_RUN} ideas on "${cluster.label}"`;
+      continue;
+    }
+    cluster.count++;
+    for (const id of signal.sourceIds) cluster.sourceIds.add(id);
+  }
+}
+
+export function titleTweakDriftReason(title: string, sourceTitle: string): string | null {
+  const normalizedTitle = title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const normalizedSource = sourceTitle.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  if (!normalizedSource) return null;
+  if (normalizedTitle === normalizedSource) {
+    return "title_tweak unchanged from source";
+  }
+
+  const srcWords = new Set(contentWords(sourceTitle));
+  const newWords = contentWords(title);
+  if (srcWords.size === 0 || newWords.length === 0) return null;
+
+  let overlap = 0;
+  let added = 0;
+  for (const word of newWords) {
+    if (srcWords.has(word)) overlap++;
+    else added++;
+  }
+  const overlapRatio = overlap / Math.max(1, Math.min(srcWords.size, newWords.length));
+  if (overlapRatio < 0.45 || added > 4) {
+    return `title_tweak drifted from source topic (${added} new content words)`;
+  }
+  return null;
+}
+
+function knownOutlierIndex(gathered: GatherResult): {
+  ids: Set<string>;
+  multiplierById: Map<string, number>;
+} {
+  const ids = new Set<string>();
+  const multiplierById = new Map<string, number>();
+  for (const c of gathered.competitors) {
+    for (const v of c.videos) {
+      if (!v.is_outlier) continue;
+      ids.add(v.video_id);
+      multiplierById.set(v.video_id, v.multiplier);
+    }
+  }
+  return { ids, multiplierById };
+}
+
+export function titleWordCount(title: string): number {
+  return title.trim().split(/\s+/).filter((word) => word.length > 0).length;
+}
+
+export function titleLengthHardRuleReason(title: string): string | null {
+  if (title.length > TITLE_MAX_CHARS) {
+    return `title too long: ${title.length} characters; max ${TITLE_MAX_CHARS}`;
+  }
+  const words = titleWordCount(title);
+  if (words > TITLE_MAX_WORDS) {
+    return `title too wordy: ${words} words; max ${TITLE_MAX_WORDS}`;
+  }
+  return null;
+}
+
 export function hardRuleCheck(idea: ComposedIdea, gathered: GatherResult): HardRuleVerdict {
   const title = idea.title.trim();
   if (title.length === 0) return { passed: false, reason: "empty title" };
-  if (title.length > TITLE_LEN_HARD_MAX) {
-    return { passed: false, reason: `title too long: ${title.length} chars` };
-  }
-  if (title.length < TITLE_LEN_MIN) {
-    return { passed: false, reason: `title too short: ${title.length} chars` };
-  }
+  const titleLengthReason = titleLengthHardRuleReason(title);
+  if (titleLengthReason) return { passed: false, reason: titleLengthReason };
   const lowerTitle = title.toLowerCase();
+  const cooldownReason = usedTitleCooldownReason(
+    title,
+    gathered.used_title_cooldowns ?? []
+  );
+  if (cooldownReason) {
+    return { passed: false, reason: cooldownReason };
+  }
   for (const w of FORBIDDEN_WORDS) {
     if (lowerTitle.includes(w.toLowerCase())) {
       return { passed: false, reason: `forbidden word: ${w}` };
@@ -1096,17 +2013,8 @@ export function hardRuleCheck(idea: ComposedIdea, gathered: GatherResult): HardR
   // can't be satisfied — this is the back-stop that fails loudly when
   // the model ignores the instruction.
   if (method === "new_angle") {
-    const outlierIds = new Set(
-      gathered.competitors.flatMap((c) =>
-        c.videos.filter((v) => v.is_outlier).map((v) => v.video_id)
-      )
-    );
-    const outlierMultiplierById = new Map<string, number>();
-    for (const c of gathered.competitors) {
-      for (const v of c.videos) {
-        if (v.is_outlier) outlierMultiplierById.set(v.video_id, v.multiplier);
-      }
-    }
+    const { ids: outlierIds, multiplierById: outlierMultiplierById } =
+      knownOutlierIndex(gathered);
     const topic = idea.source_attribution.topic_source?.video_id ?? null;
     const fmt = idea.source_attribution.format_source?.video_id ?? null;
     if (!topic || !fmt) {
@@ -1123,30 +2031,61 @@ export function hardRuleCheck(idea: ComposedIdea, gathered: GatherResult): HardR
     if (tMult < 2.0 || fMult < 2.0) {
       return { passed: false, reason: "new_angle missing valid outlier source" };
     }
+    for (const evidence of idea.source_attribution.topic_evidence_sources ?? []) {
+      if (!outlierIds.has(evidence.video_id)) {
+        return { passed: false, reason: "topic evidence source is not a known outlier" };
+      }
+    }
+    const primaryTopicAge = sourceAgeDays(idea.source_attribution.topic_source);
+    if (primaryTopicAge === null) {
+      return {
+        passed: false,
+        reason: "topic source is missing upload age/date metadata",
+      };
+    }
+    if (primaryTopicAge > TOPIC_RECENCY_DAYS) {
+      return {
+        passed: false,
+        reason: `topic source is older than ${TOPIC_RECENCY_DAYS} days`,
+      };
+    }
+  }
+
+  if (method === "reddit_angle") {
+    const hasRedditSource =
+      idea.proof.sources.some((s) => s.type === "reddit" && s.url.includes("reddit.com")) ||
+      idea.research_sources.some((s) => s.type === "reddit" && s.url.includes("reddit.com"));
+    if (!hasRedditSource) {
+      return { passed: false, reason: "reddit_angle missing Reddit source" };
+    }
+    const format = idea.source_attribution.format_source;
+    if (!format) {
+      return { passed: false, reason: "reddit_angle missing YouTube format source" };
+    }
+    const sourceIds = new Set<string>();
+    for (const comp of gathered.competitors) {
+      for (const v of comp.videos) {
+        if (v.is_outlier) sourceIds.add(v.video_id);
+      }
+    }
+    for (const own of gathered.own_recent_uploads) {
+      if (gathered.own_median_views > 0 && own.views >= gathered.own_median_views) {
+        sourceIds.add(own.video_id);
+      }
+    }
+    if (!sourceIds.has(format.video_id)) {
+      return { passed: false, reason: "reddit_angle format source is not a YouTube outlier or own winner" };
+    }
   }
 
   // PRIO-7: title_tweak token-diff rule. The whole point of a tweak is a
-  // changed title against the same proven topic — if the new title is
-  // identical or a near-clone, it's just a copy. Require ≥ 2 distinct
-  // content words (length > 3) that don't appear in the source title.
+  // small same-topic edit. Reject unchanged copies and subject drift, but
+  // allow close readable variants.
   if (method === "title_tweak") {
     const sourceTitle = idea.source_attribution.topic_source?.title ?? "";
-    const srcWords = new Set(
-      sourceTitle
-        .toLowerCase()
-        .split(/[^a-z0-9]+/)
-        .filter((w) => w.length > 3)
-    );
-    const newWords = lowerTitle
-      .split(/[^a-z0-9]+/)
-      .filter((w) => w.length > 3);
-    let distinct = 0;
-    for (const w of newWords) if (!srcWords.has(w)) distinct++;
-    if (sourceTitle.trim().length > 0 && distinct < 2) {
-      return {
-        passed: false,
-        reason: `title_tweak too close to source (${distinct} distinct content words)`,
-      };
+    const driftReason = titleTweakDriftReason(title, sourceTitle);
+    if (driftReason) {
+      return { passed: false, reason: driftReason };
     }
   }
 
@@ -1193,18 +2132,22 @@ export interface ValidatorScore {
   fit_score: number;
   dup_of: number | null;
   fit_reason: string;
+  weak_proof: string | null;
 }
 
 function buildValidateSystemPrompt(): string {
   return [
-    "You are a YouTube channel-fit validator. For each candidate idea, score 1-10 on",
+    "You are a YouTube channel-fit validator. For each candidate idea, score 0-10 on",
     "whether THIS topic genuinely fits THIS channel's niche, audience, and voice —",
     "not whether the topic is broadly viral. A generic angle slapped on a hot format",
     "scores 3-4. An idea that uniquely leverages this channel's authority + audience scores 8-10.",
     "",
     "Also flag near-duplicates within the candidate set (same topic, same angle).",
+    "Do not reject weak-but-plausible ideas yourself. If proof is weak but the idea",
+    "still fits, score it 5-6 and name the weak proof in weak_proof.",
+    "Decimals are allowed; use them when a candidate sits between two quality levels.",
     "",
-    "Output ONLY JSON: { \"ideas\": [{ \"idx\": <0-based-index>, \"fit_score\": <1-10>, \"dup_of\": <idx | null>, \"fit_reason\": \"<one sentence>\" }] }",
+    "Output ONLY JSON: { \"ideas\": [{ \"idx\": <0-based-index>, \"fit_score\": <0-10 decimal allowed>, \"dup_of\": <idx or -1>, \"fit_reason\": \"<one sentence>\", \"weak_proof\": \"\" }] }",
   ].join("\n");
 }
 
@@ -1232,6 +2175,24 @@ function buildValidateUserPrompt(survivors: { idx: number; idea: ComposedIdea }[
     lines.push(`[idx=${s.idx}] ${s.idea.title}`);
     lines.push(`  description: ${s.idea.description}`);
     lines.push(`  family: ${s.idea.source_attribution.family}`);
+    lines.push(`  method: ${s.idea.source_attribution.method ?? "unknown"}`);
+    const topicSignals = topicEvidenceSources(s.idea);
+    if (topicSignals.length > 0) {
+      lines.push(
+        `  topic_signals: ${topicSignals
+          .map((source) => `${source.title} (${source.multiplier ?? "?"}×, ${sourceAgeDays(source) ?? "?"}d)`)
+          .join(" | ")}`
+      );
+    }
+    lines.push(`  source_signal: ${s.idea.proof.source_signal}`);
+    lines.push(`  fit: ${s.idea.proof.fit}`);
+    lines.push(`  execution: ${s.idea.proof.execution}`);
+    if (s.idea.proof.whats_going_on) {
+      lines.push(`  whats_going_on: ${s.idea.proof.whats_going_on}`);
+    }
+    if (s.idea.proof.weak_proof) {
+      lines.push(`  weak_proof: ${s.idea.proof.weak_proof}`);
+    }
     lines.push("");
   }
   lines.push("Score each. Output JSON only.");
@@ -1260,21 +2221,102 @@ export function parseValidateJson(raw: string): ValidatorScore[] | null {
     if (!item || typeof item !== "object") continue;
     const ii = item as Record<string, unknown>;
     if (typeof ii.idx !== "number" || typeof ii.fit_score !== "number") continue;
+    const clampedScore = Math.max(0, Math.min(10, ii.fit_score));
     out.push({
       idx: ii.idx,
-      fit_score: Math.max(1, Math.min(10, Math.round(ii.fit_score))),
-      dup_of: typeof ii.dup_of === "number" ? ii.dup_of : null,
+      fit_score: Math.round(clampedScore * 10) / 10,
+      dup_of: typeof ii.dup_of === "number" && ii.dup_of >= 0 ? ii.dup_of : null,
       fit_reason: typeof ii.fit_reason === "string" ? ii.fit_reason : "",
+      weak_proof:
+        typeof ii.weak_proof === "string" && ii.weak_proof.trim().length > 0
+          ? ii.weak_proof
+          : null,
     });
   }
   return out;
+}
+
+export function confidenceFromFitScore(
+  fitScore: number | null,
+  weakProof?: string | null
+): "high" | "medium" | "low" {
+  if (weakProof && weakProof.trim().length > 0) return "low";
+  if (fitScore === null) return "medium";
+  if (fitScore >= 9) return "high";
+  if (fitScore >= FIT_SCORE_PASS_THRESHOLD) return "medium";
+  return "low";
+}
+
+export function confidenceFromEvidence(
+  fitScore: number | null,
+  weakProof: string | null | undefined,
+  idea: Pick<ComposedIdea, "source_attribution" | "proof" | "research_sources">
+): "high" | "medium" | "low" {
+  if (weakProof && weakProof.trim().length > 0) return "low";
+  if (fitScore === null) return "medium";
+
+  const evidence = topicEvidenceSources(idea);
+  const evidenceCount = evidence.length;
+  const hasRecent = hasRecentTopicSignal(evidence);
+  const recentCount = recentTopicSignalCount(evidence);
+
+  if (fitScore >= 8 && recentCount >= 2) return "high";
+
+  const hasRedditProof =
+    idea.proof.sources.some((s) => s.type === "reddit" && s.url.includes("reddit.com")) ||
+    idea.research_sources.some((s) => s.type === "reddit" && s.url.includes("reddit.com"));
+  if (fitScore >= FIT_SCORE_PASS_THRESHOLD && (hasRecent || evidenceCount >= 2 || hasRedditProof)) {
+    return "medium";
+  }
+
+  return "low";
+}
+
+function confidenceRank(confidence: "high" | "medium" | "low"): number {
+  if (confidence === "high") return 3;
+  if (confidence === "medium") return 2;
+  return 1;
+}
+
+function validatedIdeaRank(idea: ValidatedIdea): number {
+  const recentCount = recentTopicSignalCount(topicEvidenceSources(idea));
+  const fitScore = idea.fit_score ?? 0;
+  return confidenceRank(idea.confidence_level) * 10_000 + recentCount * 100 + fitScore;
+}
+
+function selectBalancedPassing(
+  verdicts: ValidatedIdea[],
+  mode: Mode,
+  count: number,
+  redditAvailable = true
+): Set<number> {
+  const target = allocateIdeaBuckets(mode, count, { redditAvailable });
+  const passing = verdicts
+    .map((v, i) => ({ v, i, score: validatedIdeaRank(v) }))
+    .filter((x) => x.v.validation_status === "passed")
+    .sort((a, b) => b.score - a.score);
+  const selected = new Set<number>();
+
+  for (const bucket of target) {
+    const matches = passing.filter(
+      (x) => x.v.source_attribution.method === bucket.method && !selected.has(x.i)
+    );
+    for (const item of matches.slice(0, bucket.count)) selected.add(item.i);
+  }
+  for (const item of passing) {
+    if (selected.size >= count) break;
+    selected.add(item.i);
+  }
+  return selected;
 }
 
 export async function validate(
   composed: ComposedIdea[],
   gathered: GatherResult,
   count: number,
-  clientOverride?: Anthropic
+  mode: Mode = "auto",
+  clientOverride?: Anthropic,
+  redditAvailable = true
 ): Promise<{ ideas: ValidatedIdea[]; tokensUsed: { input: number; output: number } }> {
   const verdicts: ValidatedIdea[] = composed.map((idea) => {
     const verdict = hardRuleCheck(idea, gathered);
@@ -1283,9 +2325,13 @@ export async function validate(
       title: idea.title,
       description: idea.description,
       source_attribution: idea.source_attribution,
+      proof: idea.proof,
+      confidence_level: idea.confidence_level,
+      research_sources: idea.research_sources,
       validation_status: verdict.passed ? "passed" : "rejected",
       validation_reason: verdict.reason,
-      fit_score: null,
+      fit_score: verdict.passed ? null : 0,
+      fit_reason: null,
     };
   });
 
@@ -1319,16 +2365,22 @@ export async function validate(
         max_tokens: IDEATION_VALIDATE_MAX_TOKENS,
         system: systemPrompt,
         messages: [{ role: "user", content }],
+        output_config: { format: VALIDATE_OUTPUT_FORMAT },
       });
       tokensUsed = {
         input: tokensUsed.input + (resp.usage?.input_tokens ?? 0),
         output: tokensUsed.output + (resp.usage?.output_tokens ?? 0),
       };
+      const structured = (resp as Anthropic.Message & {
+        parsed_output?: ValidateStructuredOutput | null;
+      }).parsed_output;
       const raw = resp.content
         .filter((b) => b.type === "text")
         .map((b) => (b as { text: string }).text)
         .join("\n");
-      const parsed = parseValidateJson(raw);
+      const parsed = structured
+        ? parseValidateJson(JSON.stringify(structured))
+        : parseValidateJson(raw);
       if (parsed && parsed.length > 0) {
         scores = parsed;
         break;
@@ -1356,13 +2408,25 @@ export async function validate(
     if (!score) {
       verdicts[s.idx].validation_status = "rejected";
       verdicts[s.idx].validation_reason = "validator did not score";
+      verdicts[s.idx].fit_score = 0;
+      verdicts[s.idx].fit_reason = null;
       continue;
     }
     verdicts[s.idx].fit_score = score.fit_score;
-    if (score.fit_score < FIT_SCORE_PASS_THRESHOLD) {
-      verdicts[s.idx].validation_status = "rejected";
-      verdicts[s.idx].validation_reason = `fit score ${score.fit_score} < ${FIT_SCORE_PASS_THRESHOLD}`;
-    } else if (score.dup_of !== null) {
+    verdicts[s.idx].fit_reason = score.fit_reason.trim() || null;
+    const weakProof = score.weak_proof?.trim() || null;
+    if (weakProof) {
+      verdicts[s.idx].proof = {
+        ...verdicts[s.idx].proof,
+        weak_proof: weakProof,
+      };
+    }
+    verdicts[s.idx].confidence_level = confidenceFromEvidence(
+      score.fit_score,
+      weakProof,
+      verdicts[s.idx]
+    );
+    if (score.dup_of !== null) {
       const dupScore = scoreByIdx.get(score.dup_of);
       if (dupScore && dupScore.fit_score >= score.fit_score && verdicts[score.dup_of].validation_status === "passed") {
         verdicts[s.idx].validation_status = "rejected";
@@ -1371,18 +2435,7 @@ export async function validate(
     }
   }
 
-  const passing = verdicts
-    .map((v, i) => ({ v, i, score: v.fit_score ?? 0 }))
-    .filter((x) => x.v.validation_status === "passed")
-    .sort((a, b) => b.score - a.score);
-
-  if (passing.length > count) {
-    for (let i = count; i < passing.length; i++) {
-      const idx = passing[i].i;
-      verdicts[idx].validation_status = "rejected";
-      verdicts[idx].validation_reason = `over count limit (rank ${i + 1})`;
-    }
-  }
+  enforceTopicCap(verdicts);
 
   return { ideas: verdicts, tokensUsed };
 }
@@ -1395,8 +2448,9 @@ export function persist(validated: ValidatedIdea[], generationId: string): void 
   const stmt = db.prepare(
     `INSERT INTO ideas
        (id, generation_id, title, description, source_attribution,
-        validation_status, validation_reason, fit_score)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        proof_json, confidence_level, research_sources_json,
+        validation_status, validation_reason, fit_score, fit_reason)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const tx = db.transaction(() => {
     for (const idea of validated) {
@@ -1406,9 +2460,13 @@ export function persist(validated: ValidatedIdea[], generationId: string): void 
         idea.title,
         idea.description,
         JSON.stringify(idea.source_attribution),
+        JSON.stringify(idea.proof),
+        idea.confidence_level,
+        JSON.stringify(idea.research_sources),
         idea.validation_status,
         idea.validation_reason,
-        idea.fit_score
+        idea.fit_score,
+        idea.fit_reason
       );
     }
   });
@@ -1578,6 +2636,50 @@ export async function distillFeedback(userChannelId: string, clientOverride?: An
 /* runPipeline() — orchestrator                                   */
 /* ------------------------------------------------------------ */
 
+function extractTopicSeeds(gathered: GatherResult): string[] {
+  const seeds: string[] = [];
+  const push = (value: unknown) => {
+    if (typeof value !== "string") return;
+    const clean = value.replace(/\s+/g, " ").trim();
+    if (clean.length < 4 || clean.length > 120) return;
+    const key = clean.toLowerCase();
+    if (seeds.some((s) => s.toLowerCase() === key)) return;
+    seeds.push(clean);
+  };
+
+  try {
+    const raw = gathered.channel_context.topic_analysis_json;
+    if (raw) {
+      const parsed = JSON.parse(raw) as {
+        crossCompetitorPatterns?: Array<{ topic?: string; label?: string }>;
+        topicClusters?: Array<{ topic?: string; label?: string }>;
+        clusters?: Array<{ topic?: string; label?: string }>;
+      };
+      for (const cluster of parsed.crossCompetitorPatterns ?? []) {
+        push(cluster.topic ?? cluster.label);
+      }
+      for (const cluster of parsed.topicClusters ?? parsed.clusters ?? []) {
+        push(cluster.topic ?? cluster.label);
+      }
+    }
+  } catch {
+    /* ignore cached shape drift */
+  }
+
+  for (const own of gathered.own_recent_uploads.slice(0, 8)) push(own.title);
+  for (const comp of gathered.competitors) {
+    for (const v of comp.videos.filter((x) => x.is_outlier).slice(0, 4)) {
+      push(v.title);
+    }
+  }
+
+  return seeds.slice(0, 8);
+}
+
+function modeNeedsReddit(mode: Mode, redditAvailable: boolean): boolean {
+  return mode === "reddit_angles" || (mode === "auto" && redditAvailable);
+}
+
 export async function runPipeline(
   generationId: string,
   options: GatherOptions = {}
@@ -1622,14 +2724,57 @@ export async function runPipeline(
       dropped: gathered.dropped_competitors.length,
     });
 
-    const composed = await compose(gathered, gen.mode, gen.count, client);
+    let redditResearch: RedditResearchItem[] = [];
+    const subreddits = parseSubredditSources(gathered.channel_context.reddit_sources);
+    let redditAvailable = hasRedditSignalProvider() && subreddits.length > 0;
+
+    if (gen.mode === "reddit_angles" && !redditAvailable) {
+      throw new Error(
+        !hasRedditSignalProvider()
+          ? "Brave Search API key missing — add it in /settings/integrations"
+          : "No Reddit sources configured for this channel — add one subreddit per line in /channel-info"
+      );
+    }
+
+    if (modeNeedsReddit(gen.mode, redditAvailable)) {
+      const topics = extractTopicSeeds(gathered);
+      try {
+        redditResearch = await collectRedditResearch({
+          userChannelId: gen.user_channel_id,
+          generationId,
+          topics,
+          subreddits,
+          maxItems: Math.max(12, Math.ceil(gen.count * 1.5)),
+        });
+      } catch (err) {
+        if (gen.mode === "reddit_angles") throw err;
+        redditAvailable = false;
+        log.warn("ideate", "reddit web signals failed — continuing Auto without Reddit bucket", {
+          generationId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      if (redditResearch.length === 0) {
+        if (gen.mode === "reddit_angles") {
+          throw new Error("No usable Reddit web signals found in the configured subreddits for this channel");
+        }
+        redditAvailable = false;
+      }
+      log.info("ideate", "reddit research complete", {
+        generationId,
+        items: redditResearch.length,
+        reused: redditResearch.filter((item) => item.reused).length,
+      });
+    }
+
+    const composed = await compose(gathered, gen.mode, gen.count, redditResearch, client, redditAvailable);
     log.info("ideate", "compose complete", {
       generationId,
       ideas_returned: composed.ideas.length,
       tokens: composed.tokensUsed,
     });
 
-    const validated = await validate(composed.ideas, gathered, gen.count, client);
+    const validated = await validate(composed.ideas, gathered, gen.count, gen.mode, client, redditAvailable);
     const passed = validated.ideas.filter((v) => v.validation_status === "passed").length;
     log.info("ideate", "validate complete", {
       generationId,

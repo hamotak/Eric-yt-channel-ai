@@ -8,12 +8,6 @@ import {
   listVideos,
   setSetting,
 } from "@/lib/db";
-import { getOAuthTokens } from "@/lib/google-oauth";
-import {
-  fetchChannelAudience,
-  YtAnalyticsError,
-  type ChannelAudienceBundle,
-} from "@/lib/yt-analytics";
 import { extractSection, loadMentorMethod } from "@/lib/mentor-method";
 import { log } from "@/lib/logger";
 
@@ -24,8 +18,8 @@ const RATE_LIMIT_WINDOW_SEC = 5 * 60; // one analyze per channel per 5 min
 
 // Single-paragraph channel_description — the one source of truth the rest
 // of the app's AI agents read on every job. Signal sources: recent video
-// titles + descriptions + view/like/comment counts, recent comment-analysis
-// summaries (when any), and Studio demographics (when OAuth is connected).
+// titles + descriptions + view/like/comment counts, and recent comment-analysis
+// summaries when any.
 // Transcripts used to feed this prompt; that backend was removed in the
 // May 2026 simplification pass.
 const DESCRIPTION_CAP = 1500;
@@ -99,56 +93,14 @@ export async function POST(req: Request) {
     }
   }
 
-  // Demographics fetch — graceful, never blocks the AI proposal.
-  // Three failure modes all caught: no OAuth tokens, soft 4xx from YT
-  // Analytics (per-sub-report soft() wrapper), and unexpected throws.
-  // When demographics ARE available we inject them as ground truth for
-  // the Audience field; when absent the Audience instruction falls back
-  // to inference from titles + descriptions + comment-analysis summaries.
-  let demographicsBlock = "";
-  const oauth = getOAuthTokens(channelId);
-  if (oauth?.refresh_token) {
-    try {
-      // PeriodSpec is `number | "all"` (days, not the "90d" string key).
-      const audience = await fetchChannelAudience(90, channelId);
-      demographicsBlock = formatDemographicsBlock(audience);
-      if (demographicsBlock) {
-        log.info(
-          "claude",
-          `Analyze-with-AI ${channelId}: injected demographics (${audience.demographics.length} demo rows, ${audience.geography.length} countries)`
-        );
-      } else {
-        log.info(
-          "claude",
-          `Analyze-with-AI ${channelId}: demographics empty (OAuth granted but YT returned no rows)`
-        );
-      }
-    } catch (err) {
-      const msg =
-        err instanceof YtAnalyticsError || err instanceof Error
-          ? err.message
-          : "audience fetch failed";
-      log.warn(
-        "claude",
-        `Analyze-with-AI ${channelId}: skipping demographics — ${msg}`
-      );
-    }
-  } else {
-    log.info(
-      "claude",
-      `Analyze-with-AI ${channelId}: skipping demographics — no OAuth tokens for this channel`
-    );
-  }
-
   // Build prompt.
   const md = loadMentorMethod();
   const sec1 = extractSection(md, 1);
   const sec7 = extractSection(md, 7);
   const sec9 = extractSection(md, 9);
 
-  const audienceLine = demographicsBlock
-    ? "Cover audience grounded in the demographics block above as ground truth — top age group, top 2 countries by share. Do not speculate when the data is in front of you."
-    : "Cover audience inferred from titles + descriptions + comment-analysis summaries below — age range, region, what they're looking for.";
+  const audienceLine =
+    "Cover audience inferred from titles + descriptions + comment-analysis summaries below — age range, region, what they're looking for.";
 
   // v2: a single channel_description paragraph (one source of truth that
   // the agent reads on every job). Replaces the prior 5-field proposal.
@@ -163,8 +115,6 @@ export async function POST(req: Request) {
     "",
     "From MENTOR_METHOD.md §9 (The \"what made it work\" lever taxonomy):",
     sec9 || "(section unavailable)",
-    demographicsBlock ? "" : null,
-    demographicsBlock || null,
     "",
     "# What this paragraph must cover",
     "- WHAT the channel is about (1 sentence — the niche, but framed naturally, not as a definition).",
@@ -181,7 +131,6 @@ export async function POST(req: Request) {
     "Return ONLY a JSON object. No prose, no markdown, no code fence. Shape:",
     "{ \"description\": string }",
   ]
-    .filter((line): line is string => line !== null)
     .join("\n");
 
   const userBody = [
@@ -282,63 +231,4 @@ function parseProposal(raw: string): Proposal | null {
         ? `${description.slice(0, DESCRIPTION_CAP - 1).trimEnd()}…`
         : description,
   };
-}
-
-/**
- * Render the audience bundle as a compact human-readable block for the
- * Claude system prompt. Shows:
- *  - Top 5 age×gender combos by viewerPercentage (the direct % from YT)
- *  - Top 5 countries by view-share (computed against the sum of returned rows)
- *  - Top 3 traffic sources by view-share
- * Devices intentionally skipped — desktop/mobile/tablet split rarely
- * shapes the AUDIENCE description (it speaks to consumption habits more
- * than to who the audience is). Returns "" when every block is empty,
- * which the caller treats as "no demographics, fall back to inference".
- */
-function formatDemographicsBlock(b: ChannelAudienceBundle): string {
-  const lines: string[] = [];
-
-  if (b.demographics.length > 0) {
-    const top = [...b.demographics]
-      .sort((a, x) => x.viewerPercentage - a.viewerPercentage)
-      .slice(0, 5);
-    lines.push("Age × gender (top 5 by viewer share):");
-    for (const r of top) {
-      lines.push(
-        `  • ${r.ageGroup} ${r.gender} — ${r.viewerPercentage.toFixed(1)}%`
-      );
-    }
-  }
-
-  if (b.geography.length > 0) {
-    const total = b.geography.reduce((s, r) => s + r.views, 0);
-    if (total > 0) {
-      const top = [...b.geography].slice(0, 5);
-      lines.push("Top countries (by view share):");
-      for (const r of top) {
-        lines.push(
-          `  • ${r.country} — ${((r.views / total) * 100).toFixed(1)}%`
-        );
-      }
-    }
-  }
-
-  if (b.trafficSources.length > 0) {
-    const total = b.trafficSources.reduce((s, r) => s + r.views, 0);
-    if (total > 0) {
-      const top = [...b.trafficSources].slice(0, 3);
-      lines.push("Top traffic sources (by view share):");
-      for (const r of top) {
-        lines.push(
-          `  • ${r.source} — ${((r.views / total) * 100).toFixed(1)}%`
-        );
-      }
-    }
-  }
-
-  if (lines.length === 0) return "";
-  return [
-    `ACTUAL AUDIENCE DEMOGRAPHICS (from YouTube Analytics, last 90 days, ${b.period.startDate} → ${b.period.endDate}):`,
-    ...lines,
-  ].join("\n");
 }

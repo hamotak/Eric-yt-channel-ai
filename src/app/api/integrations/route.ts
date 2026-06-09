@@ -1,10 +1,12 @@
 import { NextResponse } from "next/server";
 import { listIntegrations, setIntegration } from "@/lib/db";
+import { getBraveSearchConfig } from "@/lib/brave-search";
 
 // The only integrations the app actively uses post-simplification.
 // Claude powers ideation + analyze-with-ai; YouTube Data API powers
-// channel + video sync.
-const ALLOWED = ["claude", "youtube"] as const;
+// channel + video sync. Brave powers Reddit web signals over
+// user-curated subreddits.
+const ALLOWED = ["claude", "youtube", "brave"] as const;
 type Name = (typeof ALLOWED)[number];
 
 function mask(key: string | null) {
@@ -18,13 +20,16 @@ export async function GET() {
   const map = Object.fromEntries(
     ALLOWED.map((name) => {
       const row = rows.find((r) => r.name === name);
+      const braveConfig = name === "brave" ? getBraveSearchConfig() : null;
+      const key = name === "brave" ? braveConfig?.apiKey ?? null : row?.api_key ?? null;
       return [
         name,
         {
           name,
-          hasKey: !!row?.api_key,
-          masked: mask(row?.api_key ?? null),
-          enabled: !!row?.enabled,
+          hasKey: !!key,
+          masked: mask(key),
+          enabled: name === "brave" ? !!key : !!row?.enabled,
+          config: name === "brave" ? { source: braveConfig?.source ?? null } : undefined,
         },
       ];
     })
@@ -33,7 +38,10 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  const body = (await req.json()) as { name?: string; api_key?: string };
+  const body = (await req.json()) as {
+    name?: string;
+    api_key?: string;
+  };
   if (!body.name || !ALLOWED.includes(body.name as Name)) {
     return NextResponse.json({ error: "invalid integration name" }, { status: 400 });
   }

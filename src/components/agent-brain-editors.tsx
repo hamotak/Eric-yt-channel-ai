@@ -22,6 +22,7 @@ import { cn } from "@/lib/utils";
 const DESCRIPTION_CAP = 1500;
 const IDEATION_RULES_CAP = 1200;
 const BANNED_TOPICS_CAP = 500;
+const REDDIT_SOURCES_CAP = 800;
 
 // ---------------------------------------------------------------------
 // Channel description — one big textarea + live counter
@@ -248,6 +249,104 @@ export function BannedTopicsEditor({
 }
 
 // ---------------------------------------------------------------------
+// Reddit sources — one subreddit per line, used by Brave-backed Reddit Angles
+// ---------------------------------------------------------------------
+
+export function RedditSourcesEditor({
+  channelId,
+  initialValue,
+  onSaved,
+}: {
+  channelId: string;
+  initialValue: string;
+  onSaved?: (value: string) => void;
+}) {
+  const [value, setValue] = useState(initialValue);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setValue(initialValue);
+    setError(null);
+  }, [channelId, initialValue]);
+
+  const dirty = value !== initialValue;
+  const overCap = value.length > REDDIT_SOURCES_CAP;
+
+  const save = async () => {
+    if (overCap) {
+      setError(`Reddit sources exceed ${REDDIT_SOURCES_CAP} chars`);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/channel-info", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channelId,
+          field: "redditSources",
+          value,
+        }),
+      });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        setError(d.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      onSaved?.(value);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      <textarea
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        rows={5}
+        placeholder={"space\naskscience\nFuturology"}
+        className={cn(
+          "w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono",
+          "focus:outline-none focus:ring-2 focus:ring-ring",
+          overCap && "border-destructive/60 focus:ring-destructive"
+        )}
+        disabled={saving}
+      />
+      <div className="flex items-center gap-2 text-[11px]">
+        <span
+          className={cn(
+            "text-muted-foreground",
+            overCap && "font-medium text-destructive"
+          )}
+        >
+          {value.length} / {REDDIT_SOURCES_CAP}
+        </span>
+        {dirty && !overCap && (
+          <span className="text-amber-600 dark:text-amber-400">unsaved</span>
+        )}
+        {error && <span className="text-destructive">· {error}</span>}
+        <div className="ml-auto">
+          <Button
+            size="sm"
+            onClick={save}
+            disabled={!dirty || overCap || saving}
+            className="gap-1.5"
+          >
+            <Check className="h-3.5 w-3.5" />
+            {saving ? "Saving…" : "Save"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
 // Ideation rules — line-list with add/delete
 // ---------------------------------------------------------------------
 
@@ -344,4 +443,3 @@ export function IdeationRulesEditor({
     </div>
   );
 }
-

@@ -3,20 +3,22 @@ import { db, getActiveChannelId } from "@/lib/db";
 import {
   createGeneration,
   runPipeline,
-  estimateCostMillicents,
-  dailyBudgetSpentMillicents,
-  dailyBudgetResetIso,
   countProcessingGenerations,
   hasProcessingForChannel,
-  DAILY_IDEATION_BUDGET_MILLICENTS,
   MAX_QUEUED_GENERATIONS,
   type Mode,
 } from "@/lib/ideate/pipeline";
 import { log } from "@/lib/logger";
+import { hasRedditSignalProvider, parseSubredditSources } from "@/lib/reddit";
 
 export const runtime = "nodejs";
 
-const VALID_MODES: ReadonlySet<Mode> = new Set<Mode>(["auto", "new_angles", "title_tweaks"]);
+const VALID_MODES: ReadonlySet<Mode> = new Set<Mode>([
+  "auto",
+  "new_angles",
+  "title_tweaks",
+  "reddit_angles",
+]);
 
 export async function POST(req: Request) {
   let body: unknown;
@@ -34,7 +36,7 @@ export async function POST(req: Request) {
 
   if (typeof mode !== "string" || !VALID_MODES.has(mode as Mode)) {
     return NextResponse.json(
-      { error: "mode must be one of: auto, new_angles, title_tweaks" },
+      { error: "mode must be one of: auto, new_angles, title_tweaks, reddit_angles" },
       { status: 400 }
     );
   }
@@ -55,8 +57,8 @@ export async function POST(req: Request) {
   }
 
   const channelRow = db
-    .prepare(`SELECT 1 AS x FROM channels WHERE id = ?`)
-    .get(activeChannelId) as { x: number } | undefined;
+    .prepare(`SELECT reddit_sources FROM channels WHERE id = ?`)
+    .get(activeChannelId) as { reddit_sources: string | null } | undefined;
   if (!channelRow) {
     return NextResponse.json(
       { error: `active channel not found in DB: ${activeChannelId}` },
@@ -79,6 +81,28 @@ export async function POST(req: Request) {
     );
   }
 
+  if (mode === "reddit_angles") {
+    if (!hasRedditSignalProvider()) {
+      return NextResponse.json(
+        {
+          error:
+            "Brave Search API key missing — add it in /settings/integrations",
+        },
+        { status: 400 }
+      );
+    }
+    const subreddits = parseSubredditSources(channelRow.reddit_sources);
+    if (subreddits.length === 0) {
+      return NextResponse.json(
+        {
+          error:
+            "Add at least one Reddit source for this channel in /channel-info before using Reddit Angles",
+        },
+        { status: 400 }
+      );
+    }
+  }
+
   if (hasProcessingForChannel(activeChannelId)) {
     return NextResponse.json(
       { error: "a generation is already in progress for this channel" },
@@ -90,20 +114,6 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         error: `too many concurrent generations (max ${MAX_QUEUED_GENERATIONS}). Wait for one to finish.`,
-      },
-      { status: 429 }
-    );
-  }
-
-  const proposedCost = estimateCostMillicents(countNum);
-  const spentToday = dailyBudgetSpentMillicents();
-  if (spentToday + proposedCost > DAILY_IDEATION_BUDGET_MILLICENTS) {
-    return NextResponse.json(
-      {
-        error: "daily ideation budget reached, resets at <ISO timestamp>".replace(
-          "<ISO timestamp>",
-          dailyBudgetResetIso()
-        ),
       },
       { status: 429 }
     );

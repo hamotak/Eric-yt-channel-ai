@@ -2,7 +2,7 @@
  * Silent freshness pass for a single user-bound channel.
  *
  * Pulls the most recent slice of uploads from YouTube and upserts them into
- * the `videos` table so the /videos page surfaces newly published rows
+ * the `videos` table so ideation can reason from the user's latest titles
  * without the user pressing "Re-sync". Deliberately small: at most
  * three YT Data API calls per channel per invocation, capped at the 50
  * newest uploads. The full re-sync path at /api/youtube/sync is unchanged
@@ -29,6 +29,7 @@ import {
   YouTubeApiError,
 } from "@/lib/youtube";
 import { log } from "@/lib/logger";
+import { fallbackYouTubeThumbnailUrl } from "@/lib/youtube-thumbnail";
 
 export type SyncUserVideosResult = {
   channel_id: string;
@@ -87,7 +88,7 @@ export async function syncUserChannelVideos(
       views: v.views,
       likes: v.likes,
       comments: v.comments,
-      thumbnail_url: v.thumbnail,
+      thumbnail_url: v.thumbnail ?? fallbackYouTubeThumbnailUrl(v.id),
       tags: v.tags.length ? JSON.stringify(v.tags) : null,
     });
   }

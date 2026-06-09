@@ -14,29 +14,30 @@ export const maxDuration = 30;
 const SELF_AS_COMPETITOR_ERROR =
   "This is your own channel — cannot add as competitor.";
 
-function isUserOwnChannel(
+function normalizeHandle(handle: string | null): string | null {
+  const trimmed = handle?.trim();
+  if (!trimmed) return null;
+  return trimmed.startsWith("@") ? trimmed : `@${trimmed}`;
+}
+
+function isActiveUserChannel(
   channelId: string | null,
-  handle: string | null
+  handle: string | null,
+  activeChannelId: string
 ): boolean {
-  // channels table holds the user's own connected channels. Any match
-  // here means the user is trying to add themselves. Belt-and-braces:
-  // match on channel_id (UC...) if provided, and on handle for the
-  // resolve-by-handle path. Exact error string is asserted by Playwright
-  // (screenshot 04-add-self-rejected.png) — see SELF_AS_COMPETITOR_ERROR.
-  if (channelId) {
-    const byId = db
-      .prepare(`SELECT 1 AS x FROM channels WHERE id = ?`)
-      .get(channelId);
-    if (byId) return true;
-  }
-  if (handle) {
-    const normalised = handle.startsWith("@") ? handle : `@${handle}`;
-    const byHandle = db
-      .prepare(`SELECT 1 AS x FROM channels WHERE LOWER(handle) = LOWER(?)`)
-      .get(normalised);
-    if (byHandle) return true;
-  }
-  return false;
+  // Multi-channel installs can intentionally use one owned channel as a
+  // reference competitor for another owned channel. Only reject adding the
+  // currently-active user channel to itself.
+  if (channelId && channelId === activeChannelId) return true;
+
+  const normalised = normalizeHandle(handle);
+  if (!normalised) return false;
+
+  const active = db
+    .prepare(`SELECT handle FROM channels WHERE id = ?`)
+    .get(activeChannelId) as { handle: string | null } | undefined;
+  const activeHandle = normalizeHandle(active?.handle ?? null);
+  return !!activeHandle && activeHandle.toLowerCase() === normalised.toLowerCase();
 }
 
 /**
@@ -78,7 +79,7 @@ export async function GET(_req: Request) {
  * competitor videos LIVE at ideation time (no per-competitor cache here).
  *
  * Guards:
- *   - T8 self-as-competitor (channel_id OR handle matches user's own channels)
+ *   - T8 self-as-competitor (channel_id OR handle matches active user channel)
  *   - Pair-scoped dedup (already tracked under this user channel)
  */
 export async function POST(req: Request) {
@@ -136,8 +137,9 @@ export async function POST(req: Request) {
     );
   }
 
-  // T8: self-as-competitor guard.
-  if (isUserOwnChannel(channelId, handle)) {
+  // T8: self-as-competitor guard. Other owned channels are allowed here
+  // because they may be useful reference channels for the active channel.
+  if (isActiveUserChannel(channelId, handle, userChannelId)) {
     return NextResponse.json(
       { error: SELF_AS_COMPETITOR_ERROR },
       { status: 400 }

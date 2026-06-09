@@ -1,8 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { usePathname } from "next/navigation";
-import { Check, ChevronsUpDown, Globe, Tv } from "lucide-react";
+import { Check, ChevronsUpDown, Tv } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 type Channel = {
@@ -17,42 +16,26 @@ type ChannelsResponse = {
   activeId: string | null;
 };
 
-// Shared localStorage key with the (formerly visible) DashboardTabs toggle —
-// the Dashboard page reads from this directly to decide whether to render
-// the cross-channel combined view or the per-channel widgets.
-const VIEW_MODE_KEY = "dashboard.viewMode";
-type ViewMode = "all" | "channel";
-
 /**
  * Top-bar channel picker. Lets the user switch which YouTube channel the
- * dashboard / videos / analytics screens are scoped to, plus an "All
- * channels" sentinel that only the Dashboard understands (combined view).
+ * ideation and setup screens are scoped to.
  *
  * Triggers a full page refresh on change because most pages are server-
  * rendered against the active channel and need fresh data.
- *
- * Cross-page caveat: "All channels" lives ONLY in localStorage. The
- * server-side active-channel pointer is unchanged — so on /videos,
- * /competitors, /channel etc. the page still scopes to whichever specific
- * channel was last selected. The picker label tracks this: on Dashboard
- * it says "All channels" when that mode is set; on other pages it always
- * shows the active channel title.
  *
  * Hidden when there's only one (or zero) channels — no point in a switcher
  * with nothing to switch between.
  */
 export function ChannelSwitcher() {
-  const pathname = usePathname();
   const [channels, setChannels] = useState<Channel[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<ViewMode>("channel");
   const [open, setOpen] = useState(false);
   const [switching, setSwitching] = useState(false);
   const popRef = useRef<HTMLDivElement>(null);
 
   // Display order: largest channel first, alphabetical tiebreak. Otherwise
   // a freshly-added 100-sub channel can bury the 117K main channel below
-  // the fold. "All channels" stays pinned above this list in the render.
+  // the fold.
   const sortedChannels = useMemo(() => {
     return [...channels].sort((a, b) => {
       const aSubs = a.subscriber_count ?? -1;
@@ -63,12 +46,6 @@ export function ChannelSwitcher() {
       return aLabel.localeCompare(bLabel);
     });
   }, [channels]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const saved = window.localStorage.getItem(VIEW_MODE_KEY);
-    if (saved === "all" || saved === "channel") setViewMode(saved);
-  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -101,44 +78,12 @@ export function ChannelSwitcher() {
   if (channels.length <= 1) return null;
   const active = channels.find((c) => c.id === activeId) ?? channels[0];
 
-  // "All channels" semantics are Dashboard-only. Everywhere else the label
-  // shows the specific active channel, even if localStorage says "all" —
-  // otherwise the picker would lie about what the visible page is showing.
-  const isDashboard = pathname === "/";
-  const showingAll = isDashboard && viewMode === "all";
-
-  async function pickAll() {
-    if (switching) {
-      setOpen(false);
-      return;
-    }
-    // Don't touch /api/channels/active — the server-side active channel
-    // pointer stays as the last specific channel so other pages keep
-    // working without us inventing a server-side "all" sentinel.
-    window.localStorage.setItem(VIEW_MODE_KEY, "all");
-    setSwitching(true);
-    window.location.reload();
-  }
-
   async function pick(id: string) {
     if (switching) {
       setOpen(false);
       return;
     }
-    // Always set the localStorage flag back to "channel" so that on
-    // Dashboard the per-channel widgets render again — even if the user
-    // picks the SAME channel that was previously active while in "all"
-    // mode.
-    window.localStorage.setItem(VIEW_MODE_KEY, "channel");
     if (id === activeId) {
-      // Just changed mode without picking a new channel — reload so the
-      // Dashboard re-reads localStorage and re-mounts the per-channel
-      // widgets.
-      if (viewMode === "all") {
-        setSwitching(true);
-        window.location.reload();
-        return;
-      }
       setOpen(false);
       return;
     }
@@ -179,41 +124,15 @@ export function ChannelSwitcher() {
         disabled={switching}
         className="gap-2"
       >
-        {showingAll ? (
-          <Globe className="h-4 w-4" />
-        ) : (
-          <Tv className="h-4 w-4" />
-        )}
+        <Tv className="h-4 w-4" />
         <span className="max-w-[180px] truncate">
-          {showingAll
-            ? "All channels"
-            : (active?.title ?? active?.handle ?? "Channel")}
+          {active?.title ?? active?.handle ?? "Channel"}
         </span>
         <ChevronsUpDown className="h-3 w-3 opacity-60" />
       </Button>
       {open ? (
         <div className="absolute right-0 top-[calc(100%+4px)] z-30 w-72 overflow-hidden rounded-md border border-border bg-popover shadow-lg">
           <div className="max-h-[min(70vh,560px)] overflow-y-auto p-1">
-            {/* "All channels" sentinel — first entry, separated by a
-                bottom border. Only the Dashboard renders the combined
-                view; other pages keep scoping to the active channel. */}
-            <button
-              onClick={pickAll}
-              className="flex w-full items-center gap-2 rounded-sm border-b border-border/60 px-2 py-2 text-left text-sm hover:bg-accent"
-            >
-              <Check
-                className={`h-4 w-4 shrink-0 ${
-                  showingAll ? "opacity-100" : "opacity-0"
-                }`}
-              />
-              <Globe className="h-4 w-4 shrink-0 text-muted-foreground" />
-              <div className="min-w-0 flex-1">
-                <div className="truncate font-medium">All channels</div>
-                <div className="truncate text-xs text-muted-foreground">
-                  Dashboard only — other pages scope to the active channel
-                </div>
-              </div>
-            </button>
             {sortedChannels.map((c) => (
               <button
                 key={c.id}
@@ -222,9 +141,7 @@ export function ChannelSwitcher() {
               >
                 <Check
                   className={`h-4 w-4 shrink-0 ${
-                    !showingAll && c.id === activeId
-                      ? "opacity-100"
-                      : "opacity-0"
+                    c.id === activeId ? "opacity-100" : "opacity-0"
                   }`}
                 />
                 <div className="min-w-0 flex-1">

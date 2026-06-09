@@ -27,6 +27,7 @@ type WireField =
   | "channelDescription"
   | "ideationRules"
   | "bannedTopics"
+  | "redditSources"
   | "niche"
   | "positioning"
   | "audience"
@@ -37,6 +38,7 @@ const WIRE_TO_DB: Record<WireField, ChannelContextField> = {
   channelDescription: "channel_description",
   ideationRules: "ideation_rules",
   bannedTopics: "banned_topics",
+  redditSources: "reddit_sources",
   niche: "niche",
   positioning: "positioning",
   audience: "audience",
@@ -52,6 +54,7 @@ const FIELD_CAPS: Partial<Record<WireField, number>> = {
   channelDescription: 1500,
   ideationRules: 1200,
   bannedTopics: 500,
+  redditSources: 800,
 };
 
 type ChannelContextWire = {
@@ -64,6 +67,7 @@ type ChannelContextWire = {
   channelDescription: string;
   ideationRules: string;
   bannedTopics: string;
+  redditSources: string;
   // Legacy fields still surfaced so older clients reading the GET
   // response don't break; the redesigned UI ignores them.
   niche: string;
@@ -84,6 +88,7 @@ function toWire(c: Channel): ChannelContextWire {
     channelDescription: c.channel_description ?? "",
     ideationRules: c.ideation_rules ?? "",
     bannedTopics: c.banned_topics ?? "",
+    redditSources: c.reddit_sources ?? "",
     niche: c.niche ?? "",
     positioning: c.positioning ?? "",
     audience: c.audience ?? "",

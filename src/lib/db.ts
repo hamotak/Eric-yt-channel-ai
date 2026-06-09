@@ -114,6 +114,7 @@ function initSchema() {
     CREATE TABLE IF NOT EXISTS integrations (
       name TEXT PRIMARY KEY,
       api_key TEXT,
+      config_json TEXT,
       enabled INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
     );
@@ -218,10 +219,23 @@ try {
   /* table didn't exist or rare concurrent issue — moving on either way */
 }
 
+try {
+  const cols = db
+    .prepare(`PRAGMA table_info(integrations)`)
+    .all() as { name: string }[];
+  if (!cols.some((c) => c.name === "config_json")) {
+    db.exec(`ALTER TABLE integrations ADD COLUMN config_json TEXT`);
+  }
+} catch {
+  /* noop */
+}
+
 export function getIntegration(name: string) {
   return db
-    .prepare("SELECT name, api_key, enabled FROM integrations WHERE name = ?")
-    .get(name) as { name: string; api_key: string | null; enabled: number } | undefined;
+    .prepare("SELECT name, api_key, enabled, config_json FROM integrations WHERE name = ?")
+    .get(name) as
+    | { name: string; api_key: string | null; enabled: number; config_json: string | null }
+    | undefined;
 }
 
 export function setIntegration(name: string, apiKey: string) {
@@ -236,10 +250,50 @@ export function setIntegration(name: string, apiKey: string) {
   ).run(name, apiKey, enabled);
 }
 
+export function getIntegrationConfig<T = Record<string, unknown>>(
+  name: string
+): T | null {
+  const row = getIntegration(name);
+  if (!row?.config_json) return null;
+  try {
+    const parsed = JSON.parse(row.config_json) as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setIntegrationConfig(
+  name: string,
+  config: Record<string, unknown>
+): void {
+  const compact = Object.fromEntries(
+    Object.entries(config).map(([k, v]) => [k, typeof v === "string" ? v.trim() : v])
+  );
+  const enabled = Object.values(compact).every(
+    (v) => typeof v === "string" ? v.trim().length > 0 : v !== null && v !== undefined
+  )
+    ? 1
+    : 0;
+  db.prepare(
+    `INSERT INTO integrations (name, api_key, config_json, enabled, updated_at)
+     VALUES (?, NULL, ?, ?, strftime('%s','now'))
+     ON CONFLICT(name) DO UPDATE SET
+       config_json = excluded.config_json,
+       enabled = excluded.enabled,
+       updated_at = excluded.updated_at`
+  ).run(name, JSON.stringify(compact), enabled);
+}
+
 export function listIntegrations() {
   return db
-    .prepare("SELECT name, api_key, enabled FROM integrations")
-    .all() as { name: string; api_key: string | null; enabled: number }[];
+    .prepare("SELECT name, api_key, enabled, config_json FROM integrations")
+    .all() as {
+    name: string;
+    api_key: string | null;
+    enabled: number;
+    config_json: string | null;
+  }[];
 }
 
 /* ---------- Generic settings (key-value) ---------- */
@@ -304,6 +358,9 @@ export type Channel = {
   // T3 — comma-separated topic ban list. Pipeline hardRuleCheck() rejects
   // any candidate idea matching tokens in this list.
   banned_topics?: string | null;
+  // One subreddit per line. Used by Brave-backed Reddit web signals;
+  // user-curated so the model only studies communities HAmo trusts.
+  reddit_sources?: string | null;
 };
 
 /**
@@ -372,6 +429,7 @@ export type ChannelContextField =
   // src/lib/ideate/pipeline.ts rejects any candidate idea whose title
   // or description contains a token from this list.
   | "banned_topics"
+  | "reddit_sources"
   // Legacy — kept writable so old migrations + the chat tool's
   // backwards-compatible path keep working. UI no longer surfaces these.
   | "niche"
@@ -384,6 +442,7 @@ const CHANNEL_CONTEXT_FIELDS: readonly ChannelContextField[] = [
   "channel_description",
   "ideation_rules",
   "banned_topics",
+  "reddit_sources",
   "niche",
   "positioning",
   "audience",
@@ -3569,6 +3628,9 @@ try {
   if (!cols.some((c) => c.name === "topic_analysis_at")) {
     db.exec(`ALTER TABLE channels ADD COLUMN topic_analysis_at TEXT`);
   }
+  if (!cols.some((c) => c.name === "reddit_sources")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN reddit_sources TEXT`);
+  }
 } catch {
   /* noop */
 }
@@ -3611,6 +3673,18 @@ try {
   if (!cols.some((c) => c.name === "feedback_at")) {
     db.exec(`ALTER TABLE ideas ADD COLUMN feedback_at TEXT`);
   }
+  if (!cols.some((c) => c.name === "proof_json")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN proof_json TEXT`);
+  }
+  if (!cols.some((c) => c.name === "confidence_level")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN confidence_level TEXT`);
+  }
+  if (!cols.some((c) => c.name === "research_sources_json")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN research_sources_json TEXT`);
+  }
+  if (!cols.some((c) => c.name === "fit_reason")) {
+    db.exec(`ALTER TABLE ideas ADD COLUMN fit_reason TEXT`);
+  }
 } catch {
   /* noop */
 }
@@ -3619,7 +3693,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS generations (
     id TEXT PRIMARY KEY,
     user_channel_id TEXT NOT NULL,
-    mode TEXT NOT NULL CHECK (mode IN ('auto','new_angles','title_tweaks')),
+    mode TEXT NOT NULL CHECK (mode IN ('auto','new_angles','title_tweaks','reddit_angles')),
     count INTEGER NOT NULL CHECK (count >= 10 AND count <= 25),
     status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
     estimated_cost_millicents INTEGER NOT NULL DEFAULT 0,
@@ -3642,6 +3716,7 @@ db.exec(`
     validation_status TEXT NOT NULL CHECK (validation_status IN ('passed','rejected')),
     validation_reason TEXT,
     fit_score INTEGER,
+    fit_reason TEXT,
     user_note TEXT,
     note_distilled_at TEXT,
     used_by_user INTEGER NOT NULL DEFAULT 0,
@@ -3649,6 +3724,9 @@ db.exec(`
     feedback TEXT CHECK (feedback IS NULL OR feedback IN ('positive','negative')),
     feedback_reason TEXT,
     feedback_at TEXT,
+    proof_json TEXT,
+    confidence_level TEXT CHECK (confidence_level IS NULL OR confidence_level IN ('high','medium','low')),
+    research_sources_json TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE CASCADE
   );
@@ -3681,4 +3759,80 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_gather_attrition_generation
     ON gather_attrition_log(generation_id);
+
+  CREATE TABLE IF NOT EXISTS reddit_research_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    topic_key TEXT NOT NULL,
+    subreddit TEXT NOT NULL,
+    reddit_id TEXT,
+    title TEXT NOT NULL,
+    permalink TEXT NOT NULL,
+    score INTEGER NOT NULL DEFAULT 0,
+    comments INTEGER NOT NULL DEFAULT 0,
+    created_utc INTEGER,
+    observed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    summary TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    source_json TEXT,
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_reddit_research_channel_topic
+    ON reddit_research_items(user_channel_id, topic_key, observed_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_reddit_research_subreddit
+    ON reddit_research_items(subreddit, observed_at DESC);
+
+  CREATE TABLE IF NOT EXISTS generation_research_items (
+    generation_id TEXT NOT NULL,
+    research_item_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (generation_id, research_item_id),
+    FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE CASCADE,
+    FOREIGN KEY (research_item_id) REFERENCES reddit_research_items(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_generation_research_generation
+    ON generation_research_items(generation_id);
 `);
+
+try {
+  const row = db
+    .prepare(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name='generations'`
+    )
+    .get() as { sql: string } | undefined;
+  if (row?.sql && !row.sql.includes("'reddit_angles'")) {
+    db.pragma("foreign_keys = OFF");
+    db.exec(`
+      CREATE TABLE generations_rebuild (
+        id TEXT PRIMARY KEY,
+        user_channel_id TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('auto','new_angles','title_tweaks','reddit_angles')),
+        count INTEGER NOT NULL CHECK (count >= 10 AND count <= 25),
+        status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+        estimated_cost_millicents INTEGER NOT NULL DEFAULT 0,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT,
+        error TEXT,
+        FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE
+      );
+      INSERT INTO generations_rebuild
+        (id, user_channel_id, mode, count, status, estimated_cost_millicents, started_at, completed_at, error)
+      SELECT id, user_channel_id, mode, count, status, estimated_cost_millicents, started_at, completed_at, error
+      FROM generations;
+      DROP TABLE generations;
+      ALTER TABLE generations_rebuild RENAME TO generations;
+      CREATE INDEX IF NOT EXISTS idx_generations_channel_started
+        ON generations(user_channel_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_generations_status
+        ON generations(status, started_at DESC);
+    `);
+    db.pragma("foreign_keys = ON");
+  }
+} catch {
+  try {
+    db.pragma("foreign_keys = ON");
+  } catch {
+    /* noop */
+  }
+  /* noop */
+}
