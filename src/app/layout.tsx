@@ -7,8 +7,8 @@ import { Topbar } from "@/components/topbar";
 import { SilentVideoSync } from "@/components/silent-video-sync";
 
 export const metadata: Metadata = {
-  title: "YT Channel AI",
-  description: "YT Channel AI (local)",
+  title: "Lat Media Ideation Tool",
+  description: "Ideation, competitor research, channel context, and thumbnail generation for Lat Media.",
 };
 
 export default function RootLayout({

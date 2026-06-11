@@ -344,7 +344,7 @@ type DictionaryShape = {
 export const dictionaries: { en: DictionaryShape } = {
   en: {
     app: {
-      name: "YT Channel AI",
+      name: "Lat Media Ideation Tool",
     },
     nav: {
       dashboard: "Dashboard",
@@ -599,7 +599,7 @@ export const dictionaries: { en: DictionaryShape } = {
         helpTitle: "How to get a Claude API key",
         helpSteps: [
           "Go to console.anthropic.com and sign in (or create an account — personal email works).",
-          "Open the left sidebar → API Keys → Create Key. Give it any name (e.g. \"yt-channel-ai\").",
+          "Open the left sidebar -> API Keys -> Create Key. Give it any name (e.g. \"lat-media-ideation\").",
           "Copy the key (starts with sk-ant-…). You'll see it only once — save it now or regenerate later.",
           "Paste it into the field below and hit Save.",
           "Cost note: you pay per-token. A typical chat turn with 2+ tools + Opus advisor costs $0.05–$0.30. Budget a few dollars per audit session.",

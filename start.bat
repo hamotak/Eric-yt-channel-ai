@@ -22,7 +22,7 @@ if not exist "node_modules" (
 
 echo.
 echo ====================================
-echo  Starting Eric YT Channel AI...
+echo  Starting Lat Media Ideation Tool...
 echo  The app will open in your browser.
 echo  Close this window to stop the server.
 echo ====================================

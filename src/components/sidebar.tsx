@@ -29,7 +29,7 @@ const SIDEBAR_PREF_KEY = "sidebar-collapsed";
  * mobile menu button is clicked at <640px; the sidebar listens and
  * toggles its overlay-open state.
  */
-const SIDEBAR_TOGGLE_EVENT = "yt-channel-ai-sidebar-toggle";
+const SIDEBAR_TOGGLE_EVENT = "lat-media-ideation-sidebar-toggle";
 
 export function Sidebar() {
   const { t } = useI18n();

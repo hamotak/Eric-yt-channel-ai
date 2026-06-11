@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 
 echo
 echo "===================================="
-echo "  Eric YT Channel AI - Installation"
+echo "  Lat Media Ideation Tool - Installation"
 echo "===================================="
 echo
 

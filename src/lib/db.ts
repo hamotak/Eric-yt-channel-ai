@@ -11,18 +11,21 @@ import fs from "node:fs";
  * package.json. Prevents the classic "I restarted and my API keys are
  * gone" footgun where two runs saved into two different data folders.
  */
-function findProjectRoot(startDir: string): string {
-  let cur = startDir;
-  for (let i = 0; i < 10; i++) {
-    if (fs.existsSync(path.join(cur, "package.json"))) return cur;
-    const parent = path.dirname(cur);
-    if (parent === cur) break;
-    cur = parent;
+function findProjectRoot(...startDirs: string[]): string {
+  for (const startDir of startDirs) {
+    let cur = startDir;
+    for (let i = 0; i < 10; i++) {
+      if (fs.existsSync(path.join(cur, "package.json"))) return cur;
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+    }
   }
-  return startDir;
+  return process.cwd();
 }
 
-const PROJECT_ROOT = findProjectRoot(__dirname);
+const PROJECT_ROOT = findProjectRoot(process.cwd(), __dirname);
+const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
 
 // Where the SQLite database lives. `DATA_DIR` env var still wins (handy
 // for tests / advanced setups). Otherwise we always use
@@ -33,7 +36,7 @@ export const DATA_DIR = process.env.DATA_DIR
   : path.join(PROJECT_ROOT, "data");
 const DB_PATH = path.join(DATA_DIR, "app.db");
 
-if (!fs.existsSync(DATA_DIR)) {
+if (!isBuildPhase && !fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
@@ -58,8 +61,6 @@ declare global {
  * memory DB (CREATE IF NOT EXISTS, ALTER wrapped in try/catch), so
  * the same code path handles both modes.
  */
-const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
-
 export const db =
   global.__sqlite ?? new Database(isBuildPhase ? ":memory:" : DB_PATH);
 if (!global.__sqlite) {

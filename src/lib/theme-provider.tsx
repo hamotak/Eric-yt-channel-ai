@@ -3,7 +3,7 @@
 import * as React from "react";
 
 type Theme = "light" | "dark";
-const STORAGE_KEY = "yt-channel-ai.theme";
+const STORAGE_KEY = "lat-media-ideation.theme";
 
 type ThemeContextValue = {
   theme: Theme;

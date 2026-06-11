@@ -1,106 +1,98 @@
-# Eric YT Channel AI
+# Lat Media Ideation Tool
 
-Eric YT Channel AI is a local browser app for running YouTube channel work in one place. It helps with channel notes, video ideation, competitor research, thumbnail planning, and AI-assisted thumbnail generation.
+Lat Media Ideation Tool is an internal YouTube workflow app for turning channel context, competitor signals, recent performance, and thumbnail references into better video ideas and thumbnail directions.
 
-The app runs on your computer at `http://localhost:3000`. It is not a hosted SaaS app.
+The app is built for a technical operator or developer who needs to understand how the system works, where the data lives, and which parts are safe to change.
 
-## Plain-English Overview
+## Product Map
 
-Use this app when you want to:
+- **Ideate** creates video ideas for the active channel using channel notes, recent uploads, competitors, saved feedback, Reddit/web signals, and the mentor method prompt in `MENTOR_METHOD.md`.
+- **Image Studio** plans thumbnail directions, collects source references, analyzes winning and losing thumbnails, and sends final render jobs to 69labs.
+- **Channel Info** stores the operating brief for each channel: audience, positioning, rules, tone, thumbnail style notes, banned topics, and source preferences.
+- **Competitors** tracks competitor channels and videos so the app can find useful outliers and patterns.
+- **Settings > Integrations** stores provider API keys in SQLite.
+- **Settings > Usage** shows AI/API usage and cost history.
+- **Settings > Logs** exposes local app logs for debugging.
 
-- keep channel strategy, positioning, audience notes, and rules in one place;
-- generate and review video ideas for a selected channel;
-- compare competitor channels and outlier videos;
-- create thumbnail directions in Image Studio;
-- generate thumbnail options through 69labs;
-- track AI/API usage and app logs locally.
+The top-right channel switcher controls the active channel across the app.
 
-All private data lives on this machine unless an integration API is called for a specific task.
+## Architecture
 
-## Main App Areas
+- **Framework**: Next.js 16 App Router, React 19, TypeScript, Tailwind CSS.
+- **Database**: SQLite through `better-sqlite3`.
+- **App routes**: `src/app/`.
+- **API routes**: `src/app/api/`.
+- **Shared app logic**: `src/lib/`.
+- **Image Studio pipeline**: `src/lib/image-studio/` and `src/app/image-studio/`.
+- **Ideation pipeline**: `src/lib/ideate/`.
+- **Reusable UI**: `src/components/`.
+- **Verification scripts**: `scripts/verify-*.cjs`.
 
-- **Ideate**: creates video ideas for the active YouTube channel, using channel context, recent uploads, competitors, and learned feedback.
-- **Image Studio**: plans thumbnail directions, picks useful source thumbnails, and sends final image generation jobs to 69labs.
-- **Channel Info**: stores the channel brief, audience, positioning, voice, banned topics, Reddit sources, and thumbnail style notes.
-- **Competitors**: saves competitor channels, syncs their metadata, and helps compare useful outliers.
-- **Settings > Integrations**: where API keys are entered.
-- **Settings > Logs**: shows local app logs for debugging.
+Before changing Next.js app/router behavior, read the matching guide in `node_modules/next/dist/docs/`. This repo uses Next.js 16 conventions, including `proxy.ts` instead of old middleware naming.
 
-The top-right channel switcher controls which channel the app is currently working on.
+## Data And Secrets
+
+Runtime data is intentionally local and ignored by Git:
+
+- `data/app.db` stores channels, integrations, logs, usage, Image Studio runs, and local app state.
+- `.env` can override local runtime settings.
+- `.next/` and `node_modules/` are generated folders.
+
+Provider keys are entered in **Settings > Integrations** and stored in SQLite. Do not commit real keys, local databases, screenshots with private data, generated build output, or downloaded media.
+
+Only `.env.example` should be tracked as a safe template.
 
 ## Integrations
 
-API keys are entered inside the running app at **Settings > Integrations**. They are stored in the local SQLite database, not in Git.
+- **OpenAI**: default Image Studio planner and visual thumbnail analysis.
+- **Claude / Anthropic**: fallback planner and existing AI workflows.
+- **YouTube Data API**: channel, upload, and video metadata sync.
+- **Brave Search**: Reddit/web research signals.
+- **69labs**: thumbnail image rendering through Nano Banana Pro.
 
-Current integrations:
+Use provider API keys. Do not use browser session tokens.
 
-- **OpenAI**: default Image Studio thumbnail planner and visual analysis.
-- **Claude (Anthropic)**: fallback planner and existing AI workflows.
-- **YouTube Data API**: channel/video sync and metadata.
-- **Brave Search**: Reddit/web signals for ideation.
-- **69labs**: final image generation for thumbnails.
+## Image Studio Flow
 
-Do not paste browser session tokens. Use real provider API keys.
+1. Read active channel context, selected references, recent videos, learned feedback, and style memory.
+2. Build a planner context pack with recent winning and losing thumbnails.
+3. Ask the planner for structured thumbnail directions.
+4. Validate and clean each direction so prompts are safe for the render provider.
+5. Submit render jobs to 69labs with a staggered launch cadence.
+6. Poll each provider job, download completed images, and store provider telemetry.
+7. Show compact candidate slots with source metadata, provider attempt details, and feedback controls.
 
-## Local Data And Secrets
+The renderer remains 69labs Nano Banana Pro. Planning and prompt writing are separate from image generation.
 
-Local data is stored in:
+## Ideation Flow
 
-- `data/app.db` for SQLite app data;
-- `.env` for optional local environment overrides.
+1. Load channel brief, style rules, recent uploads, competitors, and feedback.
+2. Pull search/research signals when enabled.
+3. Apply the mentor method from `MENTOR_METHOD.md`.
+4. Generate, score, and store ideas for the selected channel.
+5. Feed accepted/rejected feedback back into future ideation.
 
-These files are intentionally ignored by Git:
+## Development
 
-- `.env`
-- `.env.local`
-- `.env.development`
-- `.env.production`
-- `data/`
-- `.next/`
-- `node_modules/`
+Requirements:
 
-Never commit API keys, SQLite databases, generated build folders, or local screenshots with private information.
+- Node.js 20 or newer.
+- npm.
 
-Only `.env.example` should be committed as a safe template.
+Common commands:
 
-## Quick Start
+```bash
+npm install
+npm run dev
+npx tsc --noEmit --pretty false
+npx next build
+```
 
-1. Install Node.js 20 or newer from [nodejs.org](https://nodejs.org/).
-2. Clone the repo:
+The helper scripts `install.command`, `start.command`, `install.bat`, and `start.bat` are convenience launchers for non-technical local use. They are not the source of truth for deployment.
 
-   ```bash
-   git clone https://github.com/hamotak/Eric-yt-channel-ai.git
-   cd Eric-yt-channel-ai
-   ```
+## Verification
 
-3. Install dependencies:
-
-   ```bash
-   npm install
-   ```
-
-4. Start the app:
-
-   ```bash
-   npm run dev
-   ```
-
-5. Open `http://localhost:3000`.
-6. Go to **Settings > Integrations** and add the needed API keys.
-
-Mac users can also use `install.command` and `start.command`. Windows users can use `install.bat` and `start.bat`.
-
-## Developer Notes
-
-Important implementation details:
-
-- The app uses **Next.js 16 App Router**, **React 19**, **TypeScript**, and **Tailwind CSS**.
-- The local database uses **SQLite** through `better-sqlite3`.
-- Image Studio code lives mainly under `src/lib/image-studio/` and `src/app/image-studio/`.
-- Provider/API routes live under `src/app/api/`.
-- The app is designed for local operation; do not assume cloud hosting or shared storage.
-
-Before publishing changes, run:
+Run these before publishing app changes:
 
 ```bash
 node scripts/verify-image-studio-behavior.cjs
@@ -109,16 +101,20 @@ npx tsc --noEmit --pretty false
 npx next build
 ```
 
-## Git Safety Checklist
+For live provider checks, use the dedicated scripts in `scripts/` and keep sample counts low.
 
-Before pushing to GitHub:
+## Git Hygiene
 
-1. Run `git status --short`.
-2. Confirm `.env` and `data/` are not staged.
-3. Confirm only `.env.example` appears if searching tracked env files.
-4. Run a quick secret scan for real API keys.
-5. Push only to the intended remote, usually `origin`.
+Before pushing:
 
-GitHub repo:
+```bash
+git status --short
+git check-ignore -v .env .env.local .env.development .env.production data .next node_modules
+git ls-files | rg '(^|/)\.env($|\.)|\.env'
+```
 
-https://github.com/hamotak/Eric-yt-channel-ai
+The env-file search should only return `.env.example`.
+
+Repository:
+
+[hamotak/Lat-Media-Ideation-Tool](https://github.com/hamotak/Lat-Media-Ideation-Tool)
