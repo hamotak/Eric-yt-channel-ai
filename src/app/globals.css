@@ -31,7 +31,7 @@
   --sidebar: 0 0% 100%;
   --sidebar-foreground: 0 0% 9%;
   --sidebar-border: 0 0% 90%;
-  --radius: 0.625rem;
+  --radius: 0.5rem;
 }
 
 .dark {

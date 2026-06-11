@@ -15,6 +15,8 @@ type Competitor = {
   avatarUrl: string | null;
   subscriberCount: number | null;
   note: string | null;
+  thumbnailPolicy: "allow" | "cms_exclude";
+  thumbnailPolicyNote: string | null;
   addedAt: number;
 };
 
@@ -104,10 +106,7 @@ export default function CompetitorsPage() {
     <div className="mx-auto w-full max-w-[760px] px-4 pb-10 leading-relaxed">
       <header className="mb-8">
         <h1 className="text-2xl font-semibold tracking-tight">Competitors</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Channels the ideation pipeline pulls live outlier signals from.
-          Paste a URL, @handle, or UC… id.
-        </p>
+        <p className="mt-1 text-sm text-muted-foreground">Source channels for outlier signals.</p>
       </header>
 
       <div className="mb-10 flex gap-2">
@@ -120,7 +119,7 @@ export default function CompetitorsPage() {
               void onAdd();
             }
           }}
-          placeholder="@channel or https://youtube.com/@… or UC…"
+          placeholder="@channel, URL, or channel ID"
           disabled={resolving || saving || !activeChannelId}
           className="flex-1"
         />
@@ -179,9 +178,15 @@ function CompetitorRow({
   onChanged: () => Promise<void> | void;
 }) {
   const [note, setNote] = useState(competitor.note ?? "");
+  const [thumbnailPolicy, setThumbnailPolicy] = useState<
+    "allow" | "cms_exclude"
+  >(competitor.thumbnailPolicy ?? "allow");
+  const thumbnailPolicyNote = competitor.thumbnailPolicyNote ?? "";
   const [savedFlash, setSavedFlash] = useState(false);
+  const [policySavedFlash, setPolicySavedFlash] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const policyFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const persistNote = useCallback(async () => {
     const next = note.trim();
@@ -196,6 +201,30 @@ function CompetitorRow({
     if (flashTimer.current) clearTimeout(flashTimer.current);
     flashTimer.current = setTimeout(() => setSavedFlash(false), 1000);
   }, [note, competitor.id, competitor.note]);
+
+  const flashPolicySaved = useCallback(() => {
+    setPolicySavedFlash(true);
+    if (policyFlashTimer.current) clearTimeout(policyFlashTimer.current);
+    policyFlashTimer.current = setTimeout(() => setPolicySavedFlash(false), 1000);
+  }, []);
+
+  const persistThumbnailPolicy = useCallback(
+    async (
+      nextPolicy = thumbnailPolicy,
+      nextNote = thumbnailPolicyNote
+    ) => {
+      await fetch(`/api/competitors/${competitor.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          thumbnailPolicy: nextPolicy,
+          thumbnailPolicyNote: nextNote.trim().length > 0 ? nextNote.trim() : null,
+        }),
+      });
+      flashPolicySaved();
+    },
+    [competitor.id, flashPolicySaved, thumbnailPolicy, thumbnailPolicyNote]
+  );
 
   const onDelete = useCallback(async () => {
     await fetch(`/api/competitors/${competitor.id}`, { method: "DELETE" });
@@ -228,9 +257,49 @@ function CompetitorRow({
                 {fmtSubs(competitor.subscriberCount)}
               </p>
             </div>
-            <div className="flex items-center gap-3 whitespace-nowrap">
+            <div className="flex items-center gap-2 whitespace-nowrap">
               {savedFlash && (
                 <span className="text-xs text-muted-foreground">Saved</span>
+              )}
+              {policySavedFlash && (
+                <span className="text-xs text-muted-foreground">Saved</span>
+              )}
+              {!confirmingDelete && (
+                <div
+                  className="inline-flex rounded-md border border-border p-0.5"
+                  title="CMS channels can inspire ideas, but Image Studio skips their thumbnails."
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setThumbnailPolicy("allow");
+                      void persistThumbnailPolicy("allow", thumbnailPolicyNote);
+                    }}
+                    className={cn(
+                      "h-7 rounded px-2 text-xs transition-colors",
+                      thumbnailPolicy === "allow"
+                        ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                        : "text-muted-foreground hover:bg-muted"
+                    )}
+                  >
+                    No CMS
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setThumbnailPolicy("cms_exclude");
+                      void persistThumbnailPolicy("cms_exclude", thumbnailPolicyNote);
+                    }}
+                    className={cn(
+                      "h-7 rounded px-2 text-xs transition-colors",
+                      thumbnailPolicy === "cms_exclude"
+                        ? "bg-destructive/15 text-destructive"
+                        : "text-muted-foreground hover:bg-muted"
+                    )}
+                  >
+                    CMS
+                  </button>
+                </div>
               )}
               {confirmingDelete ? (
                 <>
@@ -266,7 +335,7 @@ function CompetitorRow({
             value={note}
             onChange={(e) => setNote(e.target.value)}
             onBlur={persistNote}
-            placeholder="Note (optional) — what's interesting about this channel?"
+            placeholder="Note"
             className={cn(
               "mt-3 min-h-[2.25rem] resize-none border-none bg-transparent px-0 py-1",
               "text-sm leading-relaxed text-foreground placeholder:text-muted-foreground/70",

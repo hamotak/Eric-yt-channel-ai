@@ -8,18 +8,20 @@ import { Button } from "@/components/ui/button";
 
 export function ConnectBanner() {
   const { t } = useI18n();
-  const [needsClaude, setNeedsClaude] = useState(false);
+  const [needsAi, setNeedsAi] = useState(false);
 
   useEffect(() => {
     fetch("/api/integrations")
       .then((r) => r.json())
       .then((data) => {
-        setNeedsClaude(!data.integrations?.claude?.hasKey);
+        const hasPlannerKey =
+          !!data.integrations?.openai?.hasKey || !!data.integrations?.claude?.hasKey;
+        setNeedsAi(!hasPlannerKey);
       })
       .catch(() => {});
   }, []);
 
-  if (!needsClaude) return null;
+  if (!needsAi) return null;
 
   return (
     <div className="mb-6 flex items-start gap-3 rounded-lg border border-primary/30 bg-primary/5 p-4">

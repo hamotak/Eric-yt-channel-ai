@@ -1,0 +1,982 @@
+External API Developer Guide
+This guide covers the public 69labs external API for text-to-speech, SRT subtitle generation, image generation, video generation, motion graphics, and utility tools. It documents the current request and response contract, including TTS censorship recovery, model discovery, polling, downloads, image compression, and common error cases.
+
+Base URL: https://69labs.vip/api/v1
+
+Quick Start
+Generate your first image in three steps:
+
+1. Get your API key
+Go to Settings > API Keys in the 69labs web UI and create a key. It starts with vk_.
+
+2. Generate an image
+curl -X POST https://69labs.vip/api/v1/images/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "A futuristic city skyline at sunset"}'
+Response (HTTP 201):
+
+{
+  "id": "cm7abc123def",
+  "queuePosition": 2
+}
+3. Poll until complete, then download
+# Poll status
+curl https://69labs.vip/api/v1/images/status/cm7abc123def \
+  -H "Authorization: Bearer vk_your_api_key"
+
+# Once status is "COMPLETED", download
+curl -L -o image.png https://69labs.vip/api/v1/images/download/cm7abc123def \
+  -H "Authorization: Bearer vk_your_api_key"
+That's it. The rest of this guide covers every option in detail.
+
+Integration Architecture Patterns
+Use the public REST API directly from trusted server-side code, not from a public browser bundle with your shared API key.
+
+Scenario	Recommended pattern
+Public website or SaaS app	Browser calls your backend; your backend calls /api/v1 with the vk_* key
+Full backend service	Store local jobs, submit to 69labs from a worker, poll with backoff, then copy outputs to your own storage
+Serverless or automation	Store the returned job ID durably, resume polling from a scheduled function, and respect Retry-After
+Batch workflow	Use bulk endpoints with idempotencyKey, then poll batch items and dispatched jobs
+LLM-generated client	Give the LLM /api/docs/openapi.yaml and require REST-only code, runtime model discovery, async polling, and explicit error handling
+Thin backend proxy
+app.post("/api/images", async (req, res) => {
+  const response = await fetch("https://69labs.vip/api/v1/images/generate", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + process.env.LABS_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      prompt: String(req.body.prompt || "").slice(0, 15000),
+      model: req.body.model,
+      aspectRatio: req.body.aspectRatio,
+    }),
+  });
+
+  const data = await response.json();
+  res.status(response.status).json(data);
+});
+Store the returned job ID with your own user or tenant record. Let your frontend poll your backend, and let your backend poll 69labs. This keeps API keys private and gives you one place to enforce user permissions, rate limits, and logging rules.
+
+Full backend worker
+For production queues, store a local job row with your user ID, requested capability, sanitized request metadata, the returned 69labs job ID, local status, last error code, and next poll time. A worker should submit the REST request, save the 69labs job ID immediately, poll status with backoff, follow download redirects on completion, and copy outputs into your own storage when you need long-term access.
+
+LLM integration rule
+When asking an LLM to write integration code, tell it: use only https://69labs.vip/api/v1, read https://69labs.vip/api/docs/openapi.yaml, discover models/templates at runtime, treat generation as asynchronous, respect Retry-After, follow download redirects, and never call JWT, settings, admin, worker, or internal web routes.
+
+Authentication
+All endpoints require an API key in the Authorization header:
+
+Authorization: Bearer vk_your_api_key
+Keys always start with the vk_ prefix
+Each user can have one active key at a time
+Keys are capability-scoped — your account must have the required TTS, image, and/or video API access enabled
+Auth errors:
+
+HTTP Status	Code	Cause
+401	UNAUTHORIZED	Missing, malformed, invalid, inactive, or deactivated key; the public response is always generic
+403	FORBIDDEN	Key is valid but access to the requested capability is denied
+Discovering Models
+Before generating, fetch the available models to see their IDs, options, costs, and your credit or pay-per-use account setup.
+
+List all models (images + videos)
+curl https://69labs.vip/api/v1/models \
+  -H "Authorization: Bearer vk_your_api_key"
+The response only includes capabilities your key has access to:
+
+{
+  "images": {
+    "models": [ ... ],
+    "defaultModelId": "nano-banana-2",
+    "credits": {
+      "used": 3,
+      "limit": 50,
+      "remaining": 47,
+      "resetsAt": "2026-01-15T14:00:00.000Z"
+    },
+    "monthlyUsage": {
+      "used": 5,
+      "limit": 100,
+      "remaining": 95
+    }
+  },
+  "videos": {
+    "models": [ ... ],
+    "defaultModelId": "grok-imagine-video",
+    "credits": { ... },
+    "monthlyUsage": { ... }
+  }
+}
+Pay-per-use keys receive additive account setup fields and no credit balance:
+
+{
+  "billingMode": "PAY_PER_USE",
+  "retention": {
+    "generationRetentionHours": 24
+  },
+  "images": {
+    "enabled": true,
+    "models": [
+      { "id": "nano-banana-2", "name": "Nano Banana 2", "cost": 1, "ppuPriceCents": 25 }
+    ],
+    "defaultModelId": "nano-banana-2",
+    "credits": null,
+    "pricing": { "basePriceCents": 25 },
+    "limits": {
+      "maxConcurrentJobs": 3,
+      "activeJobs": 1,
+      "remainingJobs": 2,
+      "priorityLevel": 0
+    },
+    "monthlyUsage": {
+      "used": 4,
+      "completed": 3,
+      "reserved": 1,
+      "limit": 100,
+      "remaining": 96
+    }
+  },
+  "tts": {
+    "enabled": true,
+    "pricing": {
+      "billingMode": "PER_MILLION_CHARS",
+      "pricePerMillionCharsCents": 500,
+      "pricePerJobCents": 0
+    },
+    "limits": { "maxConcurrentJobs": 3, "activeJobs": 0, "remainingJobs": 3, "priorityLevel": 0 },
+    "monthlyUsage": {
+      "used": 12000,
+      "completed": 12000,
+      "reserved": 0,
+      "completedJobs": 8,
+      "limit": 1000000,
+      "remaining": 988000
+    },
+    "guidance": [ ... ]
+  },
+  "srtSubtitles": {
+    "enabled": true,
+    "pricing": {
+      "billingMode": "PER_JOB",
+      "pricePerStartedMinuteCents": 30,
+      "pricePerJobCents": 150
+    },
+    "monthlyUsage": {
+      "used": 8,
+      "completed": 5,
+      "reserved": 3,
+      "limit": 100,
+      "remaining": 92
+    },
+    "monthlyJobUsage": {
+      "used": 4,
+      "completed": 3,
+      "reserved": 1,
+      "limit": 50,
+      "remaining": 46
+    }
+  }
+}
+List image models only
+curl https://69labs.vip/api/v1/images/models \
+  -H "Authorization: Bearer vk_your_api_key"
+List video models only
+curl https://69labs.vip/api/v1/videos/models \
+  -H "Authorization: Bearer vk_your_api_key"
+Reading model capabilities
+Each model object tells you exactly what parameters it accepts:
+
+{
+  "id": "flux-2-pro",
+  "name": "Flux 2 Pro",
+  "cost": 1,
+  "resolutionCosts": {
+    "1k": 1,
+    "2k": 2
+  },
+  "aspectRatios": [
+    { "value": "1:1", "label": "1:1 (Square)" },
+    { "value": "16:9", "label": "16:9 (Landscape)" },
+    { "value": "9:16", "label": "9:16 (Portrait)" }
+  ],
+  "resolutions": [
+    { "value": "1k", "label": "1K" },
+    { "value": "2k", "label": "2K" }
+  ],
+  "qualityOptions": null,
+  "supportsImageInput": true,
+  "maxImageUrls": 8,
+  "defaults": {
+    "aspectRatio": "1:1",
+    "resolution": "1k"
+  }
+}
+Key fields:
+
+Field	Meaning
+cost	Flat credits consumed per generation
+resolutionCosts	Optional per-resolution credit overrides. When present, these override the flat cost
+aspectRatios	Valid aspectRatio values for this model
+resolutions	Valid resolution values (null if not supported)
+durations	Valid duration values — video models only (null if not supported)
+modes	Valid mode values — video models only (null if not supported)
+supportsImageInput	Whether the model accepts imageUrls
+maxImageUrls	Max number of reference images (null if no image input)
+defaults	Default values used when you omit optional parameters
+For pay-per-use accounts, model responses can also include:
+
+billingMode: "PAY_PER_USE"
+retention.generationRetentionHours with the account's output download window
+credits: null
+enabled, pricing, limits, and richer monthlyUsage on image/video/motion sections
+ppuPriceCents on each available image/video model after account-level allow/deny rules are applied
+tts setup on GET /models with billing mode, rate, concurrency, current-month characters/jobs, cap, and public voice/model guidance
+srtSubtitles setup on GET /models with enabled state, billing mode, per-minute/per-job prices, and current-month minute/job usage
+There is no public TTS model catalog endpoint. For TTS, submit voiceId and optionally modelId directly to /tts/generate. Catalog voices can be listed with GET /tts/minimax/voices.
+
+Pay-Per-Use Usage Lookup
+Pay-per-use API keys can read summary ledger totals with GET /usage.
+
+curl "https://69labs.vip/api/v1/usage?startDate=2026-05-01&endDate=2026-05-31" \
+  -H "Authorization: Bearer vk_your_api_key"
+Omit both dates to use the current UTC month through today. Custom ranges must provide both startDate and endDate, use inclusive UTC YYYY-MM-DD values, and span no more than 366 days.
+
+The response is summary-only and does not expose prompts, job IDs, customer identifiers, routing internals, raw keys, or line-item IDs.
+
+{
+  "billingMode": "PAY_PER_USE",
+  "range": {
+    "startDate": "2026-05-01",
+    "endDate": "2026-05-31",
+    "timezone": "UTC"
+  },
+  "totals": {
+    "requestCount": 42,
+    "billableUnits": 12850,
+    "ttsCharacters": 12800,
+    "srtMinutes": 5,
+    "estimatedAmountCents": 975
+  },
+  "byType": {
+    "images": { "requestCount": 12, "estimatedAmountCents": 300 },
+    "videos": { "requestCount": 2, "estimatedAmountCents": 400 },
+    "motionGraphics": { "requestCount": 1, "estimatedAmountCents": 80 },
+    "tts": { "requestCount": 24, "ttsCharacters": 12800, "estimatedAmountCents": 45 },
+    "srtSubtitles": { "requestCount": 3, "srtMinutes": 5, "estimatedAmountCents": 150 }
+  },
+  "dailyBreakdown": []
+}
+Tools
+Tools are synchronous utility endpoints. The image compressor accepts one uploaded image and returns image bytes immediately; it does not create an async job.
+
+curl -X POST https://69labs.vip/api/v1/tools/image-compressor/compress \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -F "mode=lossy" \
+  -F "file=@thumbnail.jpg" \
+  -o thumbnail-compressed.jpg
+Supported uploads are JPEG, PNG, WebP, and AVIF up to 10 MB. mode is lossy or lossless; lossy is the default and targets high-quality smaller output. The endpoint spends the configured TOOL_CREDITS action cost for regular credit accounts. Pay-per-use tool billing is not enabled yet.
+
+Useful response headers:
+
+Header	Meaning
+X-Tool-Cost	Tool credits charged
+X-Original-Size-Bytes	Uploaded size
+X-Compressed-Size-Bytes	Returned size
+X-Saved-Bytes	Bytes saved
+X-Saved-Percent	Rounded percent saved
+X-Output-Filename	Suggested output filename
+X-Used-Original	true if the original was returned because compression was not smaller
+Text-to-Speech
+Lifecycle
+POST /tts/generate  →  GET /tts/status/{id}  →  GET /tts/download/{id}
+     (submit)               (poll)                    (download)
+Recoverable censored flow:
+
+PROCESSING  →  CENSORED  →  POST /tts/retry-censored/{id}  →  PROCESSING
+Request parameters
+Parameter	Type	Required	Description
+text	string	Yes	1–500000 characters
+voiceId	string	Yes	Voice ID for the selected voiceProvider; use the full catalog voice_id for catalog voices
+voiceName	string	No	Optional display name
+voiceProvider	string	No	elevenlabs, edgetts, or minimax; these are wire-level API values. edgetts uses discounted TTS credits; defaults to elevenlabs
+modelId	string	No	Defaults to eleven_multilingual_v2; catalog voice mode defaults to speech-02-hd and accepts speech-2.8-hd / speech-2.8-turbo; edgetts uses edge-tts
+splitOutput	boolean	No	Return split outputs instead of a single merged file
+voiceSettings	object	No	stability, similarityBoost, speed, style, useSpeakerBoost
+minimaxSettings	object	No	Catalog voice mode only: speed 0.01–10, pitch -12 to 12, volume 0.5–2, languageBoost (defaults to auto; ISO hints normalize server-side)
+Basic TTS request
+curl -X POST https://69labs.vip/api/v1/tts/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Welcome to 69labs.",
+    "voiceId": "21m00Tcm4TlvDq8ikWAM"
+  }'
+Discounted voice-mode request
+The edgetts voice mode uses the discounted ceil(text.length / 6) credit rule for finite-tier grants. Raw character count still applies to validation, chunking, rolling quota, and PPU billing.
+
+curl -X POST https://69labs.vip/api/v1/tts/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Welcome to 69labs.",
+    "voiceProvider": "edgetts",
+    "voiceId": "en-US-EmmaMultilingualNeural",
+    "modelId": "edge-tts",
+    "voiceSettings": { "speed": 1 }
+  }'
+Catalog voices
+curl "https://69labs.vip/api/v1/tts/minimax/voices?page=0&page_size=30&language=English" \
+  -H "Authorization: Bearer vk_your_api_key"
+Pass the returned full voice_id to /tts/generate.
+
+curl -X POST https://69labs.vip/api/v1/tts/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Welcome to 69labs.",
+    "voiceProvider": "minimax",
+    "voiceId": "English_CalmWoman",
+    "modelId": "speech-02-hd",
+    "minimaxSettings": {
+      "languageBoost": "auto",
+      "speed": 1,
+      "pitch": 0,
+      "volume": 1
+    }
+  }'
+SRT subtitles
+Completed TTS jobs can be transcribed into SRT subtitle files through the public API. SRT generation is asynchronous and starts after the audio job is COMPLETED.
+
+POST /tts/generate -> GET /tts/status/{id} -> POST /tts/generate-srt/{id}
+  -> GET /tts/srt-status/{id} -> GET /tts/download-srt/{id}
+Request subtitles:
+
+curl -X POST https://69labs.vip/api/v1/tts/generate-srt/123e4567-e89b-12d3-a456-426614174000 \
+  -H "Authorization: Bearer vk_your_api_key"
+{
+  "jobId": "123e4567-e89b-12d3-a456-426614174000",
+  "srtStatus": "PENDING",
+  "creditCost": 150
+}
+Pay-per-use SRT responses use creditCost: null and include billing metadata:
+
+{
+  "jobId": "123e4567-e89b-12d3-a456-426614174000",
+  "srtStatus": "PENDING",
+  "creditCost": null,
+  "billingMode": "PAY_PER_USE",
+  "ppuBillableUnits": 1,
+  "ppuBillingUnit": "SRT_JOB",
+  "ppuSrtMinutes": 5,
+  "ppuUnitPriceCents": 150,
+  "ppuAmountCents": 150
+}
+Poll SRT status:
+
+curl https://69labs.vip/api/v1/tts/srt-status/123e4567-e89b-12d3-a456-426614174000 \
+  -H "Authorization: Bearer vk_your_api_key"
+{
+  "id": "123e4567-e89b-12d3-a456-426614174000",
+  "srtStatus": "COMPLETED",
+  "srtError": null,
+  "srtFileAvailable": true,
+  "creditCost": 0
+}
+Download the subtitle file:
+
+curl -L -o subtitles.srt https://69labs.vip/api/v1/tts/download-srt/123e4567-e89b-12d3-a456-426614174000 \
+  -H "Authorization: Bearer vk_your_api_key"
+SRT generation is free for credit-based accounts when the active tier has subtitles enabled. Finite tiers count accepted subtitle jobs against the current UTC month's allowance; failed subtitle jobs do not count. Pay-per-use SRT still requires SRT enabled on the account and can bill per started minute or per subtitle job while tracking subtitle duration. If generation fails, PPU reservations are released. Audio and SRT files share the same output retention window; expired files return 410.
+
+Fixing censored TTS jobs
+When TTS status is CENSORED, the response can include:
+
+blockedChunks: array of { index, text }
+retryExpiresAt: 6-hour retry deadline for chunked jobs
+chunksTotal and chunksCompleted for chunked progress
+Retry example:
+
+curl -X POST https://69labs.vip/api/v1/tts/retry-censored/cm7tts123abc \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "correctedChunks": [
+      {
+        "index": 2,
+        "text": "Rewritten text that avoids the content moderation block"
+      }
+    ]
+  }'
+Rules:
+
+Corrected text is capped at 5000 characters per chunk
+Chunked censored jobs have a 6-hour retry window
+A retried job can become CENSORED again if the rewritten text is still blocked
+Voice Clone TTS
+Use cloned voices for TTS generation. Voice creation is UI-only — these endpoints let you list existing clones and generate audio with them.
+
+Lifecycle
+GET /voice-clones            →  browse your voices
+GET /voice-clones/library    →  browse global voices
+POST /voice-clones/generate  →  GET /tts/status/{id}  →  GET /tts/download/{id}
+Voice clone TTS jobs are standard TTS jobs — poll and download using the regular TTS endpoints.
+
+List your cloned voices
+curl https://69labs.vip/api/v1/voice-clones \
+  -H "Authorization: Bearer vk_your_api_key"
+Response:
+
+{
+  "voiceClones": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "My Voice",
+      "language": "English",
+      "gender": "male",
+      "previewUrl": "https://...",
+      "isGlobal": false,
+      "status": "ready",
+      "createdAt": "2026-04-09T12:00:00.000Z"
+    }
+  ]
+}
+List global voice library
+curl https://69labs.vip/api/v1/voice-clones/library \
+  -H "Authorization: Bearer vk_your_api_key"
+Get a single voice clone
+curl https://69labs.vip/api/v1/voice-clones/a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
+  -H "Authorization: Bearer vk_your_api_key"
+Returns voices you own or global library voices.
+
+Generate TTS with a cloned voice
+curl -X POST https://69labs.vip/api/v1/voice-clones/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "voiceCloneId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "text": "Hello from my cloned voice.",
+    "model": "speech-02-hd",
+    "speed": 1.0
+  }'
+Request parameters
+Parameter	Type	Required	Description
+voiceCloneId	string (UUID)	Yes	Voice clone ID (owned or global)
+text	string	Yes	1–100000 characters
+model	string	No	Defaults to speech-02-hd; accepts speech-2.8-hd and speech-2.8-turbo
+speed	number	No	0.5–2 speed multiplier
+pitch	number	No	-12 to 12 semitones
+volume	number	No	0–10
+language_boost	string	No	Language hint such as "English" or "Turkish"; defaults to auto; ISO hints normalize server-side
+Access rules
+Your clones: GET /voice-clones lists voices you created
+Global voices: GET /voice-clones/library lists admin-curated voices available to everyone
+Generate: Accepts both your own clone IDs and global library IDs
+Requires voice cloning: Your tier must have voice cloning enabled. Listing works regardless, but generate returns 403 without it.
+Credits
+Voice clone TTS consumes advance voice credits (cost = text character count), same as the web UI. Credits are refunded on job failure.
+
+Image Generation
+Lifecycle
+Every image job follows this flow:
+
+POST /images/generate  →  GET /images/status/{id}  →  GET /images/download/{id}
+     (submit)                 (poll)                       (download)
+Request parameters
+Parameter	Type	Required	Description
+prompt	string	Yes	1–15000 characters
+model	string	No	Model ID (defaults to nano-banana-2)
+aspectRatio	string	No	Must be valid for the model
+resolution	string	No	Only for models with resolutions
+imageUrls	string[]	No	Reference image URLs (only if supportsImageInput)
+seed	integer	No	For reproducible results
+Basic text-to-image
+Generate with the default model (Nano Banana 2):
+
+curl -X POST https://69labs.vip/api/v1/images/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A watercolor painting of a mountain lake"
+  }'
+const response = await fetch("https://69labs.vip/api/v1/images/generate", {
+  method: "POST",
+  headers: {
+    "Authorization": "Bearer vk_your_api_key",
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    prompt: "A watercolor painting of a mountain lake"
+  })
+});
+
+const { id, queuePosition } = await response.json();
+console.log(`Job ${id} created, position ${queuePosition} in queue`);
+Choosing a model and aspect ratio
+curl -X POST https://69labs.vip/api/v1/images/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Cyberpunk street market at night",
+    "model": "z-image",
+    "aspectRatio": "16:9"
+  }'
+With resolution-based pricing
+Some image models support multiple resolutions, and some of those models use resolutionCosts from the models response:
+
+# Flux 2 Pro at 2K resolution
+curl -X POST https://69labs.vip/api/v1/images/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Detailed macro photo of a butterfly wing",
+    "model": "flux-2-pro",
+    "aspectRatio": "3:2",
+    "resolution": "2k"
+  }'
+Image-to-image (reference images)
+Models with supportsImageInput: true accept reference image URLs. The images must be publicly accessible. Use imageUrls for new integrations; legacy clients may send one unambiguous alias (referenceImage, imageUrl, referenceImageUrls, or referenceImages), which is normalized to imageUrls. Do not combine reference fields in one request.
+
+# GPT Image 2 with reference images (up to 10 URLs)
+curl -X POST https://69labs.vip/api/v1/images/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Transform this into a Studio Ghibli art style",
+    "model": "gpt-image-2",
+    "imageUrls": ["https://example.com/my-photo.jpg"]
+  }'
+const response = await fetch("https://69labs.vip/api/v1/images/generate", {
+  method: "POST",
+  headers: {
+    "Authorization": "Bearer vk_your_api_key",
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    prompt: "Transform this into a Studio Ghibli art style",
+    model: "gpt-image-2",
+    imageUrls: ["https://example.com/my-photo.jpg"]
+  })
+});
+Using seed for reproducibility
+Pass a seed integer to get reproducible results (model support varies):
+
+curl -X POST https://69labs.vip/api/v1/images/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A red fox in a snowy forest",
+    "model": "flux-2-pro",
+    "seed": 42
+  }'
+Available image models
+Model ID	Name	Cost	Image Input	Resolutions	Quality
+nano-banana-pro	Nano Banana Pro	2	Yes (10)	1k, 2k, 4k	—
+nano-banana-2	Nano Banana 2	1	Yes (14)	1k, 2k, 4k	—
+z-image	Z-Image	1	No	—	—
+img-flux	Flux Schnell	1	No	—	—
+flux-2-dev	Flux 2 Dev	1	Yes (4)	—	—
+flux-2-klein	Flux 2 Klein	1	Yes (4)	—	—
+flux-2-pro	Flux 2 Pro	2	Yes (8)	1k, 2k	—
+gpt-image-2	GPT Image 2	1	Yes (10)	—	—
+grok-imagine-image	Grok Image	1	Yes (5)	—	quality, speed
+This table is fetched live from the API. Model availability and costs may change — always check /v1/images/models for the current list.
+
+Video Generation
+Lifecycle
+Video jobs follow the same generate-poll-download pattern as images:
+
+POST /videos/generate  →  GET /videos/status/{id}  →  GET /videos/download/{id}
+     (submit)                 (poll)                       (download)
+Request parameters
+Parameter	Type	Required	Description
+prompt	string	Yes	1–15000 characters
+model	string	No	Model ID (defaults to grok-imagine-video)
+aspectRatio	string	No	Must be valid for the model
+resolution	string	No	Only for models with resolutions
+duration	string	No	Only for models with durations
+mode	string	No	Only for models with modes
+imageUrls	string[]	No	Input images for image-to-video
+videoInputMode	string	No	How images are used: text, ingredients, or keyframes
+mute	boolean	No	Strip audio from the final video file after generation
+Important: The submit parameter is duration (a string like "5", "10"), not length. The durationSeconds field that appears in the status response is output metadata only — it reports the actual duration of the generated video and is not a submit parameter.
+
+Text-to-video
+# Grok Video — 10 second video in landscape
+curl -X POST https://69labs.vip/api/v1/videos/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A drone shot flying over a tropical beach at golden hour",
+    "model": "grok-imagine-video",
+    "aspectRatio": "16:9",
+    "duration": "10"
+  }'
+const response = await fetch("https://69labs.vip/api/v1/videos/generate", {
+  method: "POST",
+  headers: {
+    "Authorization": "Bearer vk_your_api_key",
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    prompt: "A drone shot flying over a tropical beach at golden hour",
+    model: "grok-imagine-video",
+    aspectRatio: "16:9",
+    duration: "10"
+  })
+});
+
+const { id } = await response.json();
+Image-to-video
+Turn a still image into a video. The image must be a publicly accessible URL:
+
+# Grok Video — animate an image, 6 seconds
+curl -X POST https://69labs.vip/api/v1/videos/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Gentle camera zoom in, clouds moving slowly",
+    "model": "grok-imagine-video",
+    "imageUrls": ["https://example.com/landscape.jpg"],
+    "duration": "6"
+  }'
+Using modes
+Some models support generation modes that control how the output is produced:
+
+# Grok Video with "fun" mode
+curl -X POST https://69labs.vip/api/v1/videos/generate \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A cat playing piano",
+    "model": "grok-imagine-video",
+    "mode": "fun"
+  }'
+Video input modes
+When providing imageUrls to models that support them, you can control how the images are used with videoInputMode:
+
+Mode	Description
+text	Images are ignored; text prompt only
+ingredients	Images are used as visual reference material
+keyframes	Images define specific frames in the video
+If omitted, the API infers the mode: keyframes when the model's mode is set to keyframes, ingredients when imageUrls are provided, otherwise text.
+
+Available video models
+Model ID	Name	Cost	Image Input	Durations	Modes	Resolutions
+veo-video	Veo 3.1 Lite	1	Yes (2)	—	—	—
+gemini-omni	Gemini Omni	2	Yes (2)	4, 6, 8, 10	ingredients, keyframes	—
+veo-3.1-fast	Veo Fast (BETA)	2	Yes (2)	—	—	—
+grok-imagine-video	Grok Video (BETA)	3	Yes (1)	6, 10	—	480p, 720p
+This table is fetched live from the API. Model availability and costs may change — always check /v1/videos/models for the current list.
+
+Polling for Completion
+After submitting a job, poll the status endpoint until it reaches a terminal state.
+
+Status transitions
+PENDING  →  PROCESSING  →  FINALIZING  →  COMPLETED
+                      ↘              ↘
+                        CENSORED       FAILED
+         →  CANCELLED
+Status	Meaning
+PENDING	Queued, waiting to be picked up
+PROCESSING	Actively generating output
+FINALIZING	Generation done, file being stored
+COMPLETED	Ready to download
+FAILED	Generation failed (credits are refunded)
+CANCELLED	Job was cancelled
+CENSORED	TTS only. One or more chunks were blocked and must be rewritten before retry
+Polling example
+# Poll every 3 seconds
+while true; do
+  STATUS=$(curl -s https://69labs.vip/api/v1/images/status/cm7abc123def \
+    -H "Authorization: Bearer vk_your_api_key" | jq -r '.status')
+
+  echo "Status: $STATUS"
+
+  if [ "$STATUS" = "COMPLETED" ] || [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then
+    break
+  fi
+
+  sleep 3
+done
+async function pollUntilDone(jobId, type = "images") {
+  const baseUrl = "https://69labs.vip/api/v1";
+  const headers = { "Authorization": "Bearer vk_your_api_key" };
+
+  while (true) {
+    const res = await fetch(`${baseUrl}/${type}/status/${jobId}`, { headers });
+    const { status } = await res.json();
+
+    console.log(`Status: ${status}`);
+
+    if (["COMPLETED", "FAILED", "CANCELLED", "CENSORED"].includes(status)) {
+      return status;
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+}
+Recommended polling intervals
+Job Type	Interval
+TTS	2–5 seconds
+Images	3–5 seconds
+Videos	5–10 seconds
+Status response (image)
+{
+  "id": "cm7abc123def",
+  "status": "COMPLETED",
+  "createdAt": "2026-01-15T12:30:00.000Z",
+  "startedAt": "2026-01-15T12:30:05.000Z",
+  "completedAt": "2026-01-15T12:30:18.000Z",
+  "outputMetadata": {
+    "format": "png",
+    "width": 1024,
+    "height": 1024
+  }
+}
+Status response (video)
+{
+  "id": "cm7xyz789ghi",
+  "status": "COMPLETED",
+  "createdAt": "2026-01-15T12:30:00.000Z",
+  "startedAt": "2026-01-15T12:30:05.000Z",
+  "completedAt": "2026-01-15T12:32:18.000Z",
+  "outputMetadata": {
+    "format": "mp4",
+    "width": 1920,
+    "height": 1080,
+    "durationSeconds": 10
+  }
+}
+Note: durationSeconds in outputMetadata is read-only output metadata — it reports the actual duration of the generated video. It is not a submit parameter. To request a specific duration when generating, use the duration field in your POST request (e.g., "duration": "10").
+
+Downloading Results
+Once a job's status is COMPLETED, download the output file.
+
+Image download
+# -L follows the redirect (the API returns 302 to a presigned URL)
+curl -L -o result.png https://69labs.vip/api/v1/images/download/cm7abc123def \
+  -H "Authorization: Bearer vk_your_api_key"
+const res = await fetch(
+  `https://69labs.vip/api/v1/images/download/${jobId}`,
+  {
+    headers: { "Authorization": "Bearer vk_your_api_key" },
+    redirect: "follow"
+  }
+);
+const blob = await res.blob();
+Multi-image downloads
+Some models produce multiple images. Use the ?index=N query parameter:
+
+index=0 — Primary image (default)
+index=1, index=2, ... — Additional images
+Check outputMetadata.additionalImages in the status response to know how many images were generated.
+
+# Download the second image
+curl -L -o result_1.png \
+  "https://69labs.vip/api/v1/images/download/cm7abc123def?index=1" \
+  -H "Authorization: Bearer vk_your_api_key"
+Video download
+curl -L -o result.mp4 https://69labs.vip/api/v1/videos/download/cm7abc123def \
+  -H "Authorization: Bearer vk_your_api_key"
+Download responses
+The download endpoint returns one of:
+
+HTTP Status	Behavior
+200	File served directly (local storage)
+302	Redirect to a presigned download URL (R2 storage) — use -L with curl
+404	Job not found or not owned by you
+410	File expired (output retention window elapsed)
+Credits & Rate Limits
+Credit system
+Each generation consumes credits. There are two credit pools:
+
+Hourly credits — Resets every hour. Shown in credits.resetsAt.
+Monthly credits — Pro-rated grant based on your subscription. Shown in monthlyUsage.
+The cost field on each model is the default per-generation cost. When a model also returns resolutionCosts, the selected resolution overrides the flat cost.
+
+Checking your balance
+The models endpoints include your current credit balance:
+
+curl https://69labs.vip/api/v1/images/models \
+  -H "Authorization: Bearer vk_your_api_key" | jq '.credits, .monthlyUsage'
+{
+  "used": 3,
+  "limit": 50,
+  "remaining": 47,
+  "resetsAt": "2026-01-15T14:00:00.000Z"
+}
+{
+  "used": 5,
+  "limit": 100,
+  "remaining": 95
+}
+A null value for limit or remaining means unlimited.
+
+Credit refunds
+If a job fails (FAILED status), the credits are automatically refunded to both your hourly and monthly pools.
+
+Rate limits
+Endpoints have per-minute rate limits:
+
+Endpoint	Requests/min
+POST /tts/generate	20
+POST /tts/retry-censored/*	10
+POST /tts/generate-srt/*	10
+GET /tts/srt-status/*	60
+GET /tts/download-srt/*	30
+POST /images/generate	60
+POST /videos/generate	5
+GET /motion-graphics/templates	60
+POST /motion-graphics/render	10
+POST /motion-graphics/cancel/*	10
+GET /*/status/*	120
+GET /*/download/*	30
+GET /*/models	60
+GET /models	60
+GET /usage	PPU keys bypass generic route limits; auth failures remain limited
+When you hit a rate limit, you receive HTTP 429 with these headers:
+
+Header	Description
+Retry-After	Seconds until you can retry
+X-RateLimit-Limit	Total requests allowed per window
+X-RateLimit-Remaining	Requests remaining in current window
+Error Handling
+Error response format
+All errors return JSON:
+
+{
+  "error": "Human-readable message",
+  "code": "MACHINE_READABLE_CODE",
+  "details": {}
+}
+Auth failures are always generic. After API-key authentication succeeds, validation failures include safe field-level details for request bodies and supported query params.
+
+{
+  "error": "Validation failed",
+  "code": "VALIDATION_ERROR",
+  "details": {
+    "issues": [{ "path": "voiceSettings.speed", "message": "Must be between 0.7 and 1.2" }],
+    "fieldErrors": { "voiceSettings.speed": ["Must be between 0.7 and 1.2"] },
+    "formErrors": []
+  }
+}
+Common errors
+HTTP Status	Code	Cause	What to Do
+400	BAD_REQUEST	Invalid prompt, bad model ID, invalid aspect ratio, invalid censored retry payload, etc.	Check parameters against the endpoint contract and model capabilities
+400	VALIDATION_ERROR	Authenticated request body or query param failed validation	Use details.fieldErrors to fix the fields
+401	UNAUTHORIZED	Missing, malformed, invalid, inactive, or deactivated API key	Send a valid API key
+402	PAYMENT_REQUIRED	Insufficient monthly credits	Wait for credit renewal or upgrade your plan
+403	FORBIDDEN	No access to this capability, or hourly credits exhausted	Check credits.remaining before generating
+404	NOT_FOUND	Job or batch ID doesn't exist or belongs to another user	Verify the ID
+410	GONE	Output file expired (retention window elapsed)	Download files promptly after completion
+409	CONFLICT	Duplicate or in-progress state, especially repeated TTS requests	Poll the original work or adjust the request
+429	TOO_MANY_REQUESTS	Rate limit exceeded	Wait for Retry-After seconds, then retry
+429	TTS_CHARACTER_QUOTA_EXCEEDED	Rolling TTS character quota exceeded	Wait until the returned retry time
+500	INTERNAL_ERROR	Server error	Retry after a brief delay
+503	SERVICE_UNAVAILABLE	Service temporarily unavailable	Retry with exponential backoff
+Malformed JSON returns 400 BAD_REQUEST with Invalid JSON request body. Malformed job, SRT, download, cancel, and batch IDs return 400 Invalid job ID format before lookup. Auth-probe rate limits return generic 429 TOO_MANY_REQUESTS and do not reveal whether a key was close to valid.
+
+Retry strategy
+async function fetchWithRetry(url, options, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, options);
+
+    if (res.ok) return res;
+
+    if (res.status === 429) {
+      const retryAfter = parseInt(res.headers.get("Retry-After") || "5", 10);
+      console.log(`Rate limited. Retrying in ${retryAfter}s...`);
+      await new Promise(r => setTimeout(r, retryAfter * 1000));
+      continue;
+    }
+
+    if (res.status >= 500 && attempt < maxRetries) {
+      const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+      console.log(`Server error ${res.status}. Retrying in ${delay}ms...`);
+      await new Promise(r => setTimeout(r, delay));
+      continue;
+    }
+
+    const body = await res.json();
+    throw new Error(`API error ${res.status}: ${body.code} - ${body.error}`);
+  }
+}
+Full End-to-End Example
+Generate an image and download it:
+
+const API_KEY = "vk_your_api_key";
+const BASE = "https://69labs.vip/api/v1";
+const headers = {
+  "Authorization": `Bearer ${API_KEY}`,
+  "Content-Type": "application/json"
+};
+
+// 1. Check credits
+const modelsRes = await fetch(`${BASE}/images/models`, {
+  headers: { "Authorization": `Bearer ${API_KEY}` }
+});
+const { credits, models } = await modelsRes.json();
+
+if (credits.remaining !== null && credits.remaining < 1) {
+  console.log(`No credits. Resets at ${credits.resetsAt}`);
+  process.exit(1);
+}
+
+// 2. Generate
+const genRes = await fetch(`${BASE}/images/generate`, {
+  method: "POST",
+  headers,
+  body: JSON.stringify({
+    prompt: "A cozy cabin in the woods during autumn",
+    model: "flux-2-pro",
+    aspectRatio: "16:9",
+    resolution: "2k"
+  })
+});
+const { id } = await genRes.json();
+console.log(`Job created: ${id}`);
+
+// 3. Poll
+let status;
+do {
+  await new Promise(r => setTimeout(r, 3000));
+  const statusRes = await fetch(`${BASE}/images/status/${id}`, {
+    headers: { "Authorization": `Bearer ${API_KEY}` }
+  });
+  ({ status } = await statusRes.json());
+  console.log(`Status: ${status}`);
+} while (!["COMPLETED", "FAILED", "CANCELLED"].includes(status));
+
+// 4. Download
+if (status === "COMPLETED") {
+  const dlRes = await fetch(`${BASE}/images/download/${id}`, {
+    headers: { "Authorization": `Bearer ${API_KEY}` },
+    redirect: "follow"
+  });
+  const buffer = await dlRes.arrayBuffer();
+  // In Node.js:
+  const fs = await import("fs");
+  fs.writeFileSync("output.png", Buffer.from(buffer));
+  console.log("Saved to output.png");
+} else {
+  console.log(`Job ended with status: ${status}`);
+}
+Tips & Best Practices
+Check model capabilities before generating. Fetch /v1/images/models or /v1/videos/models and validate your parameters against the model's accepted aspectRatios, resolutions, durations, and modes.
+
+Check credits before generating. If credits.remaining is 0, your job will be rejected with a 403. Use the resetsAt timestamp to schedule retries.
+
+Handle failed jobs. Credits are refunded on failure. Don't retry immediately — if the prompt caused the failure, the retry will fail too. Adjust the prompt or try a different model.
+
+Use resolutionCosts when present. Some image models have resolution-based pricing, so do not assume the flat cost applies to every resolution.
+
+Follow redirects on download. The download endpoint typically returns HTTP 302. Use curl -L or set redirect: "follow" in fetch.
+
+Download files within the retention window. PPU model discovery returns retention.generationRetentionHours; tier accounts use their configured tier retention. After expiration, the download endpoint returns 410 GONE.
+
+Use exponential backoff for retries. On 429 (rate limit), respect the Retry-After header. On 5xx errors, use exponential backoff (1s, 2s, 4s).
+
+Handle TTS CENSORED explicitly. Treat it as a recoverable state, inspect blockedChunks, rewrite only the flagged chunks, and resubmit them to /tts/retry-censored/{jobId}.
+
+Don't poll too aggressively. Status endpoints allow 120 requests/min, but polling every 2–5 seconds for TTS, 3–5 seconds for images, and 5–10 seconds for videos is sufficient and avoids unnecessary load.

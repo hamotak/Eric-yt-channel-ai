@@ -2,11 +2,9 @@ import { NextResponse } from "next/server";
 import { listIntegrations, setIntegration } from "@/lib/db";
 import { getBraveSearchConfig } from "@/lib/brave-search";
 
-// The only integrations the app actively uses post-simplification.
-// Claude powers ideation + analyze-with-ai; YouTube Data API powers
-// channel + video sync. Brave powers Reddit web signals over
-// user-curated subreddits.
-const ALLOWED = ["claude", "youtube", "brave"] as const;
+// OpenAI/Claude power AI planning, YouTube powers channel/video sync, Brave
+// powers Reddit web signals, and 69labs powers generated thumbnail images.
+const ALLOWED = ["openai", "claude", "youtube", "brave", "69labs"] as const;
 type Name = (typeof ALLOWED)[number];
 
 function mask(key: string | null) {

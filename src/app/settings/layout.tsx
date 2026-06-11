@@ -22,10 +22,20 @@ export default function SettingsLayout({
 }: {
   children: React.ReactNode;
 }) {
+  const pathname = usePathname();
+  const activeTab = TABS.find((tab) => pathname.startsWith(tab.href));
+
   return (
-    <div className="mx-auto max-w-3xl">
+    <div
+      className={cn(
+        "mx-auto w-full",
+        activeTab?.href === "/settings/logs" ? "max-w-6xl" : "max-w-3xl"
+      )}
+    >
       <header className="mb-4">
-        <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          {activeTab ? `Settings: ${activeTab.label}` : "Settings"}
+        </h1>
       </header>
       <nav className="mb-6 flex gap-4 border-b border-border">
         {TABS.map((t) => (

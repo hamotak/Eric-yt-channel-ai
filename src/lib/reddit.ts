@@ -10,6 +10,13 @@ import {
 import { db } from "./db";
 import { log } from "./logger";
 
+export const REDDIT_RECENCY_DAYS = 30;
+export const REDDIT_VIRAL_SCORE_MIN = 500;
+export const REDDIT_VIRAL_COMMENTS_MIN = 100;
+export const REDDIT_FALLBACK_BRAVE_RANK_LIMIT = 3;
+
+export type RedditSignalStrength = "metrics" | "fallback";
+
 export interface RedditSearchHit {
   reddit_id: string;
   subreddit: string;
@@ -22,6 +29,8 @@ export interface RedditSearchHit {
   selftext: string | null;
   provider: "brave_search";
   snippet: string;
+  signal_strength: RedditSignalStrength;
+  brave_rank: number;
 }
 
 export interface RedditResearchItem {
@@ -35,6 +44,7 @@ export interface RedditResearchItem {
   comments: number;
   created_utc: number | null;
   summary: string;
+  signal_strength: RedditSignalStrength;
   reused: boolean;
 }
 
@@ -107,11 +117,70 @@ function shortDate(createdUtc: number | null): string {
   return new Date(createdUtc * 1000).toISOString().slice(0, 10);
 }
 
-function createdUtcFromAge(age: string | null): number | null {
+export function createdUtcFromAge(age: string | null, nowMs = Date.now()): number | null {
   if (!age) return null;
+  const value = age.trim().toLowerCase();
+  const relative = value.match(
+    /^(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$/
+  );
+  if (relative) {
+    const amount = Number(relative[1]);
+    const unit = relative[2];
+    const seconds =
+      unit === "second"
+        ? amount
+        : unit === "minute"
+          ? amount * 60
+          : unit === "hour"
+            ? amount * 3600
+            : unit === "day"
+              ? amount * 86400
+              : unit === "week"
+                ? amount * 7 * 86400
+                : unit === "month"
+                  ? amount * 30 * 86400
+                  : amount * 365 * 86400;
+    return Math.floor(nowMs / 1000 - seconds);
+  }
+  if (value === "yesterday") return Math.floor(nowMs / 1000 - 86400);
+
   const parsed = Date.parse(age);
   if (!Number.isFinite(parsed)) return null;
   return Math.floor(parsed / 1000);
+}
+
+export function redditSignalAgeDays(
+  createdUtc: number | null,
+  nowSec = Math.floor(Date.now() / 1000)
+): number | null {
+  if (!createdUtc || createdUtc <= 0) return null;
+  return Math.max(0, Math.floor((nowSec - createdUtc) / 86400));
+}
+
+export function hasViralRedditMetrics(
+  signal: Pick<RedditSearchHit | RedditResearchItem, "score" | "comments">
+): boolean {
+  return (
+    signal.score >= REDDIT_VIRAL_SCORE_MIN ||
+    signal.comments >= REDDIT_VIRAL_COMMENTS_MIN
+  );
+}
+
+export function isUsableRedditSignal(
+  signal: Pick<
+    RedditSearchHit | RedditResearchItem,
+    "score" | "comments" | "created_utc" | "signal_strength"
+  > & { brave_rank?: number },
+  nowSec = Math.floor(Date.now() / 1000)
+): boolean {
+  const ageDays = redditSignalAgeDays(signal.created_utc, nowSec);
+  if (ageDays === null || ageDays > REDDIT_RECENCY_DAYS) return false;
+  if (hasViralRedditMetrics(signal)) return true;
+  return (
+    signal.signal_strength === "fallback" &&
+    typeof signal.brave_rank === "number" &&
+    signal.brave_rank <= REDDIT_FALLBACK_BRAVE_RANK_LIMIT
+  );
 }
 
 function parseRedditPermalink(
@@ -146,7 +215,8 @@ function parseRedditPermalink(
 
 export function normalizeBraveRedditResult(
   result: BraveWebResult,
-  expectedSubreddit: string
+  expectedSubreddit: string,
+  braveRank = 1
 ): RedditSearchHit | null {
   const parsed = parseRedditPermalink(result.url, expectedSubreddit);
   if (!parsed) return null;
@@ -165,13 +235,90 @@ export function normalizeBraveRedditResult(
     selftext: snippet || null,
     provider: "brave_search",
     snippet,
+    signal_strength: "fallback",
+    brave_rank: braveRank,
   };
+}
+
+async function fetchRedditThreadMetrics(
+  permalink: string
+): Promise<{
+  title: string | null;
+  score: number;
+  comments: number;
+  created_utc: number | null;
+  selftext: string | null;
+} | null> {
+  const url = new URL(`${permalink}.json`);
+  url.searchParams.set("raw_json", "1");
+  const res = await fetch(url.toString(), {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "ytmanager/0.1 reddit-signal-enrichment",
+    },
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(`Reddit thread JSON ${res.status}`);
+  }
+
+  const json = (await res.json()) as unknown;
+  const firstListing = Array.isArray(json) ? json[0] : null;
+  const firstChild =
+    firstListing &&
+    typeof firstListing === "object" &&
+    "data" in firstListing
+      ? (firstListing as { data?: { children?: unknown[] } }).data?.children?.[0]
+      : null;
+  const data =
+    firstChild && typeof firstChild === "object" && "data" in firstChild
+      ? (firstChild as { data?: Record<string, unknown> }).data
+      : null;
+  if (!data) return null;
+
+  const score = typeof data.score === "number" ? data.score : 0;
+  const comments = typeof data.num_comments === "number" ? data.num_comments : 0;
+  const created =
+    typeof data.created_utc === "number" ? Math.floor(data.created_utc) : null;
+  return {
+    title: typeof data.title === "string" ? cleanText(data.title) : null,
+    score,
+    comments,
+    created_utc: created,
+    selftext: typeof data.selftext === "string" ? cleanText(data.selftext) : null,
+  };
+}
+
+async function enrichRedditSearchHit(hit: RedditSearchHit): Promise<RedditSearchHit> {
+  try {
+    const metrics = await fetchRedditThreadMetrics(hit.permalink);
+    if (!metrics) return hit;
+    return {
+      ...hit,
+      title: metrics.title || hit.title,
+      score: metrics.score,
+      comments: metrics.comments,
+      created_utc: metrics.created_utc ?? hit.created_utc,
+      selftext: metrics.selftext || hit.selftext,
+      signal_strength: "metrics",
+    };
+  } catch (err) {
+    log.warn("reddit", "Reddit permalink metric enrichment failed", {
+      permalink: hit.permalink,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return hit;
+  }
 }
 
 function buildSummary(topic: string, hit: RedditSearchHit): string {
   const date = shortDate(hit.created_utc);
   const snippet = hit.snippet ? ` The search snippet says: "${hit.snippet.slice(0, 260)}"` : "";
-  return `On ${date}, Brave Search surfaced a Reddit thread in r/${hit.subreddit} while researching ${topic}: "${hit.title}".${snippet} This is a web-search signal for audience demand, not a direct Reddit API metric.`;
+  const metric =
+    hit.signal_strength === "metrics"
+      ? ` Reddit metrics show ${hit.score} upvotes and ${hit.comments} comments.`
+      : ` Reddit score/comment metrics were unavailable, so this is accepted only as a recent top Brave result.`;
+  return `On ${date}, Brave Search surfaced a Reddit thread in r/${hit.subreddit} while researching ${topic}: "${hit.title}".${metric}${snippet} This is a topic-demand signal only; YouTube outliers must still supply the format.`;
 }
 
 function projectRoot(): string {
@@ -206,6 +353,24 @@ function appendResearchUpdates(items: RedditResearchItem[]): void {
   fs.appendFileSync(file, body, "utf-8");
 }
 
+function signalStrengthFromSourceJson(
+  sourceJson: string | null | undefined,
+  score: number,
+  comments: number
+): RedditSignalStrength {
+  if (sourceJson) {
+    try {
+      const parsed = JSON.parse(sourceJson) as { signal_strength?: unknown };
+      if (parsed.signal_strength === "metrics" || parsed.signal_strength === "fallback") {
+        return parsed.signal_strength;
+      }
+    } catch {
+      /* old rows may have malformed or absent source metadata */
+    }
+  }
+  return hasViralRedditMetrics({ score, comments }) ? "metrics" : "fallback";
+}
+
 function insertOrReuseResearch(args: {
   userChannelId: string;
   generationId?: string | null;
@@ -221,15 +386,71 @@ function insertOrReuseResearch(args: {
   const existing = db
     .prepare(
       `SELECT id, topic_key, subreddit, title, permalink, score, comments,
-              created_utc, summary
+              created_utc, summary, source_json
        FROM reddit_research_items
        WHERE dedupe_key = ?`
     )
-    .get(key) as Omit<RedditResearchItem, "topic" | "reused"> | undefined;
+    .get(key) as
+    | (Omit<RedditResearchItem, "topic" | "reused" | "signal_strength"> & {
+        source_json: string | null;
+      })
+    | undefined;
 
   let item: RedditResearchItem;
   if (existing) {
-    item = { ...existing, topic: args.topic, reused: true };
+    const { source_json: sourceJson, ...row } = existing;
+    const existingStrength = signalStrengthFromSourceJson(
+      sourceJson,
+      existing.score,
+      existing.comments
+    );
+    const shouldRefreshMetrics =
+      args.hit.signal_strength === "metrics" &&
+      (existingStrength !== "metrics" ||
+        args.hit.score !== existing.score ||
+        args.hit.comments !== existing.comments ||
+        (!existing.created_utc && !!args.hit.created_utc));
+
+    if (shouldRefreshMetrics) {
+      const summary = buildSummary(args.topic, args.hit);
+      db.prepare(
+        `UPDATE reddit_research_items
+         SET title = ?, score = ?, comments = ?, created_utc = COALESCE(?, created_utc),
+             summary = ?, source_json = ?
+         WHERE id = ?`
+      ).run(
+        args.hit.title,
+        args.hit.score,
+        args.hit.comments,
+        args.hit.created_utc,
+        summary,
+        JSON.stringify({
+          ...args.hit,
+          provider: "brave_search",
+          signal_strength: args.hit.signal_strength,
+          brave_rank: args.hit.brave_rank,
+        }),
+        existing.id
+      );
+      item = {
+        ...row,
+        title: args.hit.title,
+        score: args.hit.score,
+        comments: args.hit.comments,
+        created_utc: args.hit.created_utc ?? existing.created_utc,
+        summary,
+        topic: args.topic,
+        signal_strength: args.hit.signal_strength,
+        reused: true,
+      };
+    } else {
+      item = {
+        ...row,
+        topic: args.topic,
+        signal_strength: existingStrength,
+        reused: true,
+      };
+    }
   } else {
     const summary = buildSummary(args.topic, args.hit);
     const info = db
@@ -251,7 +472,12 @@ function insertOrReuseResearch(args: {
         args.hit.created_utc,
         summary,
         key,
-        JSON.stringify({ ...args.hit, provider: "brave_search" })
+        JSON.stringify({
+          ...args.hit,
+          provider: "brave_search",
+          signal_strength: args.hit.signal_strength,
+          brave_rank: args.hit.brave_rank,
+        })
       );
     item = {
       id: Number(info.lastInsertRowid),
@@ -264,6 +490,7 @@ function insertOrReuseResearch(args: {
       comments: args.hit.comments,
       created_utc: args.hit.created_utc,
       summary,
+      signal_strength: args.hit.signal_strength,
       reused: false,
     };
   }
@@ -309,10 +536,24 @@ export async function collectRedditResearch(
           count: 10,
           freshness: "pm",
         });
-        for (const result of hits) {
+        for (const [rankIndex, result] of hits.entries()) {
           if (items.length >= maxItems) break;
-          const hit = normalizeBraveRedditResult(result, subreddit);
-          if (!hit) continue;
+          const rawHit = normalizeBraveRedditResult(result, subreddit, rankIndex + 1);
+          if (!rawHit) continue;
+          const hit = await enrichRedditSearchHit(rawHit);
+          if (!isUsableRedditSignal(hit)) {
+            log.info("reddit", "skipping non-viral Reddit result", {
+              subreddit,
+              topic,
+              permalink: hit.permalink,
+              score: hit.score,
+              comments: hit.comments,
+              created_utc: hit.created_utc,
+              signal_strength: hit.signal_strength,
+              brave_rank: hit.brave_rank,
+            });
+            continue;
+          }
           const key = redditDedupeKey({
             topic,
             subreddit: hit.subreddit,
@@ -340,6 +581,15 @@ export async function collectRedditResearch(
     }
   }
 
-  appendResearchUpdates(items);
-  return items;
+  const ranked = items.sort((a, b) => {
+    const aMetrics = a.signal_strength === "metrics" ? 1 : 0;
+    const bMetrics = b.signal_strength === "metrics" ? 1 : 0;
+    if (aMetrics !== bMetrics) return bMetrics - aMetrics;
+    const aEngagement = Math.max(a.score, a.comments * 5);
+    const bEngagement = Math.max(b.score, b.comments * 5);
+    if (aEngagement !== bEngagement) return bEngagement - aEngagement;
+    return (b.created_utc ?? 0) - (a.created_utc ?? 0);
+  });
+  appendResearchUpdates(ranked);
+  return ranked;
 }

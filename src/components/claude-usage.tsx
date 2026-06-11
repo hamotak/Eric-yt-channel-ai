@@ -16,6 +16,7 @@ import { cn } from "@/lib/utils";
 type Turn = {
   id: number;
   ts: number;
+  provider: string;
   sessionId: string | null;
   executorModel: string;
   advisorModel: string | null;
@@ -69,16 +70,14 @@ function fmtTime(ts: number): string {
 }
 
 /**
- * Per-turn Claude spend widget rendered under the Claude integration card.
- * Shown only when the user has a Claude key configured — there's no point
- * showing spend for a disconnected integration.
+ * Per-turn AI spend widget rendered under configured model integrations.
  *
  * Three things visible at a glance:
  *   - Total spent + last-24h spent
  *   - Per-turn list with cost, duration, token breakdown on expand
- *   - "Clear history" button (resets the ledger, doesn't affect Anthropic billing)
+ *   - "Clear history" button (resets the ledger, doesn't affect provider billing)
  */
-export function ClaudeUsage({ enabled }: { enabled: boolean }) {
+export function AiUsage({ enabled }: { enabled: boolean }) {
   const { t } = useI18n();
   const [data, setData] = useState<Data | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
@@ -88,7 +87,7 @@ export function ClaudeUsage({ enabled }: { enabled: boolean }) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch("/api/claude/usage?limit=100");
+      const res = await fetch("/api/ai/usage?limit=100");
       if (!res.ok) return;
       const d = (await res.json()) as Data;
       setData(d);
@@ -103,7 +102,7 @@ export function ClaudeUsage({ enabled }: { enabled: boolean }) {
 
   const clearAll = async () => {
     if (!confirm(t.claudeUsage.confirmClear)) return;
-    await fetch("/api/claude/usage", { method: "DELETE" });
+    await fetch("/api/ai/usage", { method: "DELETE" });
     load();
   };
 
@@ -256,6 +255,8 @@ export function ClaudeUsage({ enabled }: { enabled: boolean }) {
   );
 }
 
+export const ClaudeUsage = AiUsage;
+
 function SummaryStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-md border border-border bg-background p-2">
@@ -270,7 +271,7 @@ function TurnDetails({ turn }: { turn: Turn }) {
   const durationSec = (turn.durationMs / 1000).toFixed(1);
   return (
     <div className="grid grid-cols-2 gap-x-4 gap-y-1 border-t border-border/60 bg-muted/30 px-8 py-2 text-[11px] text-muted-foreground">
-      <Row label={t.claudeUsage.rowModel} value={turn.executorModel} mono />
+      <Row label={t.claudeUsage.rowModel} value={`${turn.provider}:${turn.executorModel}`} mono />
       <Row label={t.claudeUsage.rowIterations} value={String(turn.iterations)} />
       <Row label={t.claudeUsage.rowInputTokens} value={fmtTokens(turn.inputTokens)} />
       <Row label={t.claudeUsage.rowOutputTokens} value={fmtTokens(turn.outputTokens)} />

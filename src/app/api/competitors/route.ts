@@ -61,6 +61,8 @@ export async function GET(_req: Request) {
     avatarUrl: c.avatar_url,
     subscriberCount: c.subscriber_count,
     note: c.note ?? null,
+    thumbnailPolicy: c.thumbnail_policy ?? "allow",
+    thumbnailPolicyNote: c.thumbnail_policy_note ?? null,
     addedAt: c.added_at,
   }));
   return NextResponse.json({ competitors, activeChannelId: activeId });
@@ -184,6 +186,8 @@ export async function POST(req: Request) {
       avatarUrl: thumbnail,
       subscriberCount: subscriberCount,
       note,
+      thumbnailPolicy: "allow",
+      thumbnailPolicyNote: null,
     },
   });
 }

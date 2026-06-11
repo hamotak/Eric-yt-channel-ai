@@ -10,7 +10,7 @@ import { useI18n } from "@/lib/i18n/provider";
 import { YouTubeChannelBinder } from "@/components/youtube-channel-binder";
 import { ClaudeUsage } from "@/components/claude-usage";
 
-type Name = "claude" | "youtube" | "brave";
+type Name = "openai" | "claude" | "youtube" | "brave" | "69labs";
 
 type StatusMap = Record<
   Name,
@@ -46,6 +46,23 @@ export default function IntegrationsPage() {
     mode: ItemMode;
     help: Help;
   }[] = [
+    {
+      name: "openai",
+      label: "OpenAI",
+      desc: "GPT-5.5 thumbnail planning and visual analysis for Image Studio.",
+      placeholder: "sk-...",
+      mode: "key",
+      help: {
+        title: "How to get an OpenAI API key",
+        steps: [
+          "Open the OpenAI platform dashboard and sign in.",
+          "Create a project API key from API keys.",
+          "Paste the API key here. Do not paste a ChatGPT browser/session token.",
+        ],
+        link: "https://platform.openai.com/api-keys",
+        linkLabel: "Open OpenAI API keys",
+      },
+    },
     {
       name: "claude",
       label: t.integrations.claude.name,
@@ -89,12 +106,29 @@ export default function IntegrationsPage() {
         linkLabel: "Open Brave Search API",
       },
     },
+    {
+      name: "69labs",
+      label: "69labs",
+      desc: "Image generation for Image Studio.",
+      placeholder: "vk_...",
+      mode: "key",
+      help: {
+        title: "How to connect 69labs",
+        steps: [
+          "Open your 69labs dashboard.",
+          "Create or copy a key that starts with vk_.",
+          "Paste it here so Image Studio can generate final images.",
+        ],
+        link: "https://69labs.vip/",
+        linkLabel: "Open 69labs",
+      },
+    },
   ];
 
   return (
     <div className="mx-auto max-w-3xl">
       <header className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">{t.integrations.title}</h1>
+        <h2 className="text-xl font-semibold tracking-tight">{t.integrations.title}</h2>
         <p className="mt-1 text-sm text-muted-foreground">{t.integrations.subtitle}</p>
       </header>
 
@@ -163,7 +197,7 @@ function IntegrationCard({
 
   return (
     <Card>
-      <CardHeader className="flex flex-row items-start justify-between space-y-0">
+      <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-3">
         <div>
           <CardTitle>{label}</CardTitle>
           <CardDescription className="mt-1">{desc}</CardDescription>
@@ -179,7 +213,7 @@ function IntegrationCard({
           {connected ? t.integrations.status.connected : t.integrations.status.notConnected}
         </span>
       </CardHeader>
-      <CardContent className="space-y-3">
+      <CardContent className="space-y-3 pt-0">
         {/* Expandable how-to block. Closed by default — power users don't
             need it, but new users get a step-by-step path to the key
             without leaving the page. */}
@@ -242,7 +276,11 @@ function IntegrationCard({
                     {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                   </button>
                 </div>
-                <Button onClick={save} disabled={saving || !value.trim()}>
+                <Button
+                  onClick={save}
+                  disabled={saving || !value.trim()}
+                  variant={value.trim() ? "default" : "outline"}
+                >
                   {saving ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
                   ) : justSaved ? (
@@ -264,7 +302,7 @@ function IntegrationCard({
             <YouTubeChannelBinder hasKey={!!status?.hasKey} />
           </>
         )}
-        {name === "claude" && <ClaudeUsage enabled={!!status?.hasKey} />}
+        {name === "openai" && <ClaudeUsage enabled={!!status?.hasKey} />}
       </CardContent>
     </Card>
   );

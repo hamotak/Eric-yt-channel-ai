@@ -28,6 +28,8 @@ type WireField =
   | "ideationRules"
   | "bannedTopics"
   | "redditSources"
+  | "thumbnailStyleGoals"
+  | "thumbnailDesignRules"
   | "niche"
   | "positioning"
   | "audience"
@@ -39,6 +41,8 @@ const WIRE_TO_DB: Record<WireField, ChannelContextField> = {
   ideationRules: "ideation_rules",
   bannedTopics: "banned_topics",
   redditSources: "reddit_sources",
+  thumbnailStyleGoals: "thumbnail_style_goals",
+  thumbnailDesignRules: "thumbnail_design_rules",
   niche: "niche",
   positioning: "positioning",
   audience: "audience",
@@ -55,6 +59,8 @@ const FIELD_CAPS: Partial<Record<WireField, number>> = {
   ideationRules: 1200,
   bannedTopics: 500,
   redditSources: 800,
+  thumbnailStyleGoals: 1200,
+  thumbnailDesignRules: 1200,
 };
 
 type ChannelContextWire = {
@@ -68,6 +74,8 @@ type ChannelContextWire = {
   ideationRules: string;
   bannedTopics: string;
   redditSources: string;
+  thumbnailStyleGoals: string;
+  thumbnailDesignRules: string;
   // Legacy fields still surfaced so older clients reading the GET
   // response don't break; the redesigned UI ignores them.
   niche: string;
@@ -89,6 +97,8 @@ function toWire(c: Channel): ChannelContextWire {
     ideationRules: c.ideation_rules ?? "",
     bannedTopics: c.banned_topics ?? "",
     redditSources: c.reddit_sources ?? "",
+    thumbnailStyleGoals: c.thumbnail_style_goals ?? "",
+    thumbnailDesignRules: c.thumbnail_design_rules ?? "",
     niche: c.niche ?? "",
     positioning: c.positioning ?? "",
     audience: c.audience ?? "",

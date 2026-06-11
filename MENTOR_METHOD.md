@@ -130,11 +130,13 @@ For each generated idea, the output includes:
 - **Confidence score** — derived from (a) how many channels validate the topic, (b) how recent the title format is, (c) how strong the source outlier's multiplier was, (d) how well the angle matches channel voice.
 
 **External ideation sources** (beyond YouTube) the AI may reference if the user has populated `channels.external_sources`:
-- Reddit / niche-specific forums — top posts surface what the audience cares about right now.
+- Reddit / niche-specific forums — recent viral discussions surface what the audience cares about right now. Use Reddit as a **topic-demand signal only**; it must never supply the title format, thumbnail format, or `format_source`.
 - Google articles and blog posts — often cover angles YouTube hasn't yet.
 - TikTok / Reels — consistent short-form engagement on a topic suggests a long-form audience exists.
 - Documentaries, books, news stories — strong source for factual angles and untold stories.
 - LLMs (Claude / ChatGPT) — useful for brainstorming angles, but every factual claim **must be verified independently** before use.
+
+For Reddit-backed ideation, the final idea still needs a YouTube-optimized format source: a proven YouTube outlier or strong own-channel winner whose title structure can carry the Reddit topic.
 
 ---
 
@@ -174,7 +176,7 @@ When any AI feature inside the app (Outliers explainer, Topic Validator, Topic I
 3. **Never copy a competitor's title or thumbnail 1:1 from the same niche.** If the source is direct-niche, require a 10% twist.
 4. **Always cite the source outlier** (channel name + video title + multiplier) when recommending a title format or thumbnail format.
 5. **Always state the lever(s)** the recommendation leans on — never recommend without naming the *why*.
-6. **Never confuse "topic" with "format."** A topic is what the video is about. A format is the structural pattern. Both must be validated separately.
+6. **Never confuse "topic" with "format."** A topic is what the video is about. A format is the structural pattern. Both must be validated separately. Reddit can validate topic demand, but YouTube outliers or own winners must validate format.
 7. **Flag pre-2020 outliers** as low-confidence signals — competition has changed.
 8. **Verify factual claims** when the operator's `external_sources` include factual content (documentaries, books, news). Do not assert facts the source material doesn't support.
 9. **Respect channel voice.** A counterintuitive angle that works for an irreverent channel doesn't fit a sincere one. Always check against `channels.voice` before generating.

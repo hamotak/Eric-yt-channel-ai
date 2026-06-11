@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronsUpDown, Tv } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AlertCircle, Check, ChevronsUpDown, Loader2, RefreshCw, Tv } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 type Channel = {
@@ -16,6 +16,8 @@ type ChannelsResponse = {
   activeId: string | null;
 };
 
+type LoadState = "loading" | "ready" | "error";
+
 /**
  * Top-bar channel picker. Lets the user switch which YouTube channel the
  * ideation and setup screens are scoped to.
@@ -29,9 +31,14 @@ type ChannelsResponse = {
 export function ChannelSwitcher() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [loadState, setLoadState] = useState<LoadState>("loading");
+  const [statusText, setStatusText] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [switching, setSwitching] = useState(false);
   const popRef = useRef<HTMLDivElement>(null);
+  const requestSeqRef = useRef(0);
+  const autoRetryRef = useRef(false);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Display order: largest channel first, alphabetical tiebreak. Otherwise
   // a freshly-added 100-sub channel can bury the 117K main channel below
@@ -47,22 +54,50 @@ export function ChannelSwitcher() {
     });
   }, [channels]);
 
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/channels", { cache: "no-store" })
-      .then((r) => r.json() as Promise<ChannelsResponse>)
-      .then((data) => {
-        if (cancelled) return;
-        setChannels(data.channels);
-        setActiveId(data.activeId);
-      })
-      .catch(() => {
-        // Silent — switcher will just stay hidden if the fetch fails.
-      });
-    return () => {
-      cancelled = true;
-    };
+  const loadChannels = useCallback(async (opts: { autoRetry?: boolean } = {}) => {
+    const requestId = requestSeqRef.current + 1;
+    requestSeqRef.current = requestId;
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    setLoadState("loading");
+    setStatusText(null);
+    try {
+      const res = await fetch("/api/channels", { cache: "no-store" });
+      const data = (await res.json().catch(() => ({}))) as Partial<ChannelsResponse> & {
+        error?: string;
+      };
+      if (!res.ok) {
+        throw new Error(data.error || `Channels request failed (${res.status})`);
+      }
+      if (!Array.isArray(data.channels)) {
+        throw new Error("Channels response was not valid.");
+      }
+      if (requestId !== requestSeqRef.current) return;
+      setChannels(data.channels);
+      setActiveId(typeof data.activeId === "string" ? data.activeId : null);
+      setLoadState("ready");
+    } catch (error) {
+      if (requestId !== requestSeqRef.current) return;
+      setLoadState("error");
+      setStatusText(error instanceof Error ? error.message : "Channels unavailable.");
+      if (opts.autoRetry !== false && !autoRetryRef.current) {
+        autoRetryRef.current = true;
+        retryTimerRef.current = setTimeout(() => {
+          void loadChannels({ autoRetry: false });
+        }, 1500);
+      }
+    }
   }, []);
+
+  useEffect(() => {
+    void loadChannels();
+    return () => {
+      requestSeqRef.current += 1;
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    };
+  }, [loadChannels]);
 
   // Close on outside click.
   useEffect(() => {
@@ -74,6 +109,36 @@ export function ChannelSwitcher() {
     window.addEventListener("mousedown", onClick);
     return () => window.removeEventListener("mousedown", onClick);
   }, [open]);
+
+  function retryLoad() {
+    autoRetryRef.current = false;
+    void loadChannels();
+  }
+
+  if (loadState === "loading") {
+    return (
+      <Button variant="outline" size="sm" disabled className="gap-2">
+        <Loader2 className="h-4 w-4 animate-spin" />
+        <span className="max-w-[160px] truncate">Loading channels</span>
+      </Button>
+    );
+  }
+
+  if (loadState === "error") {
+    return (
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={retryLoad}
+        className="gap-2 border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+        title={statusText ?? "Channels unavailable"}
+      >
+        <AlertCircle className="h-4 w-4" />
+        <span className="max-w-[160px] truncate">Channels unavailable</span>
+        <RefreshCw className="h-3 w-3 opacity-70" />
+      </Button>
+    );
+  }
 
   if (channels.length <= 1) return null;
   const active = channels.find((c) => c.id === activeId) ?? channels[0];
@@ -88,30 +153,31 @@ export function ChannelSwitcher() {
       return;
     }
     setSwitching(true);
+    setStatusText(null);
     try {
       const res = await fetch("/api/channels/active", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id }),
       });
-      if (res.ok) {
-        // Kick the silent freshness pass for the newly-active channel
-        // before navigating. keepalive lets the request survive the
-        // upcoming reload; the server enforces a 15-minute throttle.
-        fetch("/api/sync/user-videos", {
-          method: "POST",
-          keepalive: true,
-        }).catch(() => {});
-        // Hard reload — server components on every page read the active
-        // channel during render. SWR-style soft invalidation isn't enough.
-        window.location.reload();
-      } else {
-        setSwitching(false);
-        setOpen(false);
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error || `Could not switch channel (${res.status})`);
       }
-    } catch {
+      // Kick the silent freshness pass for the newly-active channel before
+      // navigating. keepalive lets the request survive the upcoming reload;
+      // the server enforces a 15-minute throttle.
+      fetch("/api/sync/user-videos", {
+        method: "POST",
+        keepalive: true,
+      }).catch(() => {});
+      // Hard reload — server components on every page read the active
+      // channel during render. SWR-style soft invalidation isn't enough.
+      window.location.reload();
+    } catch (error) {
       setSwitching(false);
-      setOpen(false);
+      setOpen(true);
+      setStatusText(error instanceof Error ? error.message : "Could not switch channel.");
     }
   }
 
@@ -137,6 +203,7 @@ export function ChannelSwitcher() {
               <button
                 key={c.id}
                 onClick={() => pick(c.id)}
+                disabled={switching}
                 className="flex w-full items-center gap-2 rounded-sm px-2 py-2 text-left text-sm hover:bg-accent"
               >
                 <Check
@@ -158,6 +225,11 @@ export function ChannelSwitcher() {
               </button>
             ))}
           </div>
+          {statusText ? (
+            <div className="border-t border-border px-3 py-2 text-[11px] text-destructive">
+              {statusText}
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

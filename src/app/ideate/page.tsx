@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { Copy, Loader2 } from "lucide-react";
+import { Check, Copy, ExternalLink, ImagePlus, Loader2, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { YouTubeThumbnail } from "@/components/youtube-thumbnail";
 import { cn } from "@/lib/utils";
@@ -76,6 +76,36 @@ type SourceVideo = {
   age_days?: number | null;
 };
 
+type RemixPipelineReference = {
+  id: string;
+  videoId: string | null;
+  title: string;
+  channelName: string | null;
+  channelHandle: string | null;
+  thumbnailUrl: string;
+};
+
+type RemixPipelineCandidate = {
+  id: string;
+  rank: number;
+  status: "processing" | "completed" | "failed";
+  imageUrl: string | null;
+  sourceImages: RemixPipelineReference[];
+  prompt: string | null;
+  error: string | null;
+};
+
+type RemixPipelineRun = {
+  id: string;
+  status: "processing" | "completed" | "failed";
+  title: string | null;
+  prompt: string;
+  sampleCount: number;
+  error: string | null;
+  references: RemixPipelineReference[];
+  candidates: RemixPipelineCandidate[];
+};
+
 type TitleSettings = {
   model: string;
   rules: string[];
@@ -95,13 +125,6 @@ const MODE_LABEL: Record<Mode, string> = {
   new_angles: "New Angles",
   title_tweaks: "Title Tweaks",
   reddit_angles: "Reddit Angles",
-};
-
-const MODE_DESCRIPTION: Record<Mode, string> = {
-  auto: "Balanced mix. The AI picks the strongest moves per run.",
-  new_angles: "Topic from one viral video + format from another. Cross-pollination.",
-  title_tweaks: "Take a recent winning title, swap 1-2 keywords. A/B variants.",
-  reddit_angles: "Brave-powered subreddit signal + proven YouTube format.",
 };
 
 function stepFromElapsed(elapsed: number): { label: string; pct: number } {
@@ -270,7 +293,6 @@ export default function IdeatePage() {
 
   const hasCompetitors = (competitorCount ?? 0) > 0;
   const redditSourcesConfigured = activeChannelRedditSources.trim().length > 0;
-  const redditReady = redditSourcesConfigured && braveSearchReady;
   const showProgress = generation?.status === "processing";
   const showCompleted = generation?.status === "completed";
   const showFailed = generation?.status === "failed";
@@ -278,7 +300,7 @@ export default function IdeatePage() {
   // History sidebar collapses to a slide-in panel at <1280px (xl). At
   // wider widths it stays docked. The user can also explicitly toggle
   // via the "History →" link in the main canvas.
-  const [historyOverlayMode, setHistoryOverlayMode] = useState(false);
+  const [historyOverlayMode, setHistoryOverlayMode] = useState(true);
   const [historyOverlayOpen, setHistoryOverlayOpen] = useState(false);
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -291,6 +313,7 @@ export default function IdeatePage() {
     mq.addEventListener("change", sync);
     return () => mq.removeEventListener("change", sync);
   }, []);
+  const historyOverlayClosed = historyOverlayMode && !historyOverlayOpen;
 
   return (
     <div className="-mx-6 -mb-6 -mt-20 flex h-[calc(100vh-3.5rem)]">
@@ -299,7 +322,7 @@ export default function IdeatePage() {
           aria-label="Close history"
           type="button"
           onClick={() => setHistoryOverlayOpen(false)}
-          className="fixed inset-0 z-30 bg-black/40"
+          className="fixed inset-y-0 left-60 right-0 z-30 bg-black/40"
         />
       )}
       {/* History sidebar */}
@@ -311,8 +334,11 @@ export default function IdeatePage() {
             ? historyOverlayOpen
               ? "fixed inset-y-0 left-0 z-40 translate-x-0 bg-background"
               : "fixed inset-y-0 left-0 z-40 -translate-x-full bg-background"
-            : "translate-x-0"
+            : "translate-x-0",
+          historyOverlayClosed && "pointer-events-none"
         )}
+        aria-hidden={historyOverlayClosed}
+        inert={historyOverlayClosed ? true : undefined}
       >
         <div className="px-4 py-5">
           <h2 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
@@ -380,9 +406,6 @@ export default function IdeatePage() {
             <h1 className="text-2xl font-semibold tracking-tight">
               Generate ideas for {activeChannelName ?? "this channel"}
             </h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Sonnet 4.6 with extended thinking, grounded in your competitors&apos; recent outliers and your channel context.
-            </p>
           </header>
 
           {!hasCompetitors ? (
@@ -399,7 +422,6 @@ export default function IdeatePage() {
               onCountChange={setCount}
               onGenerate={onGenerate}
               disabled={submitting || showProgress}
-              redditReady={redditReady}
               redditSourcesConfigured={redditSourcesConfigured}
               braveSearchReady={braveSearchReady}
               titleSettings={titleSettings}
@@ -442,7 +464,6 @@ function Composer({
   onCountChange,
   onGenerate,
   disabled,
-  redditReady,
   redditSourcesConfigured,
   braveSearchReady,
   titleSettings,
@@ -454,7 +475,6 @@ function Composer({
   onCountChange: (n: number) => void;
   onGenerate: () => void;
   disabled: boolean;
-  redditReady: boolean;
   redditSourcesConfigured: boolean;
   braveSearchReady: boolean;
   titleSettings: TitleSettings | null;
@@ -481,26 +501,14 @@ function Composer({
           <option value="title_tweaks">Title Tweaks</option>
           <option value="reddit_angles">Reddit Angles</option>
         </select>
-        <p className="mt-1.5 text-xs text-muted-foreground">
-          {MODE_DESCRIPTION[mode]}
-        </p>
         {showRedditNote && !redditSourcesConfigured && (
           <p className="mt-1.5 text-xs text-amber-600 dark:text-amber-400">
-            Reddit inactive: add subreddit sources in{" "}
-            <Link href="/channel-info" className="underline-offset-2 hover:underline">
-              Channel Info
-            </Link>
-            .
+            No Reddit groups configured.
           </p>
         )}
         {showRedditNote && redditSourcesConfigured && !braveSearchReady && (
           <p className="mt-1.5 text-xs text-amber-600 dark:text-amber-400">
-            Reddit inactive: add a Brave Search key in Settings.
-          </p>
-        )}
-        {showRedditNote && redditReady && (
-          <p className="mt-1.5 text-xs text-emerald-600 dark:text-emerald-400">
-            Reddit active: Auto can include Reddit Angles.
+            Reddit search needs a Brave Search key.
           </p>
         )}
       </div>
@@ -508,12 +516,9 @@ function Composer({
       {titleSettings && (
         <details className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
           <summary className="cursor-pointer font-medium text-foreground">
-            Title rules sent to Claude
+            Title rules
           </summary>
           <div className="mt-2 space-y-2 text-muted-foreground">
-            <div className="font-mono text-[10px] uppercase tracking-wider">
-              {titleSettings.model}
-            </div>
             <TitleRulesEditor
               titleSettings={titleSettings}
               onSaved={onTitleSettingsChange}
@@ -524,18 +529,23 @@ function Composer({
 
       <div>
         <div className="flex items-baseline justify-between">
-          <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          <label
+            htmlFor="idea-count"
+            className="text-xs font-medium uppercase tracking-wider text-muted-foreground"
+          >
             Count
           </label>
           <span className="text-sm tabular-nums text-foreground">{count}</span>
         </div>
         <input
+          id="idea-count"
           type="range"
           min={10}
           max={25}
           step={1}
           value={count}
           disabled={disabled}
+          aria-label="Number of ideas to generate"
           onChange={(e) => onCountChange(Number(e.target.value))}
           className="mt-1.5 w-full accent-primary"
         />
@@ -614,9 +624,6 @@ function TitleRulesEditor({
       <div className="flex items-baseline justify-between gap-3">
         <div>
           <div className="font-medium text-foreground">Editable title rules</div>
-          <p className="mt-0.5 text-muted-foreground">
-            One rule per line. These are sent to Claude on every ideation run.
-          </p>
         </div>
         <span className={cn("shrink-0 tabular-nums", overCap && "text-destructive")}>
           {value.length}/{cap}
@@ -690,9 +697,6 @@ function ProgressSection({ elapsed, count }: { elapsed: number; count: number })
             style={{ width: `${pct}%` }}
           />
         </div>
-        <p className="mt-2 text-xs text-muted-foreground">
-          This takes ~3-5 minutes. You can leave this tab open.
-        </p>
       </div>
 
       <ul className="mt-8 border-t border-border">
@@ -743,7 +747,12 @@ function IdeaCard({ idea }: { idea: Idea }) {
   // local state immediately, then post; on failure we revert.
   const [used, setUsed] = useState(!!idea.used);
   const [copied, setCopied] = useState(false);
+  const [imageStarting, setImageStarting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [imageRunId, setImageRunId] = useState<string | null>(null);
+  const [imageRun, setImageRun] = useState<RemixPipelineRun | null>(null);
+  const [pipelineError, setPipelineError] = useState<string | null>(null);
+  const [createConfirmOpen, setCreateConfirmOpen] = useState(false);
 
   const patch = useCallback(
     async (body: Record<string, unknown>): Promise<boolean> => {
@@ -787,6 +796,81 @@ function IdeaCard({ idea }: { idea: Idea }) {
     }
     setActionError(null);
   }, [idea.title, patch, used]);
+
+  const pollImageRun = useCallback(async (id: string) => {
+    const r = await fetch(`/api/image-runs/${encodeURIComponent(id)}`, {
+      cache: "no-store",
+    });
+    const data = (await r.json().catch(() => ({}))) as {
+      run?: RemixPipelineRun;
+      error?: string;
+    };
+    if (!r.ok || !data.run) {
+      throw new Error(data.error ?? `HTTP ${r.status}`);
+    }
+    setImageRun(data.run);
+    return data.run;
+  }, []);
+
+  useEffect(() => {
+    if (!imageRunId) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = async () => {
+      try {
+        const next = await pollImageRun(imageRunId);
+        if (!cancelled && next.status === "processing") {
+          timer = setTimeout(tick, 3000);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setPipelineError(e instanceof Error ? e.message : "could not load image run");
+        }
+      }
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [imageRunId, pollImageRun]);
+
+  const generateImage = useCallback(async () => {
+    setCreateConfirmOpen(false);
+    setImageStarting(true);
+    setActionError(null);
+    setPipelineError(null);
+    setImageRun(null);
+    try {
+      const r = await fetch("/api/image-runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: idea.title,
+          sourceIdeaId: idea.id,
+          sampleCount: 4,
+          aspectRatio: "16:9",
+          resolution: "1k",
+          aiAssist: true,
+          generationMode: "remix",
+        }),
+      });
+      const d = (await r.json().catch(() => ({}))) as {
+        request_id?: string;
+        error?: string;
+      };
+      if (!r.ok || !d.request_id) {
+        setActionError(d.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      setImageRunId(d.request_id);
+      void pollImageRun(d.request_id);
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : "image run failed");
+    } finally {
+      setImageStarting(false);
+    }
+  }, [idea.id, idea.title, pollImageRun]);
 
   return (
     <li className="border-b border-border py-7">
@@ -848,11 +932,66 @@ function IdeaCard({ idea }: { idea: Idea }) {
         >
           {whyOpen ? "Hide why" : "Why this works"}
         </button>
+        <div className="relative">
+          {createConfirmOpen && !imageStarting ? (
+            <div
+              className="inline-flex min-h-7 flex-wrap items-center gap-1.5 rounded-md border border-border bg-muted/40 p-1 text-xs"
+              role="group"
+              aria-label="Confirm create thumbnails"
+            >
+              <span className="px-1 text-muted-foreground">Create thumbnails?</span>
+              <Button
+                type="button"
+                size="sm"
+                onClick={generateImage}
+                disabled={imageStarting}
+                aria-label="Yes, create thumbnails"
+                className="h-6 px-2 text-xs"
+              >
+                Yes
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                onClick={() => setCreateConfirmOpen(false)}
+                disabled={imageStarting}
+                aria-label="No, cancel thumbnail creation"
+                className="h-6 px-2 text-xs"
+              >
+                No
+              </Button>
+            </div>
+          ) : (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setCreateConfirmOpen(true)}
+              disabled={imageStarting}
+              className="h-7 px-2 text-xs"
+            >
+              {imageStarting ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <ImagePlus className="h-3.5 w-3.5" />
+              )}
+              Create thumbnails
+            </Button>
+          )}
+        </div>
       </div>
 
       {actionError && (
         <p className="mt-2 text-xs text-destructive">{actionError}</p>
       )}
+
+      <ThumbnailPipeline
+        runId={imageRunId}
+        run={imageRun}
+        starting={imageStarting}
+        error={pipelineError}
+      />
 
       {whyOpen && (
         <div className="mt-3 space-y-4 text-sm">
@@ -866,6 +1005,191 @@ function IdeaCard({ idea }: { idea: Idea }) {
         </div>
       )}
     </li>
+  );
+}
+
+function ThumbnailPipeline({
+  runId,
+  run,
+  starting,
+  error,
+}: {
+  runId: string | null;
+  run: RemixPipelineRun | null;
+  starting: boolean;
+  error: string | null;
+}) {
+  if (!starting && !runId && !run && !error) return null;
+
+  const total = run?.sampleCount ?? 4;
+  const planned = run?.candidates.length ?? 0;
+  const completed =
+    run?.candidates.filter((candidate) => candidate.status === "completed").length ?? 0;
+  const failed =
+    run?.candidates.filter((candidate) => candidate.status === "failed").length ?? 0;
+  const sourceCandidates = [
+    ...(run?.references ?? []),
+    ...(run?.candidates.flatMap((candidate) => candidate.sourceImages) ?? []),
+  ];
+  const sourceMap = new Map<string, RemixPipelineReference>();
+  for (const source of sourceCandidates) {
+    sourceMap.set(source.id || source.thumbnailUrl, source);
+  }
+  const sources = Array.from(sourceMap.values()).slice(0, 4);
+  const renderLabel = total === 4 ? "Rendering 4 edits" : `Rendering ${total} edits`;
+  const stages: Array<{
+    label: string;
+    detail: string;
+    state: "done" | "active" | "pending" | "failed";
+  }> = [
+    {
+      label: "Sources found",
+      detail: sources.length > 0 ? `${sources.length} thumbnail${sources.length === 1 ? "" : "s"}` : "choosing",
+      state: sources.length > 0 ? "done" : run ? "active" : "pending",
+    },
+    {
+      label: "Prompts planned",
+      detail: `${planned}/${total} ready`,
+      state:
+        planned >= total
+          ? "done"
+          : run?.status === "failed"
+            ? "failed"
+            : run
+              ? "active"
+              : "pending",
+    },
+    {
+      label: renderLabel,
+      detail: `${completed + failed}/${total} finished`,
+      state:
+        failed > 0 && run?.status === "failed"
+          ? "failed"
+          : completed >= total
+            ? "done"
+            : planned > 0 || run?.status === "processing"
+              ? "active"
+              : "pending",
+    },
+    {
+      label: "Review results",
+      detail: run?.status === "completed" ? "ready" : run?.status === "failed" ? "needs attention" : "waiting",
+      state:
+        run?.status === "completed"
+          ? "done"
+          : run?.status === "failed"
+            ? "failed"
+            : "pending",
+    },
+  ];
+
+  return (
+    <div className="mt-4 rounded-md border border-border bg-muted/10 p-3" aria-live="polite">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+            Thumbnail pipeline
+          </div>
+        </div>
+        {runId && (
+          <Link
+            href={`/image-studio?runId=${encodeURIComponent(runId)}`}
+            className={cn(
+              "inline-flex h-8 items-center gap-2 rounded-md border border-border px-3 text-xs font-medium",
+              "text-primary transition-colors hover:bg-muted"
+            )}
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            Open Image Studio
+          </Link>
+        )}
+      </div>
+
+      <div className="mt-3 grid gap-2 sm:grid-cols-4">
+        {stages.map((stage) => (
+          <div
+            key={stage.label}
+            className={cn(
+              "rounded-md border bg-background px-2.5 py-2",
+              stage.state === "done" && "border-border",
+              stage.state === "active" && "border-border shadow-[inset_0_0_0_1px_hsl(var(--foreground)/0.04)]",
+              stage.state === "failed" && "border-destructive/35",
+              stage.state === "pending" && "border-border bg-background/40"
+            )}
+          >
+            <div className="flex items-center gap-2">
+              {stage.state === "done" ? (
+                <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+              ) : stage.state === "failed" ? (
+                <XCircle className="h-3.5 w-3.5 text-destructive" />
+              ) : stage.state === "active" ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+              ) : (
+                <span className="h-3.5 w-3.5 rounded-full border border-muted-foreground/40" />
+              )}
+              <span className="text-xs font-medium text-foreground">{stage.label}</span>
+            </div>
+            <div className="mt-1 pl-5 text-[11px] text-muted-foreground">{stage.detail}</div>
+          </div>
+        ))}
+      </div>
+
+      {sources.length > 0 && (
+        <div className="mt-3">
+          <div className="mb-2 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+            Original thumbnails
+          </div>
+          <div className="grid gap-2 sm:grid-cols-4">
+            {sources.map((source) => (
+              <div key={source.id || source.thumbnailUrl} className="min-w-0">
+                <YouTubeThumbnail
+                  videoId={source.videoId ?? ""}
+                  src={source.thumbnailUrl}
+                  alt={source.title}
+                  className="aspect-video rounded border border-border object-cover"
+                />
+                <div className="mt-1 truncate text-[11px] text-muted-foreground">
+                  {source.channelName ?? source.channelHandle ?? "Source channel"}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {planned > 0 && (
+        <div className="mt-3 space-y-1.5">
+          <div className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+            Prompt queue
+          </div>
+          {run?.candidates
+            .slice()
+            .sort((left, right) => left.rank - right.rank)
+            .map((candidate) => (
+              <div
+                key={candidate.id}
+                className="rounded border border-border bg-background/40 px-2 py-1.5 text-[11px]"
+              >
+                <span className="font-medium text-foreground">Option {candidate.rank}: </span>
+                <span className="text-muted-foreground">
+                  {candidate.prompt ?? "waiting for prompt"}
+                </span>
+              </div>
+            ))}
+        </div>
+      )}
+
+      {(error || run?.error) && (
+        <details className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+          <summary className="cursor-pointer font-medium">
+            {imageRunErrorSummary(error ?? run?.error)}
+          </summary>
+          <p className="mt-2 text-[11px] leading-relaxed text-destructive/85">
+            {error ?? run?.error}
+          </p>
+        </details>
+      )}
+    </div>
   );
 }
 
@@ -1043,6 +1367,16 @@ function channelLabel(source: SourceVideo): string | null {
   return parts.length ? parts.join(" · ") : null;
 }
 
+function imageRunErrorSummary(message: string | null | undefined): string {
+  if (!message) return "Thumbnail generation failed";
+  if (/429|too many requests|rate limit/i.test(message)) return "Image provider rate-limited the run";
+  if (/internal generation pipeline|restricted|misclassified/i.test(message)) {
+    return "Image provider rejected one option";
+  }
+  if (/image provider/i.test(message)) return "Image provider failed";
+  return "Thumbnail generation failed";
+}
+
 function sourceMetaParts(source: SourceVideo): string[] {
   const parts: string[] = [];
   const channel = channelLabel(source);
@@ -1083,8 +1417,10 @@ function youtubeSourcesForIdea(
     seen.add(source.video_id);
     sources.push({ label, source });
   };
-  add(attr.method === "title_tweak" ? "Inspiration" : "Topic source", attr.topic_source);
-  add("Format source", attr.format_source);
+  if (attr.method !== "reddit_angle") {
+    add(attr.method === "title_tweak" ? "Inspiration" : "YouTube topic source", attr.topic_source);
+  }
+  add("YouTube format source", attr.format_source);
   return sources;
 }
 
@@ -1233,7 +1569,7 @@ function RedditInspiration({ source }: { source: IdeaSourceLink }) {
   return (
     <div className="rounded-md border border-border bg-muted/15 px-3 py-2">
       <div className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-        Reddit signal
+        Reddit topic signal
       </div>
       <a
         href={source.url}
