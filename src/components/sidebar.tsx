@@ -9,6 +9,7 @@ import {
   Search,
   Users,
   Sparkles,
+  Image,
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
@@ -140,7 +141,10 @@ export function Sidebar() {
   const sections: NavSection[] = [
     {
       label: "CREATE",
-      items: [{ href: "/ideate", label: "Ideate", icon: Sparkles }],
+      items: [
+        { href: "/ideate", label: "Ideate", icon: Sparkles },
+        { href: "/image-studio", label: "Image Studio", icon: Image },
+      ],
     },
     {
       label: "CHANNEL",
@@ -173,6 +177,7 @@ export function Sidebar() {
     : effectiveCollapsed
       ? "w-16"
       : "w-60";
+  const overlayClosed = effectiveOverlayMode && !overlayOpen;
   const layoutClass = effectiveOverlayMode
     ? "fixed inset-y-0 left-0 z-50"
     : "shrink-0";
@@ -186,10 +191,10 @@ export function Sidebar() {
     <>
       {effectiveOverlayMode && overlayOpen && (
         <button
-          aria-label="Close sidebar"
+          aria-label="Dismiss sidebar"
           type="button"
           onClick={() => setOverlayOpen(false)}
-          className="fixed inset-0 z-40 bg-black/50"
+          className="fixed inset-y-0 left-60 right-0 z-40 bg-black/50"
         />
       )}
       <aside
@@ -198,8 +203,11 @@ export function Sidebar() {
           "transition-[width,transform] duration-200 ease-in-out",
           layoutClass,
           widthClass,
-          transformClass
+          transformClass,
+          overlayClosed && "pointer-events-none"
         )}
+        aria-hidden={overlayClosed}
+        inert={overlayClosed ? true : undefined}
       >
         {/* Header — single row in both states. ChatGPT pattern: in
             collapsed mode the toggle button IS the topmost element (no

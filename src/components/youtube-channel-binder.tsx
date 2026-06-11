@@ -205,7 +205,6 @@ export function YouTubeChannelBinder({ hasKey }: { hasKey: boolean }) {
         <Link2 className="h-4 w-4 text-muted-foreground" />
         {t.youtube.bindTitle}
       </div>
-      <p className="text-xs text-muted-foreground">{t.youtube.bindDesc}</p>
 
       {/* List of currently bound channels — multi-channel mode. Each row
           shows status (Active / inactive), basic stats, and Switch /
@@ -402,6 +401,7 @@ export function YouTubeChannelBinder({ hasKey }: { hasKey: boolean }) {
           <Button
             onClick={() => runSync()}
             disabled={busy || !hasKey || !input.trim()}
+            variant={input.trim() && hasKey ? "default" : "outline"}
             className="gap-2"
           >
             {busy ? (
@@ -417,11 +417,6 @@ export function YouTubeChannelBinder({ hasKey }: { hasKey: boolean }) {
             {t.youtube.needKey}
           </p>
         )}
-        <p className="text-[11px] text-muted-foreground">
-          After Sync the channel becomes active automatically. Existing
-          channels stay connected — switch between them via this list or
-          the topbar dropdown.
-        </p>
       </div>
 
       {channel && busy && (

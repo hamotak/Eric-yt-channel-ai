@@ -4,9 +4,8 @@ import { claudeUsageStats, clearClaudeUsage } from "@/lib/db";
 export const runtime = "nodejs";
 
 /**
- * Claude-spend history for the Integrations page widget. Returns recent
- * turns + aggregate totals so the UI can render a bar + an expandable
- * per-turn list.
+ * AI-spend history for the Integrations page widget. This route stays as a
+ * compatibility alias for older clients.
  */
 export async function GET(req: Request) {
   const url = new URL(req.url);
@@ -22,6 +21,7 @@ export async function GET(req: Request) {
     recent: stats.recent.map((r) => ({
       id: r.id,
       ts: r.ts,
+      provider: r.provider,
       sessionId: r.session_id,
       executorModel: r.executor_model,
       advisorModel: r.advisor_model,

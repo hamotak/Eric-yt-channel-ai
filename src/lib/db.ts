@@ -28,7 +28,7 @@ const PROJECT_ROOT = findProjectRoot(__dirname);
 // for tests / advanced setups). Otherwise we always use
 // `<project-root>/data` so it's the same folder no matter where the
 // user happens to launch `npm run dev` from.
-const DATA_DIR = process.env.DATA_DIR
+export const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : path.join(PROJECT_ROOT, "data");
 const DB_PATH = path.join(DATA_DIR, "app.db");
@@ -361,6 +361,12 @@ export type Channel = {
   // One subreddit per line. Used by Brave-backed Reddit web signals;
   // user-curated so the model only studies communities HAmo trusts.
   reddit_sources?: string | null;
+  // Per-channel packaging/style goals for Image Studio. Kept separate
+  // from ideation_rules so visual generation can learn a visual system
+  // without polluting title/idea generation.
+  thumbnail_style_goals?: string | null;
+  // Human-authored visual design notes for Image Studio.
+  thumbnail_design_rules?: string | null;
 };
 
 /**
@@ -430,6 +436,8 @@ export type ChannelContextField =
   // or description contains a token from this list.
   | "banned_topics"
   | "reddit_sources"
+  | "thumbnail_style_goals"
+  | "thumbnail_design_rules"
   // Legacy — kept writable so old migrations + the chat tool's
   // backwards-compatible path keep working. UI no longer surfaces these.
   | "niche"
@@ -443,6 +451,8 @@ const CHANNEL_CONTEXT_FIELDS: readonly ChannelContextField[] = [
   "ideation_rules",
   "banned_topics",
   "reddit_sources",
+  "thumbnail_style_goals",
+  "thumbnail_design_rules",
   "niche",
   "positioning",
   "audience",
@@ -1360,20 +1370,21 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_logs_source ON app_logs(source);
 `);
 
-/* ---------- Claude usage ledger ---------- */
+/* ---------- AI usage ledger ---------- */
 // Declared at module scope for the same reason as app_logs — survives hot
 // reloads and ensures a newly-added integration always has its tables.
 
 db.exec(`
-  -- Per-turn Claude spend ledger. One row = one chat turn (user message →
-  -- final assistant response). Tracks tokens separately for executor and
-  -- advisor so we can see where the money actually goes. Cost in
+  -- Per-turn AI spend ledger. One row = one model call or chat turn.
+  -- Tracks tokens separately for executor and advisor so we can see where
+  -- the money actually goes. Cost in
   -- millicents (1/1000 of a cent) for precision — at Sonnet rates a tiny
   -- 500-token turn rounds down to 0 cents otherwise.
   CREATE TABLE IF NOT EXISTS claude_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT,
     ts INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    provider TEXT NOT NULL DEFAULT 'anthropic',
     executor_model TEXT NOT NULL,
     advisor_model TEXT,
     input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1408,6 +1419,18 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_view_snapshots_video_ts ON video_view_snapshots(video_id, ts DESC);
 `);
+
+try {
+  const usageCols = db
+    .prepare(`PRAGMA table_info(claude_usage)`)
+    .all() as { name: string }[];
+  if (usageCols.length && !usageCols.some((c) => c.name === "provider")) {
+    db.exec(`ALTER TABLE claude_usage ADD COLUMN provider TEXT NOT NULL DEFAULT 'anthropic'`);
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_claude_usage_provider ON claude_usage(provider, ts DESC)`);
+} catch {
+  /* noop */
+}
 
 // Backfill the snapshot table on existing installs — they pre-date the
 // likes/comments columns, so SQLite would 500 on the new INSERT shape.
@@ -2403,6 +2426,7 @@ export type ClaudeUsageRow = {
   id: number;
   session_id: string | null;
   ts: number;
+  provider: string;
   executor_model: string;
   advisor_model: string | null;
   input_tokens: number;
@@ -2419,8 +2443,21 @@ export type ClaudeUsageRow = {
   active_tools: string | null;
 };
 
+export type AiUsageRow = ClaudeUsageRow;
+
+export type ImagePlannerStyleProfileRow = {
+  user_channel_id: string;
+  provider: string;
+  model: string;
+  generated_at: string;
+  source_window_days: number;
+  source_video_ids_json: string;
+  profile_json: string;
+};
+
 export function recordClaudeUsage(entry: {
   sessionId: string | null;
+  provider?: string;
   executorModel: string;
   advisorModel: string | null;
   inputTokens: number;
@@ -2438,14 +2475,15 @@ export function recordClaudeUsage(entry: {
 }): void {
   db.prepare(
     `INSERT INTO claude_usage (
-      session_id, executor_model, advisor_model,
+      session_id, provider, executor_model, advisor_model,
       input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
       advisor_input_tokens, advisor_output_tokens, advisor_calls,
       cost_millicents, duration_ms, iterations,
       first_user_msg, active_tools
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     entry.sessionId,
+    entry.provider ?? "anthropic",
     entry.executorModel,
     entry.advisorModel,
     entry.inputTokens,
@@ -2463,14 +2501,18 @@ export function recordClaudeUsage(entry: {
   );
 }
 
-export function claudeUsageStats(opts: { limit?: number } = {}): {
+export function recordAiUsage(entry: Parameters<typeof recordClaudeUsage>[0]): void {
+  recordClaudeUsage(entry);
+}
+
+export function aiUsageStats(opts: { limit?: number } = {}): {
   totalCostMillicents: number;
   totalInputTokens: number;
   totalOutputTokens: number;
   totalCacheReadTokens: number;
   turns: number;
   last24hCostMillicents: number;
-  recent: ClaudeUsageRow[];
+  recent: AiUsageRow[];
 } {
   const limit = Math.max(1, Math.min(200, opts.limit ?? 50));
   const agg = db
@@ -2506,6 +2548,53 @@ export function claudeUsageStats(opts: { limit?: number } = {}): {
     last24hCostMillicents: last24h.total,
     recent,
   };
+}
+
+export function claudeUsageStats(opts: { limit?: number } = {}) {
+  return aiUsageStats(opts);
+}
+
+export function getImagePlannerStyleProfile(
+  userChannelId: string
+): ImagePlannerStyleProfileRow | null {
+  return (
+    (db
+      .prepare(
+        `SELECT * FROM image_planner_style_profiles
+         WHERE user_channel_id = ?`
+      )
+      .get(userChannelId) as ImagePlannerStyleProfileRow | undefined) ?? null
+  );
+}
+
+export function upsertImagePlannerStyleProfile(input: {
+  userChannelId: string;
+  provider: string;
+  model: string;
+  sourceWindowDays: number;
+  sourceVideoIds: string[];
+  profile: unknown;
+}): void {
+  db.prepare(
+    `INSERT INTO image_planner_style_profiles (
+       user_channel_id, provider, model, generated_at, source_window_days,
+       source_video_ids_json, profile_json
+     ) VALUES (?, ?, ?, datetime('now'), ?, ?, ?)
+     ON CONFLICT(user_channel_id) DO UPDATE SET
+       provider = excluded.provider,
+       model = excluded.model,
+       generated_at = excluded.generated_at,
+       source_window_days = excluded.source_window_days,
+       source_video_ids_json = excluded.source_video_ids_json,
+       profile_json = excluded.profile_json`
+  ).run(
+    input.userChannelId,
+    input.provider,
+    input.model,
+    input.sourceWindowDays,
+    JSON.stringify(input.sourceVideoIds),
+    JSON.stringify(input.profile)
+  );
 }
 
 export function clearClaudeUsage(): number {
@@ -2560,7 +2649,9 @@ db.exec(`
     last_sync_at INTEGER,
     user_channel_id TEXT,                   -- one of the user's channels.id
     tier TEXT NOT NULL DEFAULT 'authority', -- authority|breakthrough|adjacent|far
-    tier_set_at INTEGER
+    tier_set_at INTEGER,
+    thumbnail_policy TEXT NOT NULL DEFAULT 'allow',
+    thumbnail_policy_note TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_competitors_channel ON competitors(channel_id);
 
@@ -2648,7 +2739,9 @@ db.exec(`
               last_sync_at INTEGER,
               user_channel_id TEXT,
               tier TEXT NOT NULL DEFAULT 'authority',
-              tier_set_at INTEGER
+              tier_set_at INTEGER,
+              thumbnail_policy TEXT NOT NULL DEFAULT 'allow',
+              thumbnail_policy_note TEXT
             )
           `);
           db.exec(`
@@ -2772,6 +2865,8 @@ export type Competitor = {
   sync_error: string | null;
   similarity_score: number | null;
   note: string | null;
+  thumbnail_policy: "allow" | "cms_exclude";
+  thumbnail_policy_note: string | null;
 };
 
 export const COMPETITOR_TIERS = ["authority", "breakthrough", "adjacent", "far"] as const;
@@ -2994,6 +3089,26 @@ export function setCompetitorNote(id: number, note: string | null): void {
   const trimmed = note?.trim() ?? null;
   db.prepare(`UPDATE competitors SET note = ? WHERE id = ?`).run(
     trimmed && trimmed.length > 0 ? trimmed : null,
+    id
+  );
+}
+
+export function setCompetitorThumbnailPolicy(
+  id: number,
+  input: {
+    thumbnail_policy: "allow" | "cms_exclude";
+    thumbnail_policy_note?: string | null;
+  }
+): void {
+  const note = input.thumbnail_policy_note?.trim() ?? null;
+  db.prepare(
+    `UPDATE competitors
+     SET thumbnail_policy = ?,
+         thumbnail_policy_note = ?
+     WHERE id = ?`
+  ).run(
+    input.thumbnail_policy,
+    note && note.length > 0 ? note : null,
     id
   );
 }
@@ -3631,6 +3746,12 @@ try {
   if (!cols.some((c) => c.name === "reddit_sources")) {
     db.exec(`ALTER TABLE channels ADD COLUMN reddit_sources TEXT`);
   }
+  if (!cols.some((c) => c.name === "thumbnail_style_goals")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN thumbnail_style_goals TEXT`);
+  }
+  if (!cols.some((c) => c.name === "thumbnail_design_rules")) {
+    db.exec(`ALTER TABLE channels ADD COLUMN thumbnail_design_rules TEXT`);
+  }
 } catch {
   /* noop */
 }
@@ -3643,6 +3764,12 @@ try {
     .all() as { name: string }[];
   if (!cols.some((c) => c.name === "note")) {
     db.exec(`ALTER TABLE competitors ADD COLUMN note TEXT`);
+  }
+  if (!cols.some((c) => c.name === "thumbnail_policy")) {
+    db.exec(`ALTER TABLE competitors ADD COLUMN thumbnail_policy TEXT NOT NULL DEFAULT 'allow'`);
+  }
+  if (!cols.some((c) => c.name === "thumbnail_policy_note")) {
+    db.exec(`ALTER TABLE competitors ADD COLUMN thumbnail_policy_note TEXT`);
   }
 } catch {
   /* noop */
@@ -3793,6 +3920,211 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_generation_research_generation
     ON generation_research_items(generation_id);
 `);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS thumbnail_runs (
+    id TEXT PRIMARY KEY,
+    user_channel_id TEXT NOT NULL,
+    source_idea_id TEXT,
+    input_title TEXT NOT NULL,
+    channel_url TEXT,
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+    selected_references_json TEXT NOT NULL DEFAULT '[]',
+    channel_snapshot_json TEXT,
+    style_goals TEXT,
+    learned_rules_json TEXT,
+    error TEXT,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_idea_id) REFERENCES ideas(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_thumbnail_runs_channel_started
+    ON thumbnail_runs(user_channel_id, started_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_thumbnail_runs_status
+    ON thumbnail_runs(status, started_at DESC);
+
+  CREATE TABLE IF NOT EXISTS thumbnail_candidates (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    rank INTEGER NOT NULL CHECK (rank >= 1 AND rank <= 3),
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+    job_id TEXT,
+    model TEXT,
+    image_path TEXT,
+    source_thumbnails_json TEXT NOT NULL DEFAULT '[]',
+    prompt TEXT,
+    rationale TEXT,
+    feedback TEXT CHECK (feedback IS NULL OR feedback IN ('accepted','rejected')),
+    feedback_reason TEXT,
+    feedback_at TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (run_id) REFERENCES thumbnail_runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, rank)
+  );
+  CREATE INDEX IF NOT EXISTS idx_thumbnail_candidates_run
+    ON thumbnail_candidates(run_id, rank);
+  CREATE INDEX IF NOT EXISTS idx_thumbnail_candidates_job
+    ON thumbnail_candidates(job_id);
+
+  CREATE TABLE IF NOT EXISTS thumbnail_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    rule_type TEXT NOT NULL CHECK (rule_type IN ('accepted_pattern','rejected_pattern')),
+    rule_value TEXT NOT NULL,
+    source_candidate_id TEXT,
+    source_feedback TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_candidate_id) REFERENCES thumbnail_candidates(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_thumbnail_rules_channel
+    ON thumbnail_rules(user_channel_id, created_at DESC);
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS image_runs (
+    id TEXT PRIMARY KEY,
+    user_channel_id TEXT NOT NULL,
+    source_idea_id TEXT,
+    mode TEXT NOT NULL CHECK (mode IN ('prompt','assist','ideate')) DEFAULT 'prompt',
+    generation_mode TEXT NOT NULL CHECK (generation_mode IN ('generate','remix')) DEFAULT 'generate',
+    input_prompt TEXT NOT NULL,
+    title TEXT,
+    sample_count INTEGER NOT NULL CHECK (sample_count >= 1 AND sample_count <= 4) DEFAULT 1,
+    aspect_ratio TEXT NOT NULL DEFAULT '16:9',
+    resolution TEXT NOT NULL DEFAULT '2k',
+    ai_assist INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+    phase TEXT NOT NULL CHECK (phase IN ('planning','rendering','reviewing','completed','failed')) DEFAULT 'planning',
+    error_category TEXT CHECK (error_category IS NULL OR error_category IN ('planner_timeout','planner_failed','provider_capacity','provider_rejected','provider_timeout','download_failed','provider_failed','unknown')),
+    selected_references_json TEXT NOT NULL DEFAULT '[]',
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    channel_snapshot_json TEXT,
+    learned_rules_json TEXT NOT NULL DEFAULT '[]',
+    error TEXT,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_idea_id) REFERENCES ideas(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_image_runs_channel_started
+    ON image_runs(user_channel_id, started_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_image_runs_status
+    ON image_runs(status, started_at DESC);
+
+  CREATE TABLE IF NOT EXISTS image_candidates (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    rank INTEGER NOT NULL CHECK (rank >= 1 AND rank <= 4),
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')) DEFAULT 'processing',
+    job_id TEXT,
+    model TEXT,
+    resolution TEXT,
+    image_path TEXT,
+    source_images_json TEXT NOT NULL DEFAULT '[]',
+    provider_attempts_json TEXT NOT NULL DEFAULT '[]',
+    prompt TEXT,
+    rationale TEXT,
+    changes TEXT,
+    critique TEXT,
+    feedback TEXT CHECK (feedback IS NULL OR feedback IN ('accepted','rejected')),
+    feedback_reason TEXT,
+    feedback_at TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (run_id) REFERENCES image_runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, rank)
+  );
+  CREATE INDEX IF NOT EXISTS idx_image_candidates_run
+    ON image_candidates(run_id, rank);
+  CREATE INDEX IF NOT EXISTS idx_image_candidates_job
+    ON image_candidates(job_id);
+
+  CREATE TABLE IF NOT EXISTS image_feedback_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    rule_type TEXT NOT NULL CHECK (rule_type IN ('accepted_pattern','rejected_pattern')),
+    rule_value TEXT NOT NULL,
+    source_candidate_id TEXT,
+    source_feedback TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_candidate_id) REFERENCES image_candidates(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_image_feedback_rules_channel
+    ON image_feedback_rules(user_channel_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS image_planner_style_profiles (
+    user_channel_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    source_window_days INTEGER NOT NULL DEFAULT 30,
+    source_video_ids_json TEXT NOT NULL DEFAULT '[]',
+    profile_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS image_source_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_channel_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_video_id TEXT,
+    source_url TEXT NOT NULL,
+    source_title TEXT,
+    source_channel_name TEXT,
+    source_channel_handle TEXT,
+    feedback TEXT NOT NULL CHECK (feedback IN ('liked','disliked')),
+    reason TEXT,
+    topic_key TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+    UNIQUE(user_channel_id, source_url)
+  );
+  CREATE INDEX IF NOT EXISTS idx_image_source_feedback_channel
+    ON image_source_feedback(user_channel_id, updated_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_image_source_feedback_video
+    ON image_source_feedback(user_channel_id, source_video_id);
+`);
+
+try {
+  const imageRunCols = db
+    .prepare(`PRAGMA table_info(image_runs)`)
+    .all() as { name: string }[];
+  if (!imageRunCols.some((c) => c.name === "resolution")) {
+    db.exec(`ALTER TABLE image_runs ADD COLUMN resolution TEXT NOT NULL DEFAULT '2k'`);
+  }
+  if (!imageRunCols.some((c) => c.name === "phase")) {
+    db.exec(`ALTER TABLE image_runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'planning'`);
+    db.exec(`
+      UPDATE image_runs
+      SET phase = CASE
+        WHEN status = 'completed' THEN 'reviewing'
+        WHEN status = 'failed' THEN 'failed'
+        ELSE 'planning'
+      END
+    `);
+  }
+  if (!imageRunCols.some((c) => c.name === "error_category")) {
+    db.exec(`ALTER TABLE image_runs ADD COLUMN error_category TEXT`);
+  }
+  const imageCandidateCols = db
+    .prepare(`PRAGMA table_info(image_candidates)`)
+    .all() as { name: string }[];
+  if (!imageCandidateCols.some((c) => c.name === "resolution")) {
+    db.exec(`ALTER TABLE image_candidates ADD COLUMN resolution TEXT`);
+  }
+  if (!imageCandidateCols.some((c) => c.name === "provider_attempts_json")) {
+    db.exec(`ALTER TABLE image_candidates ADD COLUMN provider_attempts_json TEXT NOT NULL DEFAULT '[]'`);
+  }
+} catch {
+  /* noop */
+}
 
 try {
   const row = db

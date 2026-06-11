@@ -7,6 +7,56 @@
  */
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const repoRoot = path.resolve(__dirname, "..");
+const ideatePipelinePath = path.join(repoRoot, "src/lib/ideate/pipeline.ts");
+const ideatePagePath = path.join(repoRoot, "src/app/ideate/page.tsx");
+
+function assertIdeateModelWiring() {
+  const source = fs.readFileSync(ideatePipelinePath, "utf8");
+  assert.match(source, /export const IDEATION_MODEL_COMPOSE = "claude-sonnet-4-6"/);
+  assert.match(source, /export const IDEATION_MODEL_VALIDATE = "claude-sonnet-4-6"/);
+  assert.match(source, /export const IDEATION_MODEL_DISTILL = "claude-sonnet-4-6"/);
+}
+
+assertIdeateModelWiring();
+
+function assertIdeateCreateThumbnailsButtonWiring() {
+  const source = fs.readFileSync(ideatePagePath, "utf8");
+  assert.match(source, /Create thumbnails/);
+  assert.match(source, /Create thumbnails\?/);
+  assert.match(source, /setCreateConfirmOpen\(true\)/);
+  assert.match(source, /setCreateConfirmOpen\(false\)/);
+  assert.match(source, /aria-label="Yes, create thumbnails"/);
+  assert.match(source, /aria-label="No, cancel thumbnail creation"/);
+  assert.doesNotMatch(source, /Remix Thumbnail/);
+  assert.match(source, /sampleCount:\s*4/);
+  assert.match(source, /generationMode:\s*"remix"/);
+  assert.match(source, /resolution:\s*"1k"/);
+  assert.match(source, /Thumbnail pipeline/);
+  assert.match(source, /Sources found/);
+  assert.match(source, /Prompts planned/);
+  assert.match(source, /Rendering 4 edits/);
+  assert.match(source, /Open Image Studio/);
+  assert.match(source, /setImageRunId\(d\.request_id\)/);
+  assert.match(source, /\/api\/image-runs\/\$\{encodeURIComponent\(id\)\}/);
+  assert.doesNotMatch(source, /sampleMenuOpen/);
+  assert.doesNotMatch(source, /setSampleMenuOpen/);
+  assert.doesNotMatch(source, /Remix \{samples\}/);
+  assert.doesNotMatch(
+    source,
+    /window\.location\.href = `\/image-studio\?runId=\$\{encodeURIComponent\(d\.request_id\)\}`/
+  );
+}
+
+assertIdeateCreateThumbnailsButtonWiring();
+
+const REDDIT_RECENCY_DAYS = 30;
+const REDDIT_VIRAL_SCORE_MIN = 500;
+const REDDIT_VIRAL_COMMENTS_MIN = 100;
+const REDDIT_FALLBACK_BRAVE_RANK_LIMIT = 3;
 
 function allocateIdeaBuckets(mode, count, options = {}) {
   const clamped = Math.max(1, Math.floor(count));
@@ -80,7 +130,61 @@ function parseRedditPermalink(value, expectedSubreddit) {
   };
 }
 
-function normalizeBraveRedditResult(result, expectedSubreddit) {
+function createdUtcFromAge(age, nowMs = Date.now()) {
+  if (!age) return null;
+  const value = age.trim().toLowerCase();
+  const relative = value.match(
+    /^(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$/
+  );
+  if (relative) {
+    const amount = Number(relative[1]);
+    const unit = relative[2];
+    const seconds =
+      unit === "second"
+        ? amount
+        : unit === "minute"
+          ? amount * 60
+          : unit === "hour"
+            ? amount * 3600
+            : unit === "day"
+              ? amount * 86400
+              : unit === "week"
+                ? amount * 7 * 86400
+                : unit === "month"
+                  ? amount * 30 * 86400
+                  : amount * 365 * 86400;
+    return Math.floor(nowMs / 1000 - seconds);
+  }
+  if (value === "yesterday") return Math.floor(nowMs / 1000 - 86400);
+  const parsed = Date.parse(age);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.floor(parsed / 1000);
+}
+
+function redditSignalAgeDays(createdUtc, nowSec = Math.floor(Date.now() / 1000)) {
+  if (!createdUtc || createdUtc <= 0) return null;
+  return Math.max(0, Math.floor((nowSec - createdUtc) / 86400));
+}
+
+function hasViralRedditMetrics(signal) {
+  return (
+    signal.score >= REDDIT_VIRAL_SCORE_MIN ||
+    signal.comments >= REDDIT_VIRAL_COMMENTS_MIN
+  );
+}
+
+function isUsableRedditSignal(signal, nowSec = Math.floor(Date.now() / 1000)) {
+  const ageDays = redditSignalAgeDays(signal.created_utc, nowSec);
+  if (ageDays === null || ageDays > REDDIT_RECENCY_DAYS) return false;
+  if (hasViralRedditMetrics(signal)) return true;
+  return (
+    signal.signal_strength === "fallback" &&
+    typeof signal.brave_rank === "number" &&
+    signal.brave_rank <= REDDIT_FALLBACK_BRAVE_RANK_LIMIT
+  );
+}
+
+function normalizeBraveRedditResult(result, expectedSubreddit, braveRank = 1) {
   const parsed = parseRedditPermalink(result.url, expectedSubreddit);
   if (!parsed) return null;
   return {
@@ -94,6 +198,11 @@ function normalizeBraveRedditResult(result, expectedSubreddit) {
       .join(" ")
       .replace(/\s+/g, " ")
       .trim(),
+    score: 0,
+    comments: 0,
+    created_utc: createdUtcFromAge(result.age ?? null),
+    signal_strength: "fallback",
+    brave_rank: braveRank,
   };
 }
 
@@ -219,9 +328,60 @@ function recentTopicSignalCount(sources) {
   }, 0);
 }
 
-function confidenceFromEvidence(fitScore, weakProof, idea) {
+function normalizeRedditPermalink(value) {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase().replace(/^www\./, "").replace(/^old\./, "");
+    if (host !== "reddit.com") return null;
+    return `reddit.com${url.pathname.replace(/\/+$/, "").toLowerCase()}`;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeYouTubeUrl(value) {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase().replace(/^www\./, "");
+    if (host !== "youtube.com" && host !== "youtu.be") return null;
+    return `${host}${url.pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+function acceptedRedditSignalForIdea(idea, redditResearch) {
+  const accepted = new Map();
+  for (const item of redditResearch) {
+    const key = normalizeRedditPermalink(item.permalink);
+    if (key) accepted.set(key, item);
+  }
+  if (accepted.size === 0) return null;
+  const links = [...(idea.proof?.sources ?? []), ...(idea.research_sources ?? [])]
+    .filter((source) => source.type === "reddit")
+    .map((source) => normalizeRedditPermalink(source.url))
+    .filter(Boolean);
+  for (const key of links) {
+    const item = accepted.get(key);
+    if (item) return item;
+  }
+  return null;
+}
+
+function hasYouTubeProofSource(idea) {
+  return [...(idea.proof?.sources ?? []), ...(idea.research_sources ?? [])].some(
+    (source) => source.type === "youtube" && normalizeYouTubeUrl(source.url) !== null
+  );
+}
+
+function confidenceFromEvidence(fitScore, weakProof, idea, redditResearch = []) {
   if (weakProof && weakProof.trim().length > 0) return "low";
   if (fitScore === null) return "medium";
+  if (idea.source_attribution.method === "reddit_angle") {
+    const redditSignal = acceptedRedditSignalForIdea(idea, redditResearch);
+    if (!redditSignal || redditSignal.signal_strength === "fallback") return "low";
+    return fitScore >= 7 ? "medium" : "low";
+  }
   const evidence = topicEvidenceSources(idea);
   const evidenceCount = evidence.length;
   const hasRecent = hasRecentTopicSignal(evidence);
@@ -246,7 +406,7 @@ function hardRuleCheckNewAngle(idea, gathered) {
   }
   const topic = idea.source_attribution.topic_source?.video_id ?? null;
   const format = idea.source_attribution.format_source?.video_id ?? null;
-  if (!topic || !format || topic === format) return "new_angle missing valid outlier source";
+  if (!topic || !format) return "new_angle missing valid outlier source";
   if (!outlierIds.has(topic) || !outlierIds.has(format)) return "new_angle missing valid outlier source";
   if ((multiplierById.get(topic) ?? 0) < 2 || (multiplierById.get(format) ?? 0) < 2) {
     return "new_angle missing valid outlier source";
@@ -257,6 +417,31 @@ function hardRuleCheckNewAngle(idea, gathered) {
   const primaryTopicAge = sourceAgeDays(idea.source_attribution.topic_source);
   if (primaryTopicAge === null) return "topic source is missing upload age/date metadata";
   if (primaryTopicAge > TOPIC_RECENCY_DAYS) return `topic source is older than ${TOPIC_RECENCY_DAYS} days`;
+  return null;
+}
+
+function hardRuleCheckRedditAngle(idea, gathered, redditResearch) {
+  const acceptedRedditSignal = acceptedRedditSignalForIdea(idea, redditResearch);
+  if (!acceptedRedditSignal) return "reddit_angle missing accepted Reddit topic signal";
+  if (idea.source_attribution.topic_source) return "reddit_angle must not use YouTube topic_source";
+  const format = idea.source_attribution.format_source;
+  if (!format) return "reddit_angle missing YouTube format source";
+  if (!hasYouTubeProofSource(idea)) return "reddit_angle missing YouTube proof source";
+
+  const sourceIds = new Set();
+  for (const comp of gathered.competitors) {
+    for (const video of comp.videos) {
+      if (video.is_outlier) sourceIds.add(video.video_id);
+    }
+  }
+  for (const own of gathered.own_recent_uploads ?? []) {
+    if (gathered.own_median_views > 0 && own.views >= 2 * gathered.own_median_views) {
+      sourceIds.add(own.video_id);
+    }
+  }
+  if (!sourceIds.has(format.video_id)) {
+    return "reddit_angle format source is not a YouTube outlier or own winner";
+  }
   return null;
 }
 
@@ -532,13 +717,17 @@ const braveHit = normalizeBraveRedditResult(
     title: "Creators are worried about retention",
     url: "https://www.reddit.com/r/NewTubers/comments/abc123/creators_are_worried/?utm_source=brave",
     description: "A thread about audience retention.",
+    age: "3 days ago",
     extra_snippets: ["Several creators compare hooks."],
   },
-  "NewTubers"
+  "NewTubers",
+  2
 );
 assert.equal(braveHit.provider, "brave_search");
 assert.equal(braveHit.subreddit, "NewTubers");
 assert.equal(braveHit.reddit_id, "abc123");
+assert.equal(braveHit.signal_strength, "fallback");
+assert.equal(braveHit.brave_rank, 2);
 assert.equal(
   braveHit.permalink,
   "https://www.reddit.com/r/NewTubers/comments/abc123/creators_are_worried"
@@ -553,6 +742,91 @@ assert.equal(
     "NewTubers"
   ),
   null
+);
+
+const fixedNowSec = Math.floor(Date.UTC(2026, 5, 10) / 1000);
+const threeDaysAgo = fixedNowSec - 3 * 86400;
+assert.equal(
+  redditSignalAgeDays(createdUtcFromAge("3 days ago", fixedNowSec * 1000), fixedNowSec),
+  3
+);
+assert.equal(
+  isUsableRedditSignal(
+    {
+      score: 750,
+      comments: 8,
+      created_utc: threeDaysAgo,
+      signal_strength: "metrics",
+      brave_rank: 8,
+    },
+    fixedNowSec
+  ),
+  true
+);
+assert.equal(
+  isUsableRedditSignal(
+    {
+      score: 12,
+      comments: 150,
+      created_utc: threeDaysAgo,
+      signal_strength: "metrics",
+      brave_rank: 8,
+    },
+    fixedNowSec
+  ),
+  true
+);
+assert.equal(
+  isUsableRedditSignal(
+    {
+      score: 12,
+      comments: 8,
+      created_utc: threeDaysAgo,
+      signal_strength: "metrics",
+      brave_rank: 1,
+    },
+    fixedNowSec
+  ),
+  false
+);
+assert.equal(
+  isUsableRedditSignal(
+    {
+      score: 0,
+      comments: 0,
+      created_utc: threeDaysAgo,
+      signal_strength: "fallback",
+      brave_rank: 3,
+    },
+    fixedNowSec
+  ),
+  true
+);
+assert.equal(
+  isUsableRedditSignal(
+    {
+      score: 0,
+      comments: 0,
+      created_utc: threeDaysAgo,
+      signal_strength: "fallback",
+      brave_rank: 4,
+    },
+    fixedNowSec
+  ),
+  false
+);
+assert.equal(
+  isUsableRedditSignal(
+    {
+      score: 900,
+      comments: 1,
+      created_utc: fixedNowSec - 31 * 86400,
+      signal_strength: "metrics",
+      brave_rank: 1,
+    },
+    fixedNowSec
+  ),
+  false
 );
 assert.equal(
   normalizeBraveRedditResult(
@@ -635,6 +909,59 @@ assert.equal(confidenceFromEvidence(9, null, ideaWithOneRecent), "medium");
 assert.equal(confidenceFromEvidence(9, null, ideaWithOldOnly), "low");
 assert.equal(confidenceFromEvidence(8, "topic proof is weak", ideaWithTwoSignals), "low");
 
+const acceptedRedditSignals = [
+  {
+    permalink: "https://www.reddit.com/r/space/comments/hot123/new_space_thread",
+    signal_strength: "metrics",
+  },
+  {
+    permalink: "https://www.reddit.com/r/space/comments/fallback456/recent_fallback",
+    signal_strength: "fallback",
+  },
+];
+const redditIdeaForConfidence = {
+  source_attribution: {
+    method: "reddit_angle",
+    topic_source: null,
+    format_source: { video_id: "format-old" },
+    topic_evidence_sources: [],
+  },
+  proof: {
+    sources: [
+      {
+        type: "reddit",
+        url: "https://old.reddit.com/r/space/comments/hot123/new_space_thread?utm_source=x",
+      },
+      { type: "youtube", url: "https://www.youtube.com/watch?v=format-old" },
+    ],
+  },
+  research_sources: [],
+};
+assert.equal(
+  confidenceFromEvidence(8, null, redditIdeaForConfidence, acceptedRedditSignals),
+  "medium"
+);
+assert.equal(
+  confidenceFromEvidence(
+    8,
+    null,
+    {
+      ...redditIdeaForConfidence,
+      proof: {
+        sources: [
+          {
+            type: "reddit",
+            url: "https://www.reddit.com/r/space/comments/fallback456/recent_fallback",
+          },
+          { type: "youtube", url: "https://www.youtube.com/watch?v=format-old" },
+        ],
+      },
+    },
+    acceptedRedditSignals
+  ),
+  "low"
+);
+
 const gatheredForNewAngles = {
   competitors: [
     {
@@ -655,6 +982,19 @@ const baseNewAngle = {
   },
 };
 assert.equal(hardRuleCheckNewAngle(baseNewAngle, gatheredForNewAngles), null);
+assert.equal(
+  hardRuleCheckNewAngle(
+    {
+      source_attribution: {
+        topic_source: { video_id: "topic-fresh", age_days: 12 },
+        format_source: { video_id: "topic-fresh", age_days: 12 },
+        topic_evidence_sources: [],
+      },
+    },
+    gatheredForNewAngles
+  ),
+  null
+);
 assert.match(
   hardRuleCheckNewAngle(
     {
@@ -680,6 +1020,74 @@ assert.match(
     gatheredForNewAngles
   ),
   /missing upload age/
+);
+
+const gatheredForReddit = {
+  competitors: [
+    {
+      videos: [
+        { video_id: "format-old", multiplier: 5.5, is_outlier: true },
+        { video_id: "non-outlier", multiplier: 1.2, is_outlier: false },
+      ],
+    },
+  ],
+  own_recent_uploads: [],
+  own_median_views: 0,
+};
+assert.equal(
+  hardRuleCheckRedditAngle(
+    redditIdeaForConfidence,
+    gatheredForReddit,
+    acceptedRedditSignals
+  ),
+  null
+);
+assert.equal(
+  hardRuleCheckRedditAngle(
+    {
+      ...redditIdeaForConfidence,
+      source_attribution: {
+        ...redditIdeaForConfidence.source_attribution,
+        topic_source: { video_id: "format-old" },
+      },
+    },
+    gatheredForReddit,
+    acceptedRedditSignals
+  ),
+  "reddit_angle must not use YouTube topic_source"
+);
+assert.equal(
+  hardRuleCheckRedditAngle(
+    {
+      ...redditIdeaForConfidence,
+      proof: {
+        sources: [
+          {
+            type: "reddit",
+            url: "https://www.reddit.com/r/space/comments/unknown/nope",
+          },
+          { type: "youtube", url: "https://www.youtube.com/watch?v=format-old" },
+        ],
+      },
+    },
+    gatheredForReddit,
+    acceptedRedditSignals
+  ),
+  "reddit_angle missing accepted Reddit topic signal"
+);
+assert.equal(
+  hardRuleCheckRedditAngle(
+    {
+      ...redditIdeaForConfidence,
+      source_attribution: {
+        ...redditIdeaForConfidence.source_attribution,
+        format_source: { video_id: "non-outlier" },
+      },
+    },
+    gatheredForReddit,
+    acceptedRedditSignals
+  ),
+  "reddit_angle format source is not a YouTube outlier or own winner"
 );
 assert.equal(
   validatedIdeaRank({

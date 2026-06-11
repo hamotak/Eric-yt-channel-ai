@@ -132,10 +132,10 @@ export default function LogsPage() {
   const sources = useMemo(() => stats?.sources ?? [], [stats]);
 
   return (
-    <div className="mx-auto max-w-6xl space-y-4 p-6">
+    <div className="space-y-4">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold">{t.logs.title}</h1>
+          <h2 className="text-xl font-semibold">{t.logs.title}</h2>
           <p className="mt-1 text-sm text-muted-foreground">{t.logs.subtitle}</p>
         </div>
         <div className="flex items-center gap-2">

@@ -1,49 +1,124 @@
 # Eric YT Channel AI
 
-A local AI-powered YouTube channel analytics platform: YouTube Studio-style dashboard (views, watch time, subscribers, audience, traffic, revenue), retention curves, video hook analyzer, AI chat with Claude over all your imported data, automatic transcript extraction, comment & competitor analysis.
+Eric YT Channel AI is a local browser app for running YouTube channel work in one place. It helps with channel notes, video ideation, competitor research, thumbnail planning, and AI-assisted thumbnail generation.
 
-> **This project runs locally on your computer.** All data lives in `data/app.db` next to this README. API keys are entered once on the **Integrations** page and stored in the local SQLite database — nothing is uploaded anywhere.
+The app runs on your computer at `http://localhost:3000`. It is not a hosted SaaS app.
 
-## Quick start
+## Plain-English Overview
 
-Full step-by-step setup for someone who has never worked with code is in **[INSTALL.md](./INSTALL.md)**. Short version:
+Use this app when you want to:
 
-1. Install Node.js 20+ from [nodejs.org](https://nodejs.org/)
-2. Download this repo — either as a ZIP from the green **Code** button above, or `git clone https://github.com/Bander4ik/Eric-yt-channel-ai.git`
-3. Run `install.bat` (Windows) or `install.command` (macOS) — installs dependencies
-4. Run `start.bat` (Windows) or `start.command` (macOS) — opens the app in your browser at `http://localhost:3000`
-5. Open **Integrations** and add your keys (minimum: Claude + Deepgram)
+- keep channel strategy, positioning, audience notes, and rules in one place;
+- generate and review video ideas for a selected channel;
+- compare competitor channels and outlier videos;
+- create thumbnail directions in Image Studio;
+- generate thumbnail options through 69labs;
+- track AI/API usage and app logs locally.
 
-## What it does
+All private data lives on this machine unless an integration API is called for a specific task.
 
-A web dashboard (opens in your browser at `localhost:3000`) that connects to:
+## Main App Areas
 
-- **Claude (Anthropic)** — AI analysis and chat about your channel (required)
-- **Deepgram** — local video transcription (≈$0.0043/min)
-- **YouTube Data API** — video details, stats, captions
-- **Google OAuth** — your own Analytics + monetization data
-- **Apify** (optional) — fallback path for transcription + competitor scraping
-- **Exa** (optional) — semantic web search for niche research
-- **Google Gemini** (optional) — second AI brain for chat
+- **Ideate**: creates video ideas for the active YouTube channel, using channel context, recent uploads, competitors, and learned feedback.
+- **Image Studio**: plans thumbnail directions, picks useful source thumbnails, and sends final image generation jobs to 69labs.
+- **Channel Info**: stores the channel brief, audience, positioning, voice, banned topics, Reddit sources, and thumbnail style notes.
+- **Competitors**: saves competitor channels, syncs their metadata, and helps compare useful outliers.
+- **Settings > Integrations**: where API keys are entered.
+- **Settings > Logs**: shows local app logs for debugging.
 
-## Where your data lives
+The top-right channel switcher controls which channel the app is currently working on.
 
-Everything is in the `data/` folder next to this README (a single `app.db` SQLite file). To reset, just delete that folder — it gets recreated on next launch.
+## Integrations
 
-API keys, OAuth tokens, chat history, transcripts, analytics cache — all there. Nothing ever leaves your machine.
+API keys are entered inside the running app at **Settings > Integrations**. They are stored in the local SQLite database, not in Git.
 
-## Tech stack
+Current integrations:
 
-- Next.js 16 (App Router) + React 19
-- TypeScript + Tailwind CSS v4
-- SQLite (`better-sqlite3`) in WAL mode with `synchronous=FULL` — data survives hard shutdowns
-- Anthropic SDK (Claude) + Google Generative AI (Gemini)
-- yt-dlp (via `youtube-dl-exec`) → Deepgram for transcription
+- **OpenAI**: default Image Studio thumbnail planner and visual analysis.
+- **Claude (Anthropic)**: fallback planner and existing AI workflows.
+- **YouTube Data API**: channel/video sync and metadata.
+- **Brave Search**: Reddit/web signals for ideation.
+- **69labs**: final image generation for thumbnails.
 
-## How to stop the app
+Do not paste browser session tokens. Use real provider API keys.
 
-Just close the terminal window the server is running in. The database closes cleanly on shutdown — nothing is lost.
+## Local Data And Secrets
 
-## How to update
+Local data is stored in:
 
-When the developer ships fixes or new features, follow **[UPDATE.md](./UPDATE.md)** — full step-by-step instructions, written for someone with no coding background. Covers both ZIP-based and GitHub Desktop-based installs, and explains how to switch to GitHub Desktop if you want one-click updates in the future.
+- `data/app.db` for SQLite app data;
+- `.env` for optional local environment overrides.
+
+These files are intentionally ignored by Git:
+
+- `.env`
+- `.env.local`
+- `.env.development`
+- `.env.production`
+- `data/`
+- `.next/`
+- `node_modules/`
+
+Never commit API keys, SQLite databases, generated build folders, or local screenshots with private information.
+
+Only `.env.example` should be committed as a safe template.
+
+## Quick Start
+
+1. Install Node.js 20 or newer from [nodejs.org](https://nodejs.org/).
+2. Clone the repo:
+
+   ```bash
+   git clone https://github.com/hamotak/Eric-yt-channel-ai.git
+   cd Eric-yt-channel-ai
+   ```
+
+3. Install dependencies:
+
+   ```bash
+   npm install
+   ```
+
+4. Start the app:
+
+   ```bash
+   npm run dev
+   ```
+
+5. Open `http://localhost:3000`.
+6. Go to **Settings > Integrations** and add the needed API keys.
+
+Mac users can also use `install.command` and `start.command`. Windows users can use `install.bat` and `start.bat`.
+
+## Developer Notes
+
+Important implementation details:
+
+- The app uses **Next.js 16 App Router**, **React 19**, **TypeScript**, and **Tailwind CSS**.
+- The local database uses **SQLite** through `better-sqlite3`.
+- Image Studio code lives mainly under `src/lib/image-studio/` and `src/app/image-studio/`.
+- Provider/API routes live under `src/app/api/`.
+- The app is designed for local operation; do not assume cloud hosting or shared storage.
+
+Before publishing changes, run:
+
+```bash
+node scripts/verify-image-studio-behavior.cjs
+node scripts/verify-ideate-behavior.cjs
+npx tsc --noEmit --pretty false
+npx next build
+```
+
+## Git Safety Checklist
+
+Before pushing to GitHub:
+
+1. Run `git status --short`.
+2. Confirm `.env` and `data/` are not staged.
+3. Confirm only `.env.example` appears if searching tracked env files.
+4. Run a quick secret scan for real API keys.
+5. Push only to the intended remote, usually `origin`.
+
+GitHub repo:
+
+https://github.com/hamotak/Eric-yt-channel-ai

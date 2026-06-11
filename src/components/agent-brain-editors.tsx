@@ -1,19 +1,5 @@
 "use client";
 
-/**
- * Shared editors for the agent's "brain" — the per-channel description
- * and ideation rules. Both render on:
- *   - /channel-info (the primary editing surface)
- *   - /chat → Brain panel (inline editing without leaving the chat)
- *
- * Both editors hit PATCH /api/channel-info { channelId, field, value }
- * where field ∈ "channelDescription" | "ideationRules". Saves trigger
- * an `onSaved` callback so the parent can show a toast.
- *
- * Memory was removed in the post-c63a3b9 cleanup — description +
- * ideation_rules cover every durable-agent-state case HAmo needs.
- */
-
 import { useCallback, useEffect, useState } from "react";
 import { Check, Pencil } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -23,6 +9,8 @@ const DESCRIPTION_CAP = 1500;
 const IDEATION_RULES_CAP = 1200;
 const BANNED_TOPICS_CAP = 500;
 const REDDIT_SOURCES_CAP = 800;
+const THUMBNAIL_STYLE_GOALS_CAP = 1200;
+const THUMBNAIL_DESIGN_RULES_CAP = 1200;
 
 // ---------------------------------------------------------------------
 // Channel description — one big textarea + live counter
@@ -116,8 +104,8 @@ export function DescriptionEditor({
       <textarea
         value={value}
         onChange={(e) => setValue(e.target.value)}
-        rows={variant === "full" ? 8 : 6}
-        placeholder="One paragraph the agent reads before every job. Cover what the channel is, who watches (age + region), what makes you different, voice + pacing. Plain words. Shorter is better."
+        rows={variant === "full" ? 6 : 5}
+        placeholder="Audience, promise, tone, what this channel never does."
         className={cn(
           "w-full rounded-md border border-input bg-background px-3 py-2 text-sm",
           "focus:outline-none focus:ring-2 focus:ring-ring",
@@ -155,6 +143,7 @@ export function DescriptionEditor({
           )}
           <Button
             size="sm"
+            variant={dirty && !overCap ? "default" : "outline"}
             onClick={save}
             disabled={!dirty || overCap || saving}
             className="gap-1.5"
@@ -333,6 +322,205 @@ export function RedditSourcesEditor({
         <div className="ml-auto">
           <Button
             size="sm"
+            variant={dirty && !overCap ? "default" : "outline"}
+            onClick={save}
+            disabled={!dirty || overCap || saving}
+            className="gap-1.5"
+          >
+            <Check className="h-3.5 w-3.5" />
+            {saving ? "Saving…" : "Save"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// Thumbnail style goals — visual packaging constraints for Image Studio
+// ---------------------------------------------------------------------
+
+export function ThumbnailStyleGoalsEditor({
+  channelId,
+  initialValue,
+  onSaved,
+}: {
+  channelId: string;
+  initialValue: string;
+  onSaved?: (value: string) => void;
+}) {
+  const [value, setValue] = useState(initialValue);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setValue(initialValue);
+    setError(null);
+  }, [channelId, initialValue]);
+
+  const dirty = value !== initialValue;
+  const overCap = value.length > THUMBNAIL_STYLE_GOALS_CAP;
+
+  const save = async () => {
+    if (overCap) {
+      setError(`Thumbnail style goals exceed ${THUMBNAIL_STYLE_GOALS_CAP} chars`);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/channel-info", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channelId,
+          field: "thumbnailStyleGoals",
+          value,
+        }),
+      });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        setError(d.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      onSaved?.(value);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      <textarea
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        rows={4}
+        placeholder="Colors, font style, text length, focal point, channel look."
+        className={cn(
+          "w-full rounded-md border border-input bg-background px-3 py-2 text-sm",
+          "focus:outline-none focus:ring-2 focus:ring-ring",
+          overCap && "border-destructive/60 focus:ring-destructive"
+        )}
+        disabled={saving}
+      />
+      <div className="flex items-center gap-2 text-[11px]">
+        <span
+          className={cn(
+            "text-muted-foreground",
+            overCap && "font-medium text-destructive"
+          )}
+        >
+          {value.length} / {THUMBNAIL_STYLE_GOALS_CAP}
+        </span>
+        {dirty && !overCap && (
+          <span className="text-amber-600 dark:text-amber-400">unsaved</span>
+        )}
+        {error && <span className="text-destructive">· {error}</span>}
+        <div className="ml-auto">
+          <Button
+            size="sm"
+            variant={dirty && !overCap ? "default" : "outline"}
+            onClick={save}
+            disabled={!dirty || overCap || saving}
+            className="gap-1.5"
+          >
+            <Check className="h-3.5 w-3.5" />
+            {saving ? "Saving…" : "Save"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// Thumbnail design rules — human-authored rules for Image Studio
+// ---------------------------------------------------------------------
+
+export function ThumbnailDesignRulesEditor({
+  channelId,
+  initialValue,
+  onSaved,
+}: {
+  channelId: string;
+  initialValue: string;
+  onSaved?: (value: string) => void;
+}) {
+  const [value, setValue] = useState(initialValue);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setValue(initialValue);
+    setError(null);
+  }, [channelId, initialValue]);
+
+  const dirty = value !== initialValue;
+  const overCap = value.length > THUMBNAIL_DESIGN_RULES_CAP;
+
+  const save = async () => {
+    if (overCap) {
+      setError(`Thumbnail design rules exceed ${THUMBNAIL_DESIGN_RULES_CAP} chars`);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/channel-info", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channelId,
+          field: "thumbnailDesignRules",
+          value,
+        }),
+      });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        setError(d.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      onSaved?.(value);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      <textarea
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        rows={4}
+        placeholder="Do / don't rules. One per line."
+        className={cn(
+          "w-full rounded-md border border-input bg-background px-3 py-2 text-sm",
+          "focus:outline-none focus:ring-2 focus:ring-ring",
+          overCap && "border-destructive/60 focus:ring-destructive"
+        )}
+        disabled={saving}
+      />
+      <div className="flex items-center gap-2 text-[11px]">
+        <span
+          className={cn(
+            "text-muted-foreground",
+            overCap && "font-medium text-destructive"
+          )}
+        >
+          {value.length} / {THUMBNAIL_DESIGN_RULES_CAP}
+        </span>
+        {dirty && !overCap && (
+          <span className="text-amber-600 dark:text-amber-400">unsaved</span>
+        )}
+        {error && <span className="text-destructive">· {error}</span>}
+        <div className="ml-auto">
+          <Button
+            size="sm"
+            variant={dirty && !overCap ? "default" : "outline"}
             onClick={save}
             disabled={!dirty || overCap || saving}
             className="gap-1.5"
@@ -407,7 +595,7 @@ export function IdeationRulesEditor({
         value={value}
         onChange={(e) => setValue(e.target.value)}
         rows={6}
-        placeholder="One rule per line. HARD-enforcement constraints the ideation agent must follow when composing titles. Voice constraints, banned shapes, format overrides — anything you never want bent."
+        placeholder="One rule per line."
         className={cn(
           "w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono",
           "focus:outline-none focus:ring-2 focus:ring-ring",
@@ -431,6 +619,7 @@ export function IdeationRulesEditor({
         <div className="ml-auto">
           <Button
             size="sm"
+            variant={dirty && !overCap ? "default" : "outline"}
             onClick={save}
             disabled={!dirty || overCap || saving}
             className="gap-1.5"

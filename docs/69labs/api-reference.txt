@@ -1,0 +1,672 @@
+External API docs
+Everything you need to generate audio, images, videos, and tool outputs with an API key. Use the endpoints below or read the developer guide to get started.
+
+Base URL
+https://69labs.vip
+Development: http://localhost:3200
+Auth header
+Authorization: Bearer vk_your_api_key
+API keys start with vk_.
+Quick start
+View endpoints
+Developer guide
+OpenAPI spec
+API Reference
+Developer Guide
+Quick start
+Create a job, poll for completion, then download the result. The same pattern applies to TTS, images, and videos.
+
+Text-to-Speech
+curl -X POST "https://69labs.vip/api/v1/tts/generate" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello from the API.",
+    "voiceId": "21m00Tcm4TlvDq8ikWAM",
+    "modelId": "eleven_multilingual_v2"
+  }'
+curl "https://69labs.vip/api/v1/tts/status/job_123" \
+  -H "Authorization: Bearer vk_your_api_key"
+curl -L "https://69labs.vip/api/v1/tts/download/job_123" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -o job_123.mp3
+Image Generation
+curl -X POST "https://69labs.vip/api/v1/images/generate" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "A futuristic city skyline at sunset"}'
+curl "https://69labs.vip/api/v1/images/status/cm7abc123def" \
+  -H "Authorization: Bearer vk_your_api_key"
+curl -L "https://69labs.vip/api/v1/images/download/cm7abc123def" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -o image.png
+Video Generation
+curl -X POST "https://69labs.vip/api/v1/videos/generate" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A drone shot over a tropical beach",
+    "model": "grok-imagine-video",
+    "aspectRatio": "16:9",
+    "duration": "10"
+  }'
+curl "https://69labs.vip/api/v1/videos/status/cm7xyz789ghi" \
+  -H "Authorization: Bearer vk_your_api_key"
+curl -L "https://69labs.vip/api/v1/videos/download/cm7xyz789ghi" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -o video.mp4
+Account and Discovery
+Discover available capabilities at runtime and, for pay-per-use keys, read summary ledger usage.
+
+GET
+/api/v1/models
+List accessible model groups, motion templates, pricing, limits, retention, and pay-per-use setup fields.
+
+curl "https://69labs.vip/api/v1/models" \
+  -H "Authorization: Bearer vk_your_api_key"
+GET
+/api/v1/usage
+Pay-per-use ledger summary for the authenticated API key owner.
+
+curl "https://69labs.vip/api/v1/usage?startDate=2026-05-01&endDate=2026-05-31" \
+  -H "Authorization: Bearer vk_your_api_key"
+Omit both dates for the current UTC month through today. Custom ranges are inclusive UTC dates and cannot span more than 366 days.
+Text-to-Speech
+Generate audio first, then request SRT subtitles from the completed TTS job and poll the SRT status before downloading the subtitle file.
+
+POST
+/api/v1/tts/generate
+Create a TTS job. Returns a jobId and queue position.
+
+Request body
+text
+Required. 1-500000 characters.
+voiceId
+Required. Voice ID for the selected voiceProvider; use the full catalog voice_id for catalog voices.
+voiceName
+Optional. Display name for the voice.
+voiceProvider
+Optional wire-level value: elevenlabs | edgetts | minimax. edgetts uses discounted finite-tier TTS credits. Default: elevenlabs.
+modelId
+Optional. Default: eleven_multilingual_v2. Catalog voice mode defaults to speech-02-hd and accepts speech-2.8-hd / speech-2.8-turbo. edgetts uses edge-tts.
+voiceSettings
+Optional. stability (0-1), similarityBoost (0-1), style (0-1), speed (0.7-1.2), useSpeakerBoost.
+minimaxSettings
+Optional for catalog voice mode. speed (0.01-10), pitch (-12 to 12), volume (0.5-2), languageBoost (default auto; ISO hints normalize server-side).
+Response
+{
+  "id": "job_123",
+  "status": "PENDING",
+  "queuePosition": 3
+}
+GET
+/api/v1/tts/status/:jobId
+Check job status, chunk progress, and censored retry details when applicable.
+
+Status values
+PENDING
+Queued and waiting for capacity.
+PROCESSING
+Actively being generated.
+FINALIZING
+Output is downloading to storage.
+COMPLETED
+Ready for download.
+FAILED
+Generation failed. Credits are refunded.
+CANCELLED
+Cancelled before processing.
+CENSORED
+TTS only. Rewrite blocked chunks and submit /tts/retry-censored.
+Response
+{
+  "id": "job_123",
+  "status": "CENSORED",
+  "createdAt": "2026-01-02T10:00:00.000Z",
+  "startedAt": "2026-01-02T10:01:00.000Z",
+  "completedAt": null,
+  "chunksTotal": 4,
+  "chunksCompleted": 2,
+  "blockedChunks": [
+    { "index": 2, "text": "The original flagged chunk text" }
+  ],
+  "retryExpiresAt": "2026-03-25T00:00:05.000Z"
+}
+POST
+/api/v1/tts/retry-censored/:jobId
+Submit corrected text for censored chunks and resume processing.
+
+Request body
+{
+  "correctedChunks": [
+    {
+      "index": 2,
+      "text": "Rewritten text that avoids the content moderation block"
+    }
+  ]
+}
+Response
+{
+  "message": "Retry submitted",
+  "jobId": "job_123"
+}
+Corrected text is capped at 5000 characters per chunk. Chunked jobs have a 6-hour retry window.
+GET
+/api/v1/tts/download/:jobId
+Download the audio output file.
+
+curl -L "https://69labs.vip/api/v1/tts/download/job_123" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -o job_123.mp3
+Files are retained until the account retention window expires. Expired outputs return 410 GONE.
+POST
+/api/v1/tts/generate-srt/:jobId
+Queue SRT subtitle generation for a completed TTS job.
+
+Request
+curl -X POST "https://69labs.vip/api/v1/tts/generate-srt/123e4567-e89b-12d3-a456-426614174000" \
+  -H "Authorization: Bearer vk_your_api_key"
+The TTS job must be COMPLETED and its audio file must still be available. Credit-based accounts need subtitle access on the active tier.
+Response
+{
+  "jobId": "123e4567-e89b-12d3-a456-426614174000",
+  "srtStatus": "PENDING",
+  "creditCost": 0
+}
+Credit-based SRT requests are free. Pay-per-use responses include billing metadata when SRT PPU is enabled.
+GET
+/api/v1/tts/srt-status/:jobId
+Check SRT generation progress and download availability.
+
+SRT status values
+null
+SRT has not been requested for this job.
+PENDING
+SRT generation is queued.
+PROCESSING
+Audio is being transcribed into subtitles.
+COMPLETED
+SRT file is ready to download.
+FAILED
+SRT generation failed. Credits or PPU reservations are released.
+Response
+{
+  "id": "123e4567-e89b-12d3-a456-426614174000",
+  "srtStatus": "COMPLETED",
+  "srtError": null,
+  "srtFileAvailable": true,
+  "creditCost": 150
+}
+If SRT has never been requested, srtStatus and creditCost are null.
+GET
+/api/v1/tts/download-srt/:jobId
+Download the generated SRT subtitle file.
+
+curl -L "https://69labs.vip/api/v1/tts/download-srt/123e4567-e89b-12d3-a456-426614174000" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -o subtitles.srt
+Returns 400 until SRT generation is completed. Expired or deleted SRT files return 410 GONE.
+Image Generation
+GET
+/api/v1/images/models
+List available image models with credit info and capabilities.
+
+Response
+{
+  "models": [
+    {
+      "id": "nano-banana-2",
+      "name": "Nano Banana 2",
+      "cost": 1,
+      "resolutionCosts": { "1k": 1, "2k": 2, "4k": 4 },
+      "aspectRatios": [{ "value": "16:9", "label": "16:9" }, ...],
+      "supportsImageInput": true
+    },
+    ...
+  ],
+  "defaultModelId": "nano-banana-2",
+  "credits": { "used": 3, "limit": 50, "remaining": 47, "resetsAt": "..." },
+  "monthlyUsage": { "used": 5, "limit": 100, "remaining": 95 }
+}
+POST
+/api/v1/images/generate
+Create an image generation job. Returns a jobId and queue position.
+
+Request body
+prompt
+Required. 1-15000 characters.
+model
+Optional. Defaults to nano-banana-2.
+aspectRatio
+Optional. Must be valid for the model.
+resolution
+Optional. Only for models that support it.
+imageUrls
+Optional. Reference image URLs for image-to-image.
+seed
+Optional. Integer for reproducible results.
+Response
+{
+  "id": "cm7abc123def",
+  "queuePosition": 2
+}
+GET
+/api/v1/images/status/:jobId
+Check image job status and output metadata.
+
+Response
+{
+  "id": "cm7abc123def",
+  "status": "COMPLETED",
+  "createdAt": "2026-01-15T12:30:00.000Z",
+  "startedAt": "2026-01-15T12:30:05.000Z",
+  "completedAt": "2026-01-15T12:30:18.000Z",
+  "outputMetadata": {
+    "format": "png",
+    "width": 1024,
+    "height": 1024
+  }
+}
+GET
+/api/v1/images/download/:jobId
+Download the image output. Use ?index=N for multi-image jobs.
+
+curl -L "https://69labs.vip/api/v1/images/download/cm7abc123def" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -o image.png
+Returns 302 redirect to a presigned R2 URL. Use -L with curl. Files are retained until the account retention window expires.
+Video Generation
+GET
+/api/v1/videos/models
+List available video models with credit info and capabilities.
+
+Response
+{
+  "models": [
+    {
+      "id": "grok-imagine-video",
+      "name": "Grok Video",
+      "cost": 1,
+      "aspectRatios": [...],
+      "modes": [{ "value": "normal" }, { "value": "spicy" }, { "value": "fun" }],
+      "supportsImageInput": true,
+      "maxImageUrls": 2
+    },
+    ...
+  ],
+  "defaultModelId": "grok-imagine-video",
+  "credits": { "used": 1, "limit": 20, "remaining": 19, "resetsAt": "..." },
+  "monthlyUsage": { "used": 2, "limit": 50, "remaining": 48 }
+}
+POST
+/api/v1/videos/generate
+Create a video generation job. Returns a jobId and queue position.
+
+Request body
+prompt
+Required. 1-15000 characters.
+model
+Optional. Defaults to grok-imagine-video.
+aspectRatio
+Optional. Must be valid for the model.
+resolution
+Optional. Only for models that support it.
+duration
+Optional. String value (e.g., "5", "10"). Only for models with durations. Note: "length" is NOT supported.
+mode
+Optional. Only for models with modes.
+imageUrls
+Optional. Input images for image-to-video.
+videoInputMode
+Optional. text | ingredients | keyframes.
+mute
+Optional. Strip audio from the final output file.
+Response
+{
+  "id": "cm7xyz789ghi",
+  "queuePosition": 1
+}
+GET
+/api/v1/videos/status/:jobId
+Check video job status and output metadata. The durationSeconds field in outputMetadata is read-only — it reports the actual video duration, not a submit parameter.
+
+Response
+{
+  "id": "cm7xyz789ghi",
+  "status": "COMPLETED",
+  "createdAt": "2026-01-15T12:30:00.000Z",
+  "startedAt": "2026-01-15T12:30:05.000Z",
+  "completedAt": "2026-01-15T12:32:18.000Z",
+  "outputMetadata": {
+    "format": "mp4",
+    "width": 1920,
+    "height": 1080,
+    "durationSeconds": 10
+  }
+}
+GET
+/api/v1/videos/download/:jobId
+Download the video output (MP4).
+
+curl -L "https://69labs.vip/api/v1/videos/download/cm7xyz789ghi" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -o video.mp4
+Returns 302 redirect to a presigned R2 URL. Use -L with curl. Files are retained until the account retention window expires.
+Motion Graphics
+Render parameterized Remotion templates to private MP4 outputs. Motion credits are rendered seconds: each render costs max(1, ceil(resolved durationSeconds)).
+
+GET
+/api/v1/motion-graphics/templates
+List currently enabled motion graphics templates with supported props, aspect ratios, and credit info.
+
+Response
+{
+  "templates": [
+    {
+      "id": "kinetic-title-card",
+      "name": "Kinetic Title Card",
+      "description": "Animated text title card for announcements and social cuts.",
+      "fps": 30,
+      "codec": "h264",
+      "format": "mp4",
+      "cost": 8,
+      "durationSeconds": 8,
+      "controls": [
+        { "path": "title", "label": "Title", "kind": "textarea", "valueType": "string", "group": "content", "defaultValue": "Launch Week" },
+        {
+          "path": "aspectRatio",
+          "label": "Aspect Ratio",
+          "kind": "select",
+          "valueType": "string",
+          "group": "format",
+          "defaultValue": "16:9",
+          "options": [
+            { "label": "16:9", "value": "16:9" },
+            { "label": "9:16", "value": "9:16" },
+            { "label": "1:1", "value": "1:1" }
+          ]
+        },
+        { "path": "letterSpacing", "label": "Letter Spacing", "kind": "number", "valueType": "number", "group": "style", "advanced": true, "defaultValue": 0.04 }
+      ],
+      "defaults": { "aspectRatio": "16:9", "durationSeconds": 8 }
+    }
+  ],
+  "defaultTemplateId": "kinetic-title-card",
+  "credits": { "used": 0, "limit": 20, "remaining": 20, "resetsAt": "..." },
+  "monthlyUsage": { "used": 0, "limit": 20, "remaining": 20 }
+}
+Template cost is the default render-second credit cost. If submitted props change the duration, the backend recalculates and rounds up before reserving credits or PPU units.
+POST
+/api/v1/motion-graphics/render
+Create a Remotion Lambda render job. Disabled template IDs are rejected before credits or PPU units are reserved.
+
+Request body
+templateId
+Optional. Defaults to kinetic-title-card.
+props.title
+Required. 1-120 characters.
+props.subtitle
+Optional. Up to 180 characters.
+props.footer
+Optional. Up to 96 characters.
+props.aspectRatio
+Optional. 16:9 | 9:16 | 1:1.
+props.layout
+Optional. center | left | stacked.
+props.durationSeconds
+Optional. 3-30 seconds.
+props.palette
+Optional. Hex colors for background, foreground, accent, and secondary.
+Response
+{
+  "id": "cm7motion123",
+  "queuePosition": 1
+}
+GET
+/api/v1/motion-graphics/status/:jobId
+Check render status, Lambda progress, and output metadata.
+
+Response
+{
+  "id": "cm7motion123",
+  "status": "COMPLETED",
+  "createdAt": "2026-05-06T12:30:00.000Z",
+  "startedAt": "2026-05-06T12:30:05.000Z",
+  "completedAt": "2026-05-06T12:31:18.000Z",
+  "progressPercent": 100,
+  "outputMetadata": {
+    "format": "mp4",
+    "codec": "h264",
+    "width": 1920,
+    "height": 1080,
+    "durationSeconds": 8,
+    "templateId": "kinetic-title-card"
+  }
+}
+POST
+/api/v1/motion-graphics/cancel/:jobId
+Cancel a pending motion graphics render and refund reserved motion credits or PPU units.
+
+curl -X POST "https://69labs.vip/api/v1/motion-graphics/cancel/cm7motion123" \
+  -H "Authorization: Bearer vk_your_api_key"
+GET
+/api/v1/motion-graphics/download/:jobId
+Download the completed motion graphics MP4.
+
+curl -L "https://69labs.vip/api/v1/motion-graphics/download/cm7motion123" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -o motion.mp4
+Returns 302 redirect to a presigned storage URL for R2-backed deployments. Files follow the same retained job-output lifecycle as video outputs.
+Tools
+Synchronous utility actions that spend tool credits. Image compression returns optimized image bytes directly instead of creating a job.
+
+POST
+/api/v1/tools/image-compressor/compress
+Compress one JPEG, PNG, WebP, or AVIF image up to 10 MB. Supports mode=lossy or mode=lossless.
+
+curl -X POST "https://69labs.vip/api/v1/tools/image-compressor/compress" \
+  -H "Authorization: Bearer vk_your_api_key" \
+  -F "mode=lossy" \
+  -F "file=@thumbnail.jpg" \
+  -o thumbnail-compressed.jpg
+Response headers include X-Tool-Cost, X-Original-Size-Bytes, X-Compressed-Size-Bytes, X-Saved-Percent, and X-Used-Original.
+Voice Clones
+List cloned voices and generate TTS with them. Voice creation is UI-only. Poll and download use the standard TTS status/download endpoints.
+
+GET
+/api/v1/voice-clones
+List your own cloned voices.
+
+Response
+{
+  "voiceClones": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "My Voice",
+      "language": "English",
+      "gender": "male",
+      "previewUrl": "https://...",
+      "isGlobal": false,
+      "status": "ready",
+      "createdAt": "2026-04-09T12:00:00.000Z"
+    }
+  ]
+}
+GET
+/api/v1/voice-clones/library
+List global (admin-curated) voice library available to all users.
+
+Same response shape as GET /voice-clones but returns global voices with isGlobal: true.
+GET
+/api/v1/voice-clones/:id
+Get details of a single voice clone. Works for your own clones and global library voices.
+
+Response
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "name": "My Voice",
+  "language": "English",
+  "gender": "male",
+  "previewUrl": "https://...",
+  "isGlobal": false,
+  "status": "ready",
+  "createdAt": "2026-04-09T12:00:00.000Z"
+}
+POST
+/api/v1/voice-clones/generate
+Submit a TTS job using a cloned voice. Requires voice cloning enabled on your tier.
+
+Request body
+voiceCloneId
+Required. UUID of the voice clone to use.
+text
+Required. 1-100000 characters.
+model
+Optional. Default: speech-02-hd; accepts speech-2.8-hd and speech-2.8-turbo.
+speed
+Optional. 0.5-2. Speed multiplier.
+pitch
+Optional. -12 to 12. Pitch adjustment in semitones.
+volume
+Optional. 0-10. Volume level.
+language_boost
+Optional. Language hint such as English or Turkish. Default: auto; ISO hints normalize server-side.
+Response
+{
+  "id": "job_456",
+  "status": "PENDING",
+  "queuePosition": 2
+}
+Poll with GET /tts/status/:jobId and download with GET /tts/download/:jobId.
+Errors and limits
+All errors follow a consistent JSON format with error and code fields.
+
+Error codes
+UNAUTHORIZED
+Missing or invalid API key.
+FORBIDDEN
+API access not enabled for the account.
+BAD_REQUEST
+Invalid input or job state.
+PAYMENT_REQUIRED
+Insufficient monthly credits.
+NOT_FOUND
+Job not found.
+GONE
+Output file expired.
+CONFLICT
+Duplicate or in-progress request state.
+TOO_MANY_REQUESTS
+Rate limit exceeded.
+TTS_CHARACTER_QUOTA_EXCEEDED
+Rolling TTS character quota exceeded.
+VALIDATION_ERROR
+Request validation failed.
+Error format
+{
+  "error": "Human readable message",
+  "code": "MACHINE_READABLE_CODE"
+}
+Rate limits
+POST /tts/generate
+20 req/min
+GET /tts/minimax/voices
+120 req/min
+POST /tts/retry-censored/:jobId
+10 req/min
+POST /tts/generate-srt/:jobId
+10 req/min
+GET /tts/srt-status/:jobId
+60 req/min
+GET /tts/download-srt/:jobId
+30 req/min
+POST /images/generate
+60 req/min
+POST /videos/generate
+5 req/min
+GET /motion-graphics/templates
+60 req/min
+POST /motion-graphics/render
+10 req/min
+POST /motion-graphics/cancel/:jobId
+10 req/min
+POST /tools/image-compressor/compress
+30 req/min
+GET /voice-clones
+30 req/min
+GET /voice-clones/library
+30 req/min
+GET /voice-clones/:id
+60 req/min
+POST /voice-clones/generate
+20 req/min
+GET /*/status/*
+120 req/min
+GET /*/download/*
+30 req/min
+GET /*/models
+60 req/min
+GET /usage
+PPU keys bypass generic route limits; auth failures remain limited
+Rate-limited requests return HTTP 429 with Retry-After header.
+Suggested flows
+TTS generation
+POST /api/v1/tts/generate to create a job.
+Poll GET /api/v1/tts/status/:jobId every 2-5 seconds.
+If status is CENSORED, rewrite blockedChunks and POST /api/v1/tts/retry-censored/:jobId.
+When status is COMPLETED, download the audio.
+SRT subtitles
+Wait for the TTS job to reach COMPLETED.
+POST /api/v1/tts/generate-srt/:jobId to queue subtitle generation.
+Poll GET /api/v1/tts/srt-status/:jobId every 2-5 seconds.
+When srtFileAvailable is true, download with GET /api/v1/tts/download-srt/:jobId.
+Image generation
+POST /api/v1/images/generate to create a job.
+Poll GET /api/v1/images/status/:jobId every 3-5 seconds.
+When COMPLETED, download the image.
+Video generation
+POST /api/v1/videos/generate to create a job.
+Poll GET /api/v1/videos/status/:jobId every 5-10 seconds.
+When COMPLETED, download the video.
+Motion graphics
+GET /api/v1/motion-graphics/templates to list Remotion templates currently enabled by admins.
+POST /api/v1/motion-graphics/render with templateId and props to create a render job.
+Poll GET /api/v1/motion-graphics/status/:jobId every 5-10 seconds.
+When COMPLETED, download the MP4 output.
+Image compression tool
+POST multipart /api/v1/tools/image-compressor/compress with file or image and mode=lossy|lossless.
+Save the binary image response directly to disk.
+Read X-Original-Size-Bytes, X-Compressed-Size-Bytes, X-Saved-Percent, and X-Tool-Cost headers for reporting.
+Model discovery
+GET /api/v1/models to list all available image/video models and motion templates.
+Use /api/v1/motion-graphics/templates when you only need motion template metadata.
+Check cost, aspect ratios, and capabilities before submitting jobs.
+Voice clone TTS
+GET /api/v1/voice-clones to list your cloned voices, or /voice-clones/library for global voices.
+POST /api/v1/voice-clones/generate with voiceCloneId and text.
+Poll GET /api/v1/tts/status/:jobId every 2-5 seconds.
+When COMPLETED, download with GET /api/v1/tts/download/:jobId.
+Batch generation
+Submit multiple jobs and store each jobId.
+Poll with exponential backoff to reduce traffic.
+Download outputs as they complete.
+Expired output
+If download returns 410, the file has expired.
+Output retention depends on the account policy returned by model discovery or the user tier.
+Re-submit the same input to generate a fresh output.
+On this page
+Quick start
+Account and Discovery
+Text-to-Speech
+Image Generation
+Video Generation
+Motion Graphics
+Tools
+Voice Clones
+Errors and limits
+Suggested flows
+OpenAPI spec
+Need help?
+Visit the help center or open a support ticket.
+
+Help center

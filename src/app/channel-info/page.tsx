@@ -16,6 +16,8 @@ import {
   DescriptionEditor,
   IdeationRulesEditor,
   RedditSourcesEditor,
+  ThumbnailDesignRulesEditor,
+  ThumbnailStyleGoalsEditor,
 } from "@/components/agent-brain-editors";
 import { LearnedRulesPanel } from "@/components/learned-rules-panel";
 import { YouTubeThumbnail } from "@/components/youtube-thumbnail";
@@ -35,6 +37,8 @@ type ChannelContext = {
   ideationRules: string;
   bannedTopics: string;
   redditSources: string;
+  thumbnailStyleGoals: string;
+  thumbnailDesignRules: string;
   // Legacy — kept for type completeness, never rendered.
   niche: string;
   positioning: string;
@@ -138,7 +142,7 @@ export default function ChannelInfoPage() {
         </div>
         <p className="mt-1 text-sm text-muted-foreground">
           {activeChannel
-            ? `Channel context for ${activeChannel.title ?? activeChannel.handle ?? "this channel"}. Every AI feature reads from this.`
+            ? `Context for ${activeChannel.title ?? activeChannel.handle ?? "this channel"}.`
             : "Pick a channel from the top-right picker."}
         </p>
       </header>
@@ -296,14 +300,11 @@ function SingleChannelCard({
     }
   };
 
-  // Single-field save callback used by the editors. Refetches the row
-  // server-side so derived state (e.g. analytics widget channel info)
-  // stays in sync.
   const handleFieldSaved = useCallback(
-    (field: "channelDescription" | "ideationRules" | "bannedTopics" | "redditSources", value: string) => {
+    (field: "channelDescription" | "ideationRules" | "bannedTopics" | "redditSources" | "thumbnailStyleGoals" | "thumbnailDesignRules", value: string) => {
       const next: ChannelContext = { ...channel, [field]: value };
       onUpdated(next);
-      setSavedToast("Saved — the agent will use this on the next message.");
+      setSavedToast("Saved.");
     },
     [channel, onUpdated]
   );
@@ -364,7 +365,7 @@ function SingleChannelCard({
             </Button>
           </div>
         </CardHeader>
-        <CardContent className="space-y-6">
+        <CardContent className="space-y-5">
           {savedToast && (
             <div
               className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-400"
@@ -373,67 +374,99 @@ function SingleChannelCard({
               {savedToast}
             </div>
           )}
-          <div>
-            <div className="mb-1 flex items-baseline justify-between gap-2">
-              <h3 className="text-sm font-semibold">Channel description</h3>
+          <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(340px,0.82fr)]">
+            <div>
+              <div className="mb-1 flex items-baseline justify-between gap-2">
+                <h3 className="text-sm font-semibold">Channel Brief</h3>
+              </div>
+              <DescriptionEditor
+                channelId={channel.channelId}
+                initialValue={channel.channelDescription}
+                onSaved={(v) => handleFieldSaved("channelDescription", v)}
+              />
             </div>
-            <p className="mb-2 text-xs text-muted-foreground">
-              One paragraph the agent reads before every job. Cover: what the channel is, who watches (age + region), what makes you different, voice + pacing. Plain words. The shorter the better — long fluff dilutes the agent&apos;s focus.
-            </p>
-            <DescriptionEditor
-              channelId={channel.channelId}
-              initialValue={channel.channelDescription}
-              onSaved={(v) => handleFieldSaved("channelDescription", v)}
-            />
-          </div>
-          <div>
-            <div className="mb-1 flex items-baseline justify-between gap-2">
-              <h3 className="text-sm font-semibold">Banned topics</h3>
+
+            <div className="space-y-3 lg:border-l lg:border-border lg:pl-5">
+              <div className="mb-1 flex items-baseline justify-between gap-2">
+                <h3 className="text-sm font-semibold">Thumbnail Notes</h3>
+              </div>
+              <div>
+                <h4 className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Style
+                </h4>
+                <ThumbnailStyleGoalsEditor
+                  channelId={channel.channelId}
+                  initialValue={channel.thumbnailStyleGoals}
+                  onSaved={(v) => handleFieldSaved("thumbnailStyleGoals", v)}
+                />
+              </div>
+              <div>
+                <h4 className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Rules
+                </h4>
+                <ThumbnailDesignRulesEditor
+                  channelId={channel.channelId}
+                  initialValue={channel.thumbnailDesignRules}
+                  onSaved={(v) => handleFieldSaved("thumbnailDesignRules", v)}
+                />
+              </div>
             </div>
-            <BannedTopicsEditor
-              channelId={channel.channelId}
-              initialValue={channel.bannedTopics}
-              onSaved={(v) => handleFieldSaved("bannedTopics", v)}
-            />
           </div>
-          <div>
-            <div className="mb-1 flex items-baseline justify-between gap-2">
-              <h3 className="text-sm font-semibold">Ideation rules <span className="text-xs font-normal text-muted-foreground">(HARD)</span></h3>
+
+          <details className="rounded-md border border-border bg-muted/10 p-3">
+            <summary className="cursor-pointer text-sm font-medium">
+              Advanced context
+            </summary>
+            <div className="mt-4 space-y-6">
+              <div>
+                <div className="mb-1 flex items-baseline justify-between gap-2">
+                  <h3 className="text-sm font-semibold">Banned topics</h3>
+                </div>
+                <BannedTopicsEditor
+                  channelId={channel.channelId}
+                  initialValue={channel.bannedTopics}
+                  onSaved={(v) => handleFieldSaved("bannedTopics", v)}
+                />
+              </div>
+              <div>
+                <div className="mb-1 flex items-baseline justify-between gap-2">
+                  <h3 className="text-sm font-semibold">Ideation rules <span className="text-xs font-normal text-muted-foreground">(HARD)</span></h3>
+                </div>
+                <IdeationRulesEditor
+                  channelId={channel.channelId}
+                  initialValue={channel.ideationRules}
+                  onSaved={(v) => handleFieldSaved("ideationRules", v)}
+                />
+              </div>
+              <div>
+                <div className="mb-1 flex items-baseline justify-between gap-2">
+                  <h3 className="text-sm font-semibold">Reddit sources</h3>
+                </div>
+                <RedditSourcesEditor
+                  channelId={channel.channelId}
+                  initialValue={channel.redditSources}
+                  onSaved={(v) => handleFieldSaved("redditSources", v)}
+                />
+              </div>
             </div>
-            <p className="mb-2 text-xs text-muted-foreground">
-              Non-negotiable rules the ideation agent must follow when composing titles. Injected verbatim into the compose prompt. One rule per line — voice constraints, banned shapes, format-bias overrides, anything you never want bent.
-            </p>
-            <IdeationRulesEditor
-              channelId={channel.channelId}
-              initialValue={channel.ideationRules}
-              onSaved={(v) => handleFieldSaved("ideationRules", v)}
-            />
-          </div>
-          <div>
-            <div className="mb-1 flex items-baseline justify-between gap-2">
-              <h3 className="text-sm font-semibold">Reddit sources</h3>
-            </div>
-            <p className="mb-2 text-xs text-muted-foreground">
-              One subreddit per line. Auto and Reddit Angles use Brave Search to find dated web signals from these communities.
-            </p>
-            <RedditSourcesEditor
-              channelId={channel.channelId}
-              initialValue={channel.redditSources}
-              onSaved={(v) => handleFieldSaved("redditSources", v)}
-            />
-          </div>
+          </details>
         </CardContent>
       </Card>
 
       <CurrentVideosPanel channelId={channel.channelId} />
 
-      <SectionDivider label="Learned rules" />
-      <div className="rounded-lg border border-border bg-card p-6">
-        <p className="mb-4 text-xs text-muted-foreground">
-          Rules the AI distilled from your notes on past ideas. Pending rows wait for you to Apply or Reject — nothing affects the next generation until you decide.
-        </p>
-        <LearnedRulesPanel channelId={channel.channelId} />
-      </div>
+      <SectionDivider label="Learning" />
+      <details className="rounded-lg border border-border bg-card p-4">
+        <summary className="cursor-pointer text-sm font-medium">
+          Learned ideation rules
+        </summary>
+        <div className="mt-4">
+          <p className="mb-4 text-xs text-muted-foreground">
+            Rules distilled from notes on past ideas. Pending rows wait for Apply or Reject.
+          </p>
+          <LearnedRulesPanel channelId={channel.channelId} />
+        </div>
+      </details>
 
       {aiOpen && (
         <AnalyzeModal
@@ -503,8 +536,7 @@ function CurrentVideosPanel({ channelId }: { channelId: string }) {
           <div>
             <h3 className="text-sm font-semibold">Current channel videos</h3>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Synced public uploads used as your own-channel source material.
-              {lastSyncAt ? ` Last synced ${formatDateTime(lastSyncAt)}.` : ""}
+              {lastSyncAt ? `Synced ${formatDateTime(lastSyncAt)}.` : "Not synced yet."}
             </p>
           </div>
           <Button

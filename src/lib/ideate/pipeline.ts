@@ -9,6 +9,9 @@ import { db, getIntegration, getSetting } from "../db";
 import {
   collectRedditResearch,
   hasRedditSignalProvider,
+  REDDIT_RECENCY_DAYS,
+  REDDIT_VIRAL_COMMENTS_MIN,
+  REDDIT_VIRAL_SCORE_MIN,
   parseSubredditSources,
   type RedditResearchItem,
 } from "../reddit";
@@ -1025,19 +1028,20 @@ function buildComposeSystemPrompt(): string {
     "",
     "## ATTRIBUTION RULES (HARD)",
     "- topic_source: the competitor outlier (or own upload, for Title Tweaks) whose TOPIC you reused.",
-    "- format_source: the DIFFERENT video whose title STRUCTURE you reused. Use an empty source object for Title Tweaks (no second source).",
+    "- format_source: the YouTube video whose title STRUCTURE you reused. It may be the same YouTube outlier as topic_source or another proven outlier; prefer another source when it improves fit. Use an empty source object for Title Tweaks (no second source).",
     "- topic_evidence_sources: additional YouTube outliers on the SAME topic, excluding topic_source. Use [] when there is no second same-topic signal.",
     "- Both source objects carry { video_id, title, channel_name, channel_handle, multiplier }, plus optional thumbnail_url, views, published_at, and age_days when known.",
     "- Empty source object means { video_id: \"\", title: \"\", channel_name: \"\", channel_handle: \"\", multiplier: 0 }.",
     "- video_id MUST be picked from the competitor source bank or own uploads block in the user prompt — do not invent IDs.",
+    "- Reddit links are topic-demand evidence only. They NEVER belong in topic_source or format_source.",
     "",
     "## METHOD TAG (HARD)",
     "Every idea MUST include source_attribution.method, set to ONE of:",
-    "  - \"new_angle\"   : a two-outlier mashup. Topic from one competitor outlier,",
-    "                    title format from a DIFFERENT competitor outlier. Both",
-    "                    source video_ids MUST come from the competitor source bank",
+    "  - \"new_angle\"   : a YouTube outlier topic paired with a YouTube outlier title format.",
+    "                    The topic and format may come from the SAME outlier or from DIFFERENT outliers.",
+    "                    Prefer a different format source when it makes the title structure clearer.",
+    "                    Both source video_ids MUST come from the competitor source bank",
     "                    and BOTH sources MUST be marked as outliers with multiplier ≥ 2.0.",
-    "                    topic_source and format_source must reference DIFFERENT video_ids.",
     `                    Primary topic_source MUST be uploaded within ${TOPIC_RECENCY_DAYS} days.`,
     "                    Older same-topic videos are historical proof only; put them in topic_evidence_sources, never as primary topic_source.",
     "                    Prefer topics that recently went viral more than once.",
@@ -1049,9 +1053,10 @@ function buildComposeSystemPrompt(): string {
     "                    upload), with only small wording/synonym/clarity changes.",
     "                    Do not swap the main subject, add a new premise, or change the topic.",
     "  - \"reddit_angle\": demand signal from Reddit web signals, paired with a",
-    "                    YouTube outlier or own winner as the format_source. topic_source",
-    "                    may be the empty source object because Reddit supplies the topic; proof.sources",
-    "                    MUST include at least one Reddit link and one YouTube link.",
+    "                    YouTube outlier or strong 2x+ own-channel winner as the format_source. Reddit supplies the topic only.",
+    "                    topic_source MUST be the empty source object. Never put a YouTube video in topic_source for a Reddit idea.",
+    "                    proof.sources MUST include an accepted Reddit permalink from the research library and one YouTube link.",
+    "                    If the Reddit item says metrics unavailable/fallback, set weak_proof and keep confidence low.",
     "",
     "## PROOF RULES (HARD)",
     "- Every idea includes proof: { source_signal, fit, execution, whats_going_on, weak_proof, sources }.",
@@ -1063,7 +1068,8 @@ function buildComposeSystemPrompt(): string {
     "- sources: source links used by the proof. Use YouTube watch links and Reddit permalinks.",
     "- Use an empty string for unknown source-link dates.",
     "- Keep source_signal, fit, and execution to one sentence each. Keep each idea compact.",
-    `- Confidence rule: high only when fit is very strong and the topic has 2+ same-topic outliers within ${TOPIC_RECENCY_DAYS} days.`,
+    `- Confidence rule: high only when fit is very strong and the topic has 2+ same-topic YouTube outliers within ${TOPIC_RECENCY_DAYS} days.`,
+    "- Reddit ideas can be medium only when the Reddit signal has score/comment metrics and fit is strong; fallback-only Reddit ideas must be low.",
     "- Use medium for one recent topic source or repeated older evidence with weaker fit. Use low for old-only, single weak, or uncertain topic proof.",
     "",
     "## OUTPUT",
@@ -1129,8 +1135,12 @@ function buildResearchContext(redditResearch: RedditResearchItem[]): string[] {
       item.score > 0 || item.comments > 0
         ? `${item.score} upvotes | ${item.comments} comments`
         : "Brave web signal";
+    const strength =
+      item.signal_strength === "metrics"
+        ? "accepted recent viral Reddit topic (metric-enriched)"
+        : "accepted recent Reddit topic (top Brave fallback; metrics unavailable)";
     return [
-      `- topic=${item.topic} | r/${item.subreddit} | ${date} | ${metric} | ${reuse}`,
+      `- topic=${item.topic} | r/${item.subreddit} | ${date} | ${metric} | ${strength} | ${reuse}`,
       `  title: ${item.title}`,
       `  summary: ${item.summary}`,
       `  permalink: ${item.permalink}`,
@@ -1175,6 +1185,9 @@ function buildComposeUserPrompt(
   lines.push("");
 
   lines.push("## Reddit web-signal research library");
+  lines.push(
+    `Use these as topic signals only. Accepted Reddit topics are <= ${REDDIT_RECENCY_DAYS} days old and either have >= ${REDDIT_VIRAL_SCORE_MIN} upvotes, >= ${REDDIT_VIRAL_COMMENTS_MIN} comments, or are a clearly recent top Brave fallback when Reddit metrics were unavailable.`
+  );
   lines.push(...buildResearchContext(redditResearch));
   lines.push("");
 
@@ -1260,7 +1273,7 @@ function buildComposeUserPrompt(
       `Pick a TOPIC from a competitor outlier uploaded within ${TOPIC_RECENCY_DAYS} days.`,
       "Prefer topics that recently went viral more than once; put additional same-topic outliers in topic_evidence_sources.",
       `Use any one primary topic source for at most ${MAX_IDEAS_PER_TOPIC_PER_RUN} ideas in this run.`,
-      "Pick a TITLE STRUCTURE from a DIFFERENT proven outlier. This format source may be older because formats are evergreen.",
+      "Pick a TITLE STRUCTURE from the same YouTube outlier or another proven outlier. Prefer another format source when it makes the structure clearer. This format source may be older because formats are evergreen.",
       "Stay close to the simple readable structure of the format source, but use simpler words.",
       "Both source video_ids MUST appear as nested source_attribution.topic_source and source_attribution.format_source objects."
     );
@@ -1277,9 +1290,12 @@ function buildComposeUserPrompt(
     lines.push(
       "## Mode = reddit_angles",
       "EVERY idea uses reddit_angle.",
-      "Use Reddit web signals as the topic signal and a YouTube outlier or own winner as format_source.",
+      "Use only the accepted Reddit research library above as the topic signal.",
+      "Use a YouTube outlier or strong 2x+ own-channel winner as format_source. Reddit is NEVER the format source.",
+      "topic_source MUST be the empty source object because Reddit supplies the topic.",
       `Use any one Reddit topic/source theme for at most ${MAX_IDEAS_PER_TOPIC_PER_RUN} ideas in this run.`,
-      "topic_source may be the empty source object. proof.sources and research_sources MUST include Reddit permalinks."
+      "proof.sources and research_sources MUST include Reddit permalinks from the library above, plus a YouTube link for the format source.",
+      "If the selected Reddit line is a top Brave fallback with metrics unavailable, include weak_proof and set low confidence."
     );
   }
   lines.push("");
@@ -1950,6 +1966,57 @@ function knownOutlierIndex(gathered: GatherResult): {
   return { ids, multiplierById };
 }
 
+function normalizeRedditPermalink(value: string): string | null {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase().replace(/^www\./, "").replace(/^old\./, "");
+    if (host !== "reddit.com") return null;
+    return `reddit.com${url.pathname.replace(/\/+$/, "").toLowerCase()}`;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeYouTubeUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase().replace(/^www\./, "");
+    if (host !== "youtube.com" && host !== "youtu.be") return null;
+    return `${host}${url.pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+function acceptedRedditSignalForIdea(
+  idea: Pick<ComposedIdea, "proof" | "research_sources">,
+  redditResearch: RedditResearchItem[]
+): RedditResearchItem | null {
+  const accepted = new Map<string, RedditResearchItem>();
+  for (const item of redditResearch) {
+    const key = normalizeRedditPermalink(item.permalink);
+    if (key) accepted.set(key, item);
+  }
+  if (accepted.size === 0) return null;
+
+  const links = [...idea.proof.sources, ...idea.research_sources]
+    .filter((source) => source.type === "reddit")
+    .map((source) => normalizeRedditPermalink(source.url))
+    .filter((key): key is string => !!key);
+  for (const key of links) {
+    const item = accepted.get(key);
+    if (item) return item;
+  }
+  return null;
+}
+
+function hasYouTubeProofSource(idea: Pick<ComposedIdea, "proof" | "research_sources">): boolean {
+  return [...idea.proof.sources, ...idea.research_sources].some((source) => {
+    if (source.type !== "youtube") return false;
+    return normalizeYouTubeUrl(source.url) !== null;
+  });
+}
+
 export function titleWordCount(title: string): number {
   return title.trim().split(/\s+/).filter((word) => word.length > 0).length;
 }
@@ -1965,7 +2032,11 @@ export function titleLengthHardRuleReason(title: string): string | null {
   return null;
 }
 
-export function hardRuleCheck(idea: ComposedIdea, gathered: GatherResult): HardRuleVerdict {
+export function hardRuleCheck(
+  idea: ComposedIdea,
+  gathered: GatherResult,
+  redditResearch: RedditResearchItem[] = []
+): HardRuleVerdict {
   const title = idea.title.trim();
   if (title.length === 0) return { passed: false, reason: "empty title" };
   const titleLengthReason = titleLengthHardRuleReason(title);
@@ -2006,21 +2077,16 @@ export function hardRuleCheck(idea: ComposedIdea, gathered: GatherResult): HardR
 
   const method = idea.source_attribution.method;
 
-  // PRIO-4: new_angle gate. Both source video_ids must come from the
-  // competitor_outliers context (not own uploads, not invented), must be
-  // distinct, and both must clear the 2.0× multiplier bar. The compose
-  // prompt already pushes the model to fall back to "fresh" when these
-  // can't be satisfied — this is the back-stop that fails loudly when
-  // the model ignores the instruction.
+  // PRIO-4: new_angle gate. Topic and format source video_ids must come
+  // from the competitor_outliers context (not own uploads, not invented)
+  // and clear the 2.0× multiplier bar. They may be the same video when
+  // one outlier is the strongest topic+format proof.
   if (method === "new_angle") {
     const { ids: outlierIds, multiplierById: outlierMultiplierById } =
       knownOutlierIndex(gathered);
     const topic = idea.source_attribution.topic_source?.video_id ?? null;
     const fmt = idea.source_attribution.format_source?.video_id ?? null;
     if (!topic || !fmt) {
-      return { passed: false, reason: "new_angle missing valid outlier source" };
-    }
-    if (topic === fmt) {
       return { passed: false, reason: "new_angle missing valid outlier source" };
     }
     if (!outlierIds.has(topic) || !outlierIds.has(fmt)) {
@@ -2052,15 +2118,19 @@ export function hardRuleCheck(idea: ComposedIdea, gathered: GatherResult): HardR
   }
 
   if (method === "reddit_angle") {
-    const hasRedditSource =
-      idea.proof.sources.some((s) => s.type === "reddit" && s.url.includes("reddit.com")) ||
-      idea.research_sources.some((s) => s.type === "reddit" && s.url.includes("reddit.com"));
-    if (!hasRedditSource) {
-      return { passed: false, reason: "reddit_angle missing Reddit source" };
+    const acceptedRedditSignal = acceptedRedditSignalForIdea(idea, redditResearch);
+    if (!acceptedRedditSignal) {
+      return { passed: false, reason: "reddit_angle missing accepted Reddit topic signal" };
+    }
+    if (idea.source_attribution.topic_source) {
+      return { passed: false, reason: "reddit_angle must not use YouTube topic_source" };
     }
     const format = idea.source_attribution.format_source;
     if (!format) {
       return { passed: false, reason: "reddit_angle missing YouTube format source" };
+    }
+    if (!hasYouTubeProofSource(idea)) {
+      return { passed: false, reason: "reddit_angle missing YouTube proof source" };
     }
     const sourceIds = new Set<string>();
     for (const comp of gathered.competitors) {
@@ -2069,7 +2139,10 @@ export function hardRuleCheck(idea: ComposedIdea, gathered: GatherResult): HardR
       }
     }
     for (const own of gathered.own_recent_uploads) {
-      if (gathered.own_median_views > 0 && own.views >= gathered.own_median_views) {
+      if (
+        gathered.own_median_views > 0 &&
+        own.views >= OUTLIER_MULTIPLIER * gathered.own_median_views
+      ) {
         sourceIds.add(own.video_id);
       }
     }
@@ -2250,10 +2323,17 @@ export function confidenceFromFitScore(
 export function confidenceFromEvidence(
   fitScore: number | null,
   weakProof: string | null | undefined,
-  idea: Pick<ComposedIdea, "source_attribution" | "proof" | "research_sources">
+  idea: Pick<ComposedIdea, "source_attribution" | "proof" | "research_sources">,
+  redditResearch: RedditResearchItem[] = []
 ): "high" | "medium" | "low" {
   if (weakProof && weakProof.trim().length > 0) return "low";
   if (fitScore === null) return "medium";
+
+  if (idea.source_attribution.method === "reddit_angle") {
+    const redditSignal = acceptedRedditSignalForIdea(idea, redditResearch);
+    if (!redditSignal || redditSignal.signal_strength === "fallback") return "low";
+    return fitScore >= FIT_SCORE_PASS_THRESHOLD ? "medium" : "low";
+  }
 
   const evidence = topicEvidenceSources(idea);
   const evidenceCount = evidence.length;
@@ -2316,10 +2396,11 @@ export async function validate(
   count: number,
   mode: Mode = "auto",
   clientOverride?: Anthropic,
-  redditAvailable = true
+  redditAvailable = true,
+  redditResearch: RedditResearchItem[] = []
 ): Promise<{ ideas: ValidatedIdea[]; tokensUsed: { input: number; output: number } }> {
   const verdicts: ValidatedIdea[] = composed.map((idea) => {
-    const verdict = hardRuleCheck(idea, gathered);
+    const verdict = hardRuleCheck(idea, gathered, redditResearch);
     return {
       id: randomUUID(),
       title: idea.title,
@@ -2424,7 +2505,8 @@ export async function validate(
     verdicts[s.idx].confidence_level = confidenceFromEvidence(
       score.fit_score,
       weakProof,
-      verdicts[s.idx]
+      verdicts[s.idx],
+      redditResearch
     );
     if (score.dup_of !== null) {
       const dupScore = scoreByIdx.get(score.dup_of);
@@ -2774,7 +2856,15 @@ export async function runPipeline(
       tokens: composed.tokensUsed,
     });
 
-    const validated = await validate(composed.ideas, gathered, gen.count, gen.mode, client, redditAvailable);
+    const validated = await validate(
+      composed.ideas,
+      gathered,
+      gen.count,
+      gen.mode,
+      client,
+      redditAvailable,
+      redditResearch
+    );
     const passed = validated.ideas.filter((v) => v.validation_status === "passed").length;
     log.info("ideate", "validate complete", {
       generationId,

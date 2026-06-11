@@ -357,8 +357,7 @@ export const dictionaries: { en: DictionaryShape } = {
     },
     logs: {
       title: "Logs",
-      subtitle:
-        "Structured activity log. Every sync, chat turn, and API error lands here — filter by level and source to see what went wrong.",
+      subtitle: "Activity log.",
       refresh: "Refresh",
       liveOn: "Live",
       liveOff: "Live tail",
@@ -367,7 +366,7 @@ export const dictionaries: { en: DictionaryShape } = {
       clickToClear: "Click to clear this level",
       levelAll: "all levels",
       sourceAll: "all sources",
-      searchPlaceholder: "Search messages & context…",
+      searchPlaceholder: "Search logs…",
       empty: "No logs match these filters.",
       loading: "Loading…",
       kpi: {
@@ -381,7 +380,7 @@ export const dictionaries: { en: DictionaryShape } = {
     banner: {
       connectTitle: "Connect your integrations to get started",
       connectDesc:
-        "Add your API keys for Claude and YouTube to unlock the full app.",
+        "Add your API keys for OpenAI or Claude and YouTube to unlock the full app.",
       connectCta: "Go to Integrations",
     },
     dashboard: {
@@ -582,7 +581,7 @@ export const dictionaries: { en: DictionaryShape } = {
     },
     integrations: {
       title: "Integrations",
-      subtitle: "Connect the services used by ideation",
+      subtitle: "API keys and providers.",
       save: "Save",
       saved: "Saved",
       showKey: "Show",
@@ -595,7 +594,7 @@ export const dictionaries: { en: DictionaryShape } = {
       },
       claude: {
         name: "Claude (Anthropic)",
-        desc: "Required. Powers ideation, validation, and channel-context drafting.",
+        desc: "Ideation, validation, and planning.",
         placeholder: "sk-ant-...",
         helpTitle: "How to get a Claude API key",
         helpSteps: [
@@ -610,7 +609,7 @@ export const dictionaries: { en: DictionaryShape } = {
       },
       youtube: {
         name: "YouTube Data API v3",
-        desc: "Public YouTube data — videos, statistics, search, comments. Required for syncing a channel.",
+        desc: "Videos, search, statistics, and comments.",
         placeholder: "YouTube API key",
         helpTitle: "How to get a YouTube API key",
         helpSteps: [
@@ -625,7 +624,7 @@ export const dictionaries: { en: DictionaryShape } = {
       },
     },
     claudeUsage: {
-      title: "Spend history",
+      title: "AI spend history",
       total: "Total",
       last24h: "Last 24h",
       statTurns: "Chat turns",
@@ -635,12 +634,12 @@ export const dictionaries: { en: DictionaryShape } = {
       refresh: "Refresh",
       clearHistory: "Clear history",
       confirmClear:
-        "Clear the spend ledger? This only resets what's shown here — it doesn't refund anything on your Anthropic bill.",
+        "Clear the spend ledger? This only resets what's shown here — it doesn't refund anything on provider bills.",
       loading: "Loading…",
-      empty: "No chat turns yet — the ledger fills up as you talk with Claude.",
+      empty: "No AI calls yet — the ledger fills up as the app plans and analyzes.",
       emptyMsg: "(attachments only)",
-      advisorUsedTitle: "Opus advisor was consulted this turn",
-      rowModel: "Executor model",
+      advisorUsedTitle: "Advisor model was consulted this turn",
+      rowModel: "Provider/model",
       rowIterations: "Tool iterations",
       rowInputTokens: "Input tokens",
       rowOutputTokens: "Output tokens",
@@ -651,7 +650,7 @@ export const dictionaries: { en: DictionaryShape } = {
       rowDuration: "Duration",
       rowActiveTools: "Active tools",
       ledgerSinceHint:
-        "Ledger tracks turns since {date}. Older chats (before tracking was added, or on error paths before a recent fix) won't appear here but still show on your Anthropic console.",
+        "Ledger tracks calls since {date}. Older calls (before tracking was added, or on error paths before a recent fix) won't appear here but still show in provider consoles.",
     },
     import: {
       title: "Import",
